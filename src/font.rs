@@ -4,6 +4,10 @@
 pub mod cff;
 pub mod truetype;
 
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
 use crate::error::{Error, Result};
 use crate::fixed::{Fixed, Matrix};
 use crate::pdf::{Dict, Document, Object};
@@ -102,6 +106,10 @@ impl Metrics {
 /// A Type 0 font with one CIDFont, as Golem embeds it.
 pub struct Font {
     program: Program,
+    /// The outline of each glyph ID, interpreted at its first use (docs/adr/0011).
+    outlines: Vec<OnceLock<Result<Arc<[Segment]>>>>,
+    /// How many outlines were interpreted, for the tests of the cache.
+    interpretations: AtomicUsize,
     vertical: bool,
     widths: Metrics,
     default_width: Fixed,
@@ -182,8 +190,14 @@ impl Font {
             Some(other) => return Err(unsupported("DW2", &other)),
             None => (Fixed::from_int(880)?, Fixed::from_int(-1000)?),
         };
+        let glyphs = match &program {
+            Program::Cff(c) => c.glyph_count(),
+            Program::TrueType(t) => t.glyph_count(),
+        };
         Ok(Font {
             program,
+            outlines: (0..glyphs).map(|_| OnceLock::new()).collect(),
+            interpretations: AtomicUsize::new(0),
             vertical,
             widths: Metrics::load(doc, doc.get(&descendant, "W")?, 1)?,
             default_width,
@@ -215,12 +229,38 @@ impl Font {
         ]))
     }
 
-    /// The outline of the glyph of a CID, in glyph units (ISO 32000-1 9.7.4.2).
-    pub fn outline(&self, cid: u16) -> Result<Vec<Segment>> {
+    /// The glyph ID of a CID (ISO 32000-1 9.7.4.2).
+    fn gid(&self, cid: u16) -> Result<u16> {
+        match &self.program {
+            Program::Cff(c) => c.gid(cid),
+            Program::TrueType(_) => Ok(cid),
+        }
+    }
+
+    /// The outline of the glyph of a CID, in glyph units, interpreted once
+    /// per glyph and then reused (docs/adr/0011).
+    pub fn outline(&self, cid: u16) -> Result<Arc<[Segment]>> {
+        let gid = self.gid(cid)?;
+        match self.outlines.get(usize::from(gid)) {
+            Some(cell) => cell
+                .get_or_init(|| self.interpret_outline(cid).map(Arc::from))
+                .clone(),
+            None => Err(Error::new(format!("glyph {gid} is not in the font"))),
+        }
+    }
+
+    /// The outline of the glyph of a CID, interpreted now, without the cache.
+    pub fn interpret_outline(&self, cid: u16) -> Result<Vec<Segment>> {
+        self.interpretations.fetch_add(1, Ordering::Relaxed);
         match &self.program {
             Program::Cff(c) => c.outline(c.gid(cid)?),
             Program::TrueType(t) => t.outline(cid),
         }
+    }
+
+    /// How many outlines were interpreted.
+    pub fn interpretations(&self) -> usize {
+        self.interpretations.load(Ordering::Relaxed)
     }
 
     /// The horizontal displacement w0 of a CID, in 1/1000 em.
@@ -243,5 +283,52 @@ impl Font {
     }
 }
 
+/// The font of one object, read at its first use; an error is kept too.
+type FontCell = Arc<OnceLock<Result<Arc<Font>>>>;
+
+/// The fonts of one document, read once each and shared by the pages, the
+/// check and the rendering, and the threads (docs/adr/0011). A font is keyed
+/// by the object number of its Type 0 font dictionary; a font given directly
+/// in a resource dictionary is not kept.
+#[derive(Default)]
+pub struct FontCache {
+    table: Mutex<BTreeMap<u32, FontCell>>,
+    loads: AtomicUsize,
+}
+
+impl FontCache {
+    pub fn new() -> FontCache {
+        FontCache::default()
+    }
+
+    /// The font of a resource: from the cache if it is an indirect reference.
+    pub fn get(&self, doc: &Document, obj: &Object) -> Result<Arc<Font>> {
+        let Object::Ref(r) = obj else {
+            return Font::load(doc, obj).map(Arc::new);
+        };
+        // The lock is held only to take the cell; the font is read outside it.
+        let cell = self
+            .table
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(r.num)
+            .or_default()
+            .clone();
+        cell.get_or_init(|| {
+            self.loads.fetch_add(1, Ordering::Relaxed);
+            Font::load(doc, obj).map(Arc::new)
+        })
+        .clone()
+    }
+
+    /// How many fonts were read into the cache.
+    pub fn loads(&self) -> usize {
+        self.loads.load(Ordering::Relaxed)
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cache_tests;

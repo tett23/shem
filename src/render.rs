@@ -4,7 +4,7 @@ use crate::color::{self, Device, FillSpace, Separation};
 use crate::content::{self, Op, Operator};
 use crate::error::{Error, Result};
 use crate::fixed::{Fixed, Matrix};
-use crate::font::{Font, Segment};
+use crate::font::{Font, FontCache, Segment};
 use crate::pdf::Object;
 use crate::pdf::{Dict, Document, Page};
 use crate::raster::{Canvas, FillRule, Path, Point, coverage, signed_area, stroke};
@@ -13,7 +13,7 @@ use crate::raster::{Canvas, FillRule, Path, Point, coverage, signed_area, stroke
 const BOX_FILL: [u8; 3] = [192, 192, 192];
 const BOX_LINE: [u8; 3] = [96, 96, 96];
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// The largest number of pixels of a page (docs/adr/0007).
 const MAX_PIXELS: u128 = 1 << 28;
@@ -87,7 +87,7 @@ struct GraphicsState {
     stroke: [u8; 3],
     // The text state (ISO 32000-1 9.3): the font and its size, the
     // horizontal scaling (Tz / 100) and the rendering mode.
-    font: Option<Rc<Font>>,
+    font: Option<Arc<Font>>,
     font_size: Fixed,
     h_scale: Fixed,
     render_mode: i64,
@@ -95,6 +95,7 @@ struct GraphicsState {
 
 struct Renderer<'a> {
     doc: &'a Document,
+    cache: &'a FontCache,
     resources: &'a Dict,
     canvas: Canvas,
     state: GraphicsState,
@@ -103,7 +104,7 @@ struct Renderer<'a> {
     // The text matrix, set by BT and Tm.
     text_matrix: Matrix,
     // The fonts of the resources, read once per page.
-    fonts: BTreeMap<Vec<u8>, Rc<Font>>,
+    fonts: BTreeMap<Vec<u8>, Arc<Font>>,
     // Half of 1 point in device space, in units of 1/256 pixel.
     point_half_width: i64,
     // Whether pixels are drawn; without it, the page is only interpreted.
@@ -129,7 +130,7 @@ impl Renderer<'_> {
     }
 
     /// The font of a name of the resources, read at its first use.
-    fn font(&mut self, name: &[u8]) -> Result<Rc<Font>> {
+    fn font(&mut self, name: &[u8]) -> Result<Arc<Font>> {
         if let Some(f) = self.fonts.get(name) {
             return Ok(f.clone());
         }
@@ -140,7 +141,7 @@ impl Renderer<'_> {
         let obj = fonts
             .get(name)
             .ok_or_else(|| Error::new("no such font in the resources"))?;
-        let font = Rc::new(Font::load(self.doc, obj)?);
+        let font = self.cache.get(self.doc, obj)?;
         self.fonts.insert(name.to_vec(), font.clone());
         Ok(font)
     }
@@ -384,23 +385,47 @@ impl Renderer<'_> {
 
 /// Renders a page at `dpi`. The content is checked before anything is drawn.
 pub fn render_page(doc: &Document, page: &Page, dpi: u32) -> Result<Canvas> {
-    interpret(doc, page, dpi, true)
+    render_page_with(doc, page, dpi, &FontCache::new())
+}
+
+/// Renders a page with the fonts of a cache shared by the pages of the
+/// document (docs/adr/0011).
+pub fn render_page_with(
+    doc: &Document,
+    page: &Page,
+    dpi: u32,
+    cache: &FontCache,
+) -> Result<Canvas> {
+    interpret(doc, page, dpi, true, cache)
 }
 
 /// Interprets a page without drawing pixels: the content, the resources,
 /// the fonts, the glyphs, the colors and the XObjects are read and checked
 /// as `render_page` reads them (docs/adr/0002, docs/adr/0007).
 pub fn check_page(doc: &Document, page: &Page, dpi: u32) -> Result<()> {
-    interpret(doc, page, dpi, false).map(|_| ())
+    check_page_with(doc, page, dpi, &FontCache::new())
 }
 
-fn interpret(doc: &Document, page: &Page, dpi: u32, paint: bool) -> Result<Canvas> {
+/// Checks a page with the fonts of a cache shared by the pages of the
+/// document (docs/adr/0011).
+pub fn check_page_with(doc: &Document, page: &Page, dpi: u32, cache: &FontCache) -> Result<()> {
+    interpret(doc, page, dpi, false, cache).map(|_| ())
+}
+
+fn interpret(
+    doc: &Document,
+    page: &Page,
+    dpi: u32,
+    paint: bool,
+    cache: &FontCache,
+) -> Result<Canvas> {
     let at_page = |e: Error| e.at_page(page.index + 1);
     let ops: Vec<Op> = content::parse(&page.contents).map_err(at_page)?;
     content::check_resources(doc, &page.resources, &ops).map_err(at_page)?;
     let (width, height) = page_size(&page.media_box, dpi).map_err(at_page)?;
     let mut renderer = Renderer {
         doc,
+        cache,
         resources: &page.resources,
         canvas: if paint {
             Canvas::new(width, height)
