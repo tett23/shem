@@ -57,6 +57,7 @@ The plan of each version is in [docs/roadmap.md](docs/roadmap.md).
 - Commit messages, release notes and the CHANGELOG are written in English.
 - ADRs and docs/specifications.md are written in Japanese.
 - README.md and CONTRIBUTING.md are written in English, and the English version is canonical. README.ja.md and CONTRIBUTING.ja.md are machine translations of them. A commit that changes an English version updates its translation in the same commit.
+- The commit-msg hook and CI check this ([ADR 0008](docs/adr/0008-english-canonical-readme-and-contributing.md)). When a change does not affect the translation, such as a fix of a link, add the trailer `Translation-Unchanged: <reason>` to the last paragraph of the commit message.
 
 ## Code
 

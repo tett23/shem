@@ -57,6 +57,7 @@ v1 では、汎用の PDF のラスタライザを目指す。
 - コミットメッセージ、リリースノート、CHANGELOG は英語で書く。
 - ADR と docs/specifications.md は日本語で書く。
 - README.md と CONTRIBUTING.md は英語で書き、英語版を正とする。README.ja.md と CONTRIBUTING.ja.md はその機械翻訳である。英語版を変えるコミットは、同じコミットで翻訳も更新する。
+- commit-msg の hook と CI がこれを検査する（[ADR 0008](docs/adr/0008-english-canonical-readme-and-contributing.md)）。リンクの修正など、訳に影響しない変更では、コミットメッセージの最後の段落に `Translation-Unchanged: <理由>` のトレーラーを付ける。
 
 ## コード
 
