@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use std::num::NonZeroUsize;
 
 use crate::error::Error;
+use crate::font::FontCache;
 use crate::parallel;
 use crate::pdf::Document;
 use crate::png::{encode_png, encode_ppm};
-use crate::render::{check_page, render_page};
+use crate::render::{check_page_with, render_page_with};
 
 const USAGE: &str = "usage: shem render [--dpi <N>] [--format png|ppm] [--pages <range>] [--jobs <N>] <input.pdf> <output directory>
        shem diff [--format png|ppm] [--jobs <N>] <before> <after> <output>";
@@ -215,8 +216,11 @@ fn render(r: &Render) -> std::result::Result<(), Error> {
     // Every page is checked before any file is written (docs/adr/0002). The
     // pages are checked and then rendered in parallel; the error reported is
     // the one of the first page that fails (docs/adr/0009).
+    // The fonts are read once for the check and the rendering of every page
+    // (docs/adr/0011).
+    let fonts = FontCache::new();
     parallel::run(selected.len(), r.jobs, |k| {
-        check_page(&doc, &pages[selected[k] - 1], r.dpi)
+        check_page_with(&doc, &pages[selected[k] - 1], r.dpi, &fonts)
     })
     .map_err(|(_, e)| e)?;
     let dir = PathBuf::from(&r.output);
@@ -226,7 +230,7 @@ fn render(r: &Render) -> std::result::Result<(), Error> {
     let extension = if r.ppm { "ppm" } else { "png" };
     parallel::run(selected.len(), r.jobs, |k| {
         let n = selected[k];
-        let canvas = render_page(&doc, &pages[n - 1], r.dpi)?;
+        let canvas = render_page_with(&doc, &pages[n - 1], r.dpi, &fonts)?;
         let bytes = if r.ppm {
             encode_ppm(&canvas)
         } else {

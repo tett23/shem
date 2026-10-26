@@ -129,6 +129,8 @@ v0.1 は、今の Golem の Writer が書く PDF の部分集合を読む（[ADR
 - 掛け算、割り算、行列の積と点の変換は、128 ビットの整数で計算してから一度だけ丸める（最近接の偶数への丸め）。平方根は切り捨てる。
 - 桁あふれはエラーにする。黙って折り返さない。
 
+速さの記録は `docs/benchmarks/` に置く（[2026-10-27-parallel-render.md](benchmarks/2026-10-27-parallel-render.md)、[2026-10-27-speed-up.md](benchmarks/2026-10-27-speed-up.md)）。フォントとグリフのアウトラインの使い回しなど、出力のバイト列を変えない高速化は、仕様の振る舞いを変えない（[ADR 0011](adr/0011-speed-up-without-changing-bytes.md)）。
+
 ## 配布
 
 `v` で始まるタグを push すると、Linux の x86-64 と aarch64（musl で静的にリンク）と macOS の aarch64 のアーカイブ `shem-<タグ>-<ターゲット>.tar.gz` と `SHA256SUMS` を、GitHub の Releases に置く（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)）。

@@ -185,3 +185,145 @@ fn ppm_files_hold_the_pixels() {
         b"P6\n2 1\n255\n\x01\x02\x03\x04\x05\x06".to_vec()
     );
 }
+
+// --- the speed-ups that keep the bytes (docs/adr/0011)
+
+/// The choice of filters before docs/adr/0011: every filtered row is made.
+fn reference_choose_filter(row: &[u8], prev: Option<&[u8]>) -> (u8, Vec<u8>) {
+    let up = |x: usize| prev.map_or(0, |p| p[x]);
+    let left = |x: usize| if x >= BPP { row[x - BPP] } else { 0 };
+    let up_left = |x: usize| {
+        if x >= BPP {
+            prev.map_or(0, |p| p[x - BPP])
+        } else {
+            0
+        }
+    };
+    let filtered = |kind: u8| -> Vec<u8> {
+        (0..row.len())
+            .map(|x| {
+                let predicted = match kind {
+                    0 => 0,
+                    1 => left(x),
+                    2 => up(x),
+                    3 => ((u16::from(left(x)) + u16::from(up(x))) / 2) as u8,
+                    _ => paeth(left(x), up(x), up_left(x)),
+                };
+                row[x].wrapping_sub(predicted)
+            })
+            .collect()
+    };
+    let cost = |r: &[u8]| {
+        r.iter()
+            .map(|&b| u64::from((b as i8).unsigned_abs()))
+            .sum::<u64>()
+    };
+    (0..5u8)
+        .map(|k| (k, filtered(k)))
+        .min_by_key(|(k, r)| (cost(r), *k))
+        .unwrap_or((0, row.to_vec()))
+}
+
+#[test]
+fn filters_are_chosen_as_before() {
+    let width = 37 * 3;
+    let random = lcg(width * 400, 21);
+    let rows: Vec<Vec<u8>> = (0..1000)
+        .map(|y| match y % 5 {
+            0 => random[(y / 5 % 400) * width..(y / 5 % 400 + 1) * width].to_vec(),
+            1 => vec![(y % 256) as u8; width],
+            2 => (0..width)
+                .map(|x| if (x + y) % 2 == 0 { 0 } else { 255 })
+                .collect(),
+            3 => (0..width).map(|x| (x * y % 256) as u8).collect(),
+            _ => vec![255; width],
+        })
+        .collect();
+    rows.iter().enumerate().for_each(|(y, row)| {
+        let prev = if y == 0 {
+            None
+        } else {
+            Some(rows[y - 1].as_slice())
+        };
+        assert_eq!(
+            choose_filter(row, prev),
+            reference_choose_filter(row, prev),
+            "row {y}"
+        );
+    });
+}
+
+/// The length of a match before docs/adr/0011: one byte at a time.
+fn reference_match_length(data: &[u8], candidate: usize, i: usize, max: usize) -> usize {
+    data[candidate..]
+        .iter()
+        .zip(&data[i..i + max])
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+#[test]
+fn match_lengths_are_as_before() {
+    for len in [0, 1, 3, 7, 8, 9, 15, 16, 17, 257, 258] {
+        // a prefix of `len` equal bytes, then a different byte
+        let mut data = lcg(300, 4);
+        let mut second = data[..len.min(300)].to_vec();
+        second.push(data.get(len).map_or(0, |b| b.wrapping_add(1)));
+        second.extend(lcg(300, 5));
+        let at = data.len();
+        data.extend(second);
+        let max = MAX_MATCH.min(data.len() - at);
+        assert_eq!(
+            match_length(&data, 0, at, max),
+            reference_match_length(&data, 0, at, max),
+            "{len}"
+        );
+    }
+    // the maximum is a limit even when more bytes match
+    let data = vec![9; 1000];
+    for max in [3, 7, 8, 9, 258] {
+        assert_eq!(match_length(&data, 0, 300, max), max);
+    }
+}
+
+#[test]
+fn zlib_streams_are_as_before() {
+    let inputs: Vec<Vec<u8>> = vec![
+        vec![],
+        b"abcabcabcabc".to_vec(),
+        vec![0; 100_000],
+        lcg(70_000, 5),
+        [lcg(32768, 9), lcg(32768, 9)[..1000].to_vec()].concat(),
+    ];
+    inputs
+        .iter()
+        .for_each(|d| assert_eq!(zlib(d), zlib_with(d, reference_match_length)));
+    // the filtered rows of the goldens of Golem's fixtures
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden");
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    names.sort();
+    names
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "png"))
+        .for_each(|p| {
+            let c = crate::image::decode(&std::fs::read(p).unwrap()).unwrap();
+            let rows: Vec<&[u8]> = c.pixels.chunks(c.width * 3).collect();
+            let raw: Vec<u8> = rows
+                .iter()
+                .enumerate()
+                .flat_map(|(y, row)| {
+                    let (k, f) = choose_filter(row, if y == 0 { None } else { Some(rows[y - 1]) });
+                    std::iter::once(k).chain(f)
+                })
+                .collect();
+            assert_eq!(
+                zlib(&raw),
+                zlib_with(&raw, reference_match_length),
+                "{}",
+                p.display()
+            );
+        });
+}

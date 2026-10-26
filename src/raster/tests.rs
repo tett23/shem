@@ -271,3 +271,59 @@ fn polygons_of_a_stroke_are_positive() {
         .iter()
         .for_each(|s| assert!(signed_area(&s.points) > 0));
 }
+
+// --- the cells in a Vec (docs/adr/0011)
+
+/// The coverage before docs/adr/0011: the cells in a BTreeMap.
+fn reference_coverage(path: &Path, rule: FillRule, w: usize, h: usize) -> Vec<(usize, usize, u8)> {
+    let mut map: std::collections::BTreeMap<(i32, i32), (i64, i64)> =
+        std::collections::BTreeMap::new();
+    let mut add = |row: i32, col: i32, cover: i64, area: i64| {
+        let e = map.entry((row, col)).or_insert((0, 0));
+        e.0 += cover;
+        e.1 += area;
+    };
+    path.subpaths()
+        .iter()
+        .filter(|s| s.points.len() > 1)
+        .for_each(|s| {
+            s.points
+                .windows(2)
+                .for_each(|w| render_line(&mut add, w[0], w[1]));
+            render_line(&mut add, s.points[s.points.len() - 1], s.points[0]);
+        });
+    let cells: Vec<Cell> = map
+        .into_iter()
+        .map(|((r, c), (cover, area))| (r, c, cover, area))
+        .collect();
+    sweep(&cells, rule, w, h)
+}
+
+#[test]
+fn coverage_is_as_before() {
+    let mut x: u64 = 77;
+    let mut next = |n: i32| {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((x >> 33) % n as u64) as i32
+    };
+    (0..200).for_each(|k| {
+        let mut path = Path::new();
+        (0..1 + next(3)).for_each(|_| {
+            path.move_to((next(64 * PX) - 8 * PX, next(48 * PX) - 8 * PX));
+            (0..2 + next(10))
+                .for_each(|_| path.line_to((next(64 * PX) - 8 * PX, next(48 * PX) - 8 * PX)));
+            if next(2) == 0 {
+                path.close();
+            }
+        });
+        for rule in [FillRule::NonZero, FillRule::EvenOdd] {
+            assert_eq!(
+                coverage(&path, rule, 48, 32),
+                reference_coverage(&path, rule, 48, 32),
+                "path {k}"
+            );
+        }
+    });
+}

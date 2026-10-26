@@ -5,8 +5,6 @@
 //! the signed height of the edges that cross it (cover) and twice the
 //! signed area to their left (area), and a row is swept from the left.
 
-use std::collections::BTreeMap;
-
 use crate::fixed::{div_round, isqrt};
 
 /// A point in units of 1/256 pixel.
@@ -144,13 +142,26 @@ pub fn flatten_curve(p0: Point, p1: Point, p2: Point, p3: Point) -> Vec<Point> {
     out
 }
 
-/// The cells of a path: (row, column) to (cover, area).
-type Cells = BTreeMap<(i32, i32), (i64, i64)>;
+/// A cell: (row, column, cover, area).
+pub(crate) type Cell = (i32, i32, i64, i64);
 
-fn add_cell(cells: &mut Cells, row: i32, col: i32, cover: i64, area: i64) {
-    let e = cells.entry((row, col)).or_insert((0, 0));
-    e.0 += cover;
-    e.1 += area;
+/// The cells sorted by row and column, with the values of the same cell
+/// added. The sums of integers do not depend on the order of the additions,
+/// so this gives the cells of a map from (row, column) (docs/adr/0011).
+fn merge(mut cells: Vec<Cell>) -> Vec<Cell> {
+    cells.sort_unstable_by_key(|&(row, col, _, _)| (row, col));
+    cells
+        .into_iter()
+        .fold(Vec::new(), |mut out: Vec<Cell>, (row, col, cover, area)| {
+            match out.last_mut() {
+                Some(last) if (last.0, last.1) == (row, col) => {
+                    last.2 += cover;
+                    last.3 += area;
+                }
+                _ => out.push((row, col, cover, area)),
+            }
+            out
+        })
 }
 
 /// The points where a segment crosses the multiples of ONE of one
@@ -175,8 +186,8 @@ fn interpolate(a0: i64, a1: i64, b0: i64, b1: i64, at: i64) -> i64 {
     ) as i64
 }
 
-/// Adds a line segment to the cells.
-fn render_line(cells: &mut Cells, p0: Point, p1: Point) {
+/// Adds a line segment to the cells through `add(row, column, cover, area)`.
+pub(crate) fn render_line(add: &mut impl FnMut(i32, i32, i64, i64), p0: Point, p1: Point) {
     let (x0, y0, x1, y1) = (
         i64::from(p0.0),
         i64::from(p0.1),
@@ -213,7 +224,7 @@ fn render_line(cells: &mut Cells, p0: Point, p1: Point) {
             let col = cx.min(dx).div_euclid(ONE64);
             let (fx0, fx1) = (cx - col * ONE64, dx - col * ONE64);
             let height = dy - cy;
-            add_cell(cells, row as i32, col as i32, height, (fx0 + fx1) * height);
+            add(row as i32, col as i32, height, (fx0 + fx1) * height);
         });
     });
 }
@@ -240,24 +251,35 @@ pub fn coverage(
     width: usize,
     height: usize,
 ) -> Vec<(usize, usize, u8)> {
-    let mut cells = Cells::new();
+    let mut cells: Vec<Cell> = Vec::new();
+    let mut add = |row, col, cover, area| cells.push((row, col, cover, area));
     path.subpaths
         .iter()
         .filter(|s| s.points.len() > 1)
         .for_each(|s| {
             s.points
                 .windows(2)
-                .for_each(|w| render_line(&mut cells, w[0], w[1]));
-            render_line(&mut cells, s.points[s.points.len() - 1], s.points[0]);
+                .for_each(|w| render_line(&mut add, w[0], w[1]));
+            render_line(&mut add, s.points[s.points.len() - 1], s.points[0]);
         });
+    sweep(&merge(cells), rule, width, height)
+}
+
+/// The pixels of the cells, sorted by row and column with one cell each.
+pub(crate) fn sweep(
+    cells: &[Cell],
+    rule: FillRule,
+    width: usize,
+    height: usize,
+) -> Vec<(usize, usize, u8)> {
     let (w, h) = (width as i64, height as i64);
     let mut out = Vec::new();
     let mut row_cells = cells.iter().peekable();
-    while let Some(&(&(row, _), _)) = row_cells.peek() {
+    while let Some(&&(row, _, _, _)) = row_cells.peek() {
         let cells_of_row: Vec<(i32, i64, i64)> = std::iter::from_fn(|| {
             row_cells
-                .next_if(|((r, _), _)| *r == row)
-                .map(|(&(_, col), &(cover, area))| (col, cover, area))
+                .next_if(|c| c.0 == row)
+                .map(|&(_, col, cover, area)| (col, cover, area))
         })
         .collect();
         if !(0..h).contains(&i64::from(row)) {

@@ -132,10 +132,34 @@ fn hash(d: &[u8], i: usize) -> usize {
         & ((1 << HASH_BITS) - 1)
 }
 
+/// The length of the match of `data[i..i + max]` at `candidate`: 8 bytes at
+/// a time, then the first byte that differs (docs/adr/0011).
+fn match_length(data: &[u8], candidate: usize, i: usize, max: usize) -> usize {
+    let word = |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().unwrap_or([0; 8]));
+    let mut len = 0;
+    while len + 8 <= max {
+        let diff = word(candidate + len) ^ word(i + len);
+        if diff != 0 {
+            return len + (diff.trailing_zeros() / 8) as usize;
+        }
+        len += 8;
+    }
+    len + data[candidate + len..]
+        .iter()
+        .zip(&data[i + len..i + max])
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
 /// Raw Deflate: one block with the fixed Huffman code, greedy LZ77 over a
 /// window of 32 KiB with hash chains of at most 128 candidates. The
 /// longest match wins; among equal lengths, the nearest.
 fn deflate(data: &[u8]) -> Vec<u8> {
+    deflate_with(data, match_length)
+}
+
+/// Deflate with a function for the length of a match.
+fn deflate_with(data: &[u8], match_len: impl Fn(&[u8], usize, usize, usize) -> usize) -> Vec<u8> {
     let mut w = BitWriter::default();
     w.put(1, 1); // BFINAL
     w.put(1, 2); // fixed Huffman
@@ -157,11 +181,7 @@ fn deflate(data: &[u8]) -> Vec<u8> {
             let mut candidate = head[hash(data, i)];
             let mut tries = 0;
             while candidate != none && i - candidate <= WINDOW && tries < MAX_CHAIN {
-                let len = data[candidate..]
-                    .iter()
-                    .zip(&data[i..i + max])
-                    .take_while(|(a, b)| a == b)
-                    .count();
+                let len = match_len(data, candidate, i, max);
                 if len > best_len {
                     best_len = len;
                     best_dist = i - candidate;
@@ -190,6 +210,17 @@ fn deflate(data: &[u8]) -> Vec<u8> {
     }
     literal(&mut w, 256);
     w.finish()
+}
+
+/// A zlib stream with a function for the length of a match, for the tests.
+#[cfg(test)]
+fn zlib_with(data: &[u8], match_len: impl Fn(&[u8], usize, usize, usize) -> usize) -> Vec<u8> {
+    [
+        &[0x78, 0x01][..],
+        &deflate_with(data, match_len),
+        &adler32(data).to_be_bytes(),
+    ]
+    .concat()
 }
 
 /// A zlib stream (RFC 1950): the header 78 01, Deflate and the Adler-32.
@@ -233,29 +264,27 @@ pub fn choose_filter(row: &[u8], prev: Option<&[u8]>) -> (u8, Vec<u8>) {
             0
         }
     };
-    let filtered = |kind: u8| -> Vec<u8> {
-        (0..row.len())
-            .map(|x| {
-                let predicted = match kind {
-                    0 => 0,
-                    1 => left(x),
-                    2 => up(x),
-                    3 => ((u16::from(left(x)) + u16::from(up(x))) / 2) as u8,
-                    _ => paeth(left(x), up(x), up_left(x)),
-                };
-                row[x].wrapping_sub(predicted)
-            })
-            .collect()
+    let filtered = |kind: u8, x: usize| -> u8 {
+        let predicted = match kind {
+            0 => 0,
+            1 => left(x),
+            2 => up(x),
+            3 => ((u16::from(left(x)) + u16::from(up(x))) / 2) as u8,
+            _ => paeth(left(x), up(x), up_left(x)),
+        };
+        row[x].wrapping_sub(predicted)
     };
-    let cost = |r: &[u8]| {
-        r.iter()
-            .map(|&b| u64::from((b as i8).unsigned_abs()))
-            .sum::<u64>()
-    };
-    (0..5u8)
-        .map(|k| (k, filtered(k)))
-        .min_by_key(|(k, r)| (cost(r), *k))
-        .unwrap_or((0, row.to_vec()))
+    // The sums of the five types in one pass, without making the rows
+    // (docs/adr/0011); only the chosen row is made.
+    let costs = (0..row.len()).fold([0u64; 5], |mut sums, x| {
+        (0..5u8)
+            .for_each(|k| sums[usize::from(k)] += u64::from((filtered(k, x) as i8).unsigned_abs()));
+        sums
+    });
+    let kind = (0..5u8)
+        .min_by_key(|&k| (costs[usize::from(k)], k))
+        .unwrap_or(0);
+    (kind, (0..row.len()).map(|x| filtered(kind, x)).collect())
 }
 
 fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
