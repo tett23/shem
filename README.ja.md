@@ -36,9 +36,29 @@ shem は変化を見つけるものであり、描いた結果が正しいこと
 
 ## 状態
 
-まだ何も実装していない。
-設計は [docs/adr/](docs/adr/) の ADR（Architecture Decision Record）で決めているところである。
+v0.1 の範囲を `main` に実装した。まだリリースしていない。
+設計は [docs/adr/](docs/adr/) の ADR（Architecture Decision Record）で決めている。
 仕様は [docs/specifications.md](docs/specifications.md) にある。
+
+## 使い方
+
+Cargo で shem をビルドする。
+
+```sh
+cargo build --release
+```
+
+PDF のすべてのページを、ディレクトリの PNG のファイルに描く。
+
+```sh
+target/release/shem render --dpi 150 input.pdf out
+```
+
+これは `out/page-0001.png`、`out/page-0002.png` などを書く。
+`--format ppm` を付けると、PNG の代わりに PPM のファイルを書く。PPM のバイト列は画素だけで決まる。
+`--pages 2-5` を付けると、一部のページだけを描く。
+描くページのどれかが shem の読む部分集合の外にあれば、shem はファイルを一つも書かず、その場所を標準エラーに書き、終了コード 1 で終わる。
+すべてのオプションと終了コードは `shem --help` で読める。
 
 ## 開発
 

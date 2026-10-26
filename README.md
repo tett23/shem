@@ -36,9 +36,29 @@ The plan is in [docs/roadmap.md](docs/roadmap.md).
 
 ## Status
 
-Nothing is implemented yet.
-The design is being decided in ADRs (Architecture Decision Records) under [docs/adr/](docs/adr/).
+The scope of v0.1 is implemented on `main`, and not released yet.
+The design is decided in ADRs (Architecture Decision Records) under [docs/adr/](docs/adr/).
 The specification is in [docs/specifications.md](docs/specifications.md).
+
+## Usage
+
+Build shem with Cargo:
+
+```sh
+cargo build --release
+```
+
+Render every page of a PDF to PNG files in a directory:
+
+```sh
+target/release/shem render --dpi 150 input.pdf out
+```
+
+This writes `out/page-0001.png`, `out/page-0002.png` and so on.
+`--format ppm` writes PPM files instead, whose bytes depend only on the pixels.
+`--pages 2-5` renders only some pages.
+If any page to render is outside the subset that shem reads, shem writes no file, prints the place to standard error and exits with 1.
+`shem --help` describes every option and exit status.
 
 ## Development
 
