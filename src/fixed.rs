@@ -301,3 +301,30 @@ impl Matrix {
 
 #[cfg(test)]
 mod tests;
+
+/// The value in decimal with up to six fraction digits, truncated toward
+/// zero, for messages.
+impl std::fmt::Display for Fixed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let negative = self.0 < 0;
+        let magnitude = self.0.unsigned_abs();
+        let int = magnitude >> FRAC_BITS;
+        let frac = magnitude & ((1 << FRAC_BITS) - 1);
+        let digits: String =
+            std::iter::successors(Some(frac), |&r| Some((r * 10) & ((1 << FRAC_BITS) - 1)))
+                .take(6)
+                .map(|r| char::from(b'0' + ((r * 10) >> FRAC_BITS) as u8))
+                .collect();
+        let digits = digits.trim_end_matches('0');
+        let sign = if negative && (int != 0 || !digits.is_empty()) {
+            "-"
+        } else {
+            ""
+        };
+        if digits.is_empty() {
+            write!(f, "{sign}{int}")
+        } else {
+            write!(f, "{sign}{int}.{digits}")
+        }
+    }
+}

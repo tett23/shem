@@ -14,6 +14,28 @@ v1 では、汎用の PDF のラスタライザを目指す（[roadmap.md](roadm
 目的と範囲、Golem との取り決め、決定性の約束、描く範囲は、ADR で決めているところである。
 版ごとの計画は [roadmap.md](roadmap.md) にある。
 
+## 読む PDF の部分集合
+
+v0.1 は、今の Golem の Writer が書く PDF の部分集合を読む（[ADR 0002](adr/0002-pdf-subset-and-out-of-scope-input.md)）。
+範囲の外の入力と壊れた入力は、エラーで止める。読み飛ばしも、近いものでの代用もしない。
+エラーは `page <番号>`、`object <番号>`、`offset <バイトの位置>` のうちわかるものと内容を、`page 3: offset 120: unsupported operator TJ` の形で示す。
+
+### ファイルの構造
+
+- 先頭は `%PDF-` で始まる。末尾の 1024 バイトにある `startxref` から、古典的な xref の表と trailer を読む。
+- xref のストリーム、オブジェクトのストリーム（`/Type /ObjStm`）、trailer の `Prev`、`XRefStm`、`Encrypt`、世代番号が 0 でないオブジェクトは、エラーにする。xref の表の位置にそのオブジェクトがないときもエラーにする。
+- オブジェクトは使うときに読む。ストリームの `Length` は直接の整数か、整数への間接参照とする。
+- 中身を読むストリームのフィルタは、なしか `FlateDecode` だけとする。`DecodeParms` はエラーにする。Flate の伸長は自前で行い、Adler-32 が合わなければエラーにする。
+- ページの木をたどり、`Resources`、`MediaBox`、`Rotate` を継承する。木の循環はエラーにする。`Rotate` は 0 だけを認め、`UserUnit` はエラーにする。`Contents` の配列は、ストリームの間に空白を一つ挟んでつなぐ。注釈は読まない。
+
+### ページの内容の演算子
+
+解釈する演算子は `q Q cm w m c h re f k K cs scn BT ET Tf Tz Tm Tr Tj Do BDC EMC` だけで、ほかの演算子は `unsupported operator <演算子>` のエラーにする。
+
+- 被演算子の数と型が合わなければ `wrong operands of <演算子>` のエラーにする。`w` の負の値もエラーにする。`Tr` は 0 と 2 だけを認める。
+- `q` と `Q`、`BT` と `ET`、`BDC` と `EMC` は対応する。文字のオブジェクトの中では `q Q cm Do BT` とパスの演算子を、パスの途中では `m c h re f` 以外を、エラーにする（ISO 32000-1 の附属書 L の図 9）。`c` と `h` は現在の点を要る。
+- `Tf`、`cs`、`Do` の名前は、ページの `Resources` の `Font`、`ColorSpace`、`XObject` になければエラーにする。
+
 ## 決定性
 
 同じ入力と同じオプションから、x86-64 と aarch64、Linux と macOS で、バイト単位で同じ出力を出す（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)）。
