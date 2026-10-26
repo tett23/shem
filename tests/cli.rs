@@ -269,3 +269,125 @@ fn version_and_help() {
     }
     assert_eq!(shem(&["-h"]).1, help);
 }
+
+/// The bytes of every file of a directory, by name.
+fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    files(dir)
+        .into_iter()
+        .map(|n| (n.clone(), std::fs::read(dir.join(&n)).unwrap()))
+        .collect()
+}
+
+#[test]
+fn the_output_does_not_depend_on_jobs() {
+    let dir = scratch("jobs-same");
+    ["sample", "sample-marks", "figures", "truetype"]
+        .iter()
+        .for_each(|name| {
+            ["png", "ppm"].iter().for_each(|format| {
+                let outputs: Vec<_> = ["1", "2", "16"]
+                    .iter()
+                    .map(|jobs| {
+                        let out = dir.join(format!("{name}-{format}-{jobs}"));
+                        let (code, _, stderr) = shem(&[
+                            "render",
+                            "--dpi",
+                            "50",
+                            "--format",
+                            format,
+                            "--jobs",
+                            jobs,
+                            &fixture(name),
+                            out.to_str().unwrap(),
+                        ]);
+                        assert_eq!(code, 0, "{stderr}");
+                        contents(&out)
+                    })
+                    .collect();
+                assert!(!outputs[0].is_empty());
+                assert_eq!(outputs[0], outputs[1], "{name} {format}");
+                assert_eq!(outputs[0], outputs[2], "{name} {format}");
+            });
+        });
+}
+
+#[test]
+fn many_pages_with_many_jobs() {
+    let dir = scratch("jobs-many");
+    let input = write_pdf(
+        &dir,
+        "many.pdf",
+        &pdf(&vec!["0 0 1 1 re f"; 12345], "0 0 2 2"),
+    );
+    let one = dir.join("one");
+    let eight = dir.join("eight");
+    assert_eq!(
+        shem(&[
+            "render",
+            "--jobs",
+            "1",
+            "--pages",
+            "1-64",
+            &input,
+            one.to_str().unwrap()
+        ])
+        .0,
+        0
+    );
+    assert_eq!(
+        shem(&[
+            "render",
+            "--jobs",
+            "8",
+            "--pages",
+            "1-64",
+            &input,
+            eight.to_str().unwrap()
+        ])
+        .0,
+        0
+    );
+    assert_eq!(files(&eight).len(), 64);
+    assert_eq!(contents(&one), contents(&eight));
+}
+
+#[test]
+fn the_error_of_the_first_bad_page_is_reported_whatever_the_jobs() {
+    let dir = scratch("jobs-error");
+    let input = write_pdf(
+        &dir,
+        "bad.pdf",
+        &pdf(&["", "q (x) TJ Q", "", "q (y) Td Q", ""], "0 0 10 10"),
+    );
+    let out = dir.join("out");
+    for jobs in ["1", "8"] {
+        for _ in 0..20 {
+            let (code, stdout, stderr) =
+                shem(&["render", "--jobs", jobs, &input, out.to_str().unwrap()]);
+            assert_eq!(code, 1);
+            assert_eq!(stdout, "");
+            assert_eq!(
+                stderr,
+                format!("shem: {input}: page 2: offset 6: unsupported operator TJ\n")
+            );
+            assert!(files(&out).is_empty());
+        }
+    }
+}
+
+#[test]
+fn wrong_jobs_are_usage_errors() {
+    let dir = scratch("jobs-usage");
+    let o = dir.join("out");
+    let o = o.to_str().unwrap();
+    let input = fixture("sample");
+    for args in [
+        vec!["render", "--jobs", "0", &input, o],
+        vec!["render", "--jobs", "1025", &input, o],
+        vec!["render", "--jobs", "x", &input, o],
+        vec!["render", "--jobs", "2", "--jobs", "2", &input, o],
+    ] {
+        assert_eq!(shem(&args).0, 64, "{args:?}");
+    }
+    assert!(shem(&["--help"]).1.contains("--jobs"));
+}
