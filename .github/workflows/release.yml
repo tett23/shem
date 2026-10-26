@@ -1,0 +1,124 @@
+# Releases for the tags v* (docs/adr/0001)
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify tag matches Cargo.toml version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::The tag $TAG does not match the version of Cargo.toml ($version)"
+            exit 1
+          fi
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - run: cargo test --locked
+
+  build:
+    needs: verify
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Verify binary version
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          actual=$("target/$TARGET/release/shem" --version)
+          if [ "$actual" != "shem ${TAG#v}" ]; then
+            echo "::error::The version of the binary ($actual) does not match the tag $TAG"
+            exit 1
+          fi
+      - name: Verify static linking
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          if ldd "target/$TARGET/release/shem" 2>&1 | grep -q '=>'; then
+            echo "::error::The binary links dynamically"
+            exit 1
+          fi
+      - name: Package
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="shem-$TAG-$TARGET"
+          mkdir "$name"
+          cp "target/$TARGET/release/shem" LICENSE README.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          listing=$(tar -tzf "$name.tar.gz")
+          for file in shem LICENSE README.md; do
+            if ! printf '%s\n' "$listing" | grep -qxF "$name/$file"; then
+              echo "::error::$name.tar.gz has no $file"
+              exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: shem-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum shem-*.tar.gz > SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A tag with a hyphen (v0.1.0-rc1 and so on) is a pre-release
+          prerelease=()
+          case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$TAG" dist/* --title "$TAG" --generate-notes --verify-tag "${prerelease[@]}"

@@ -39,6 +39,8 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
+      # src/ has no floating-point types (docs/adr/0001)
+      - run: sh scripts/ci/check-no-float.sh
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked

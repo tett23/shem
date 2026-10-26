@@ -14,6 +14,21 @@ v1 では、汎用の PDF のラスタライザを目指す（[roadmap.md](roadm
 目的と範囲、Golem との取り決め、決定性の約束、描く範囲は、ADR で決めているところである。
 版ごとの計画は [roadmap.md](roadmap.md) にある。
 
+## 決定性
+
+同じ入力と同じオプションから、x86-64 と aarch64、Linux と macOS で、バイト単位で同じ出力を出す（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)）。
+
+- 入力から画素までの経路で、浮動小数点数を使わない。CI は `src/` に `f32` と `f64` がないことを `scripts/ci/check-no-float.sh` で確かめる。
+- 実数と行列の要素は Q32.32（符号付き 64 ビットの整数、小数部 32 ビット）で表す。
+- 十進の数の文字列は、桁数によらず正確に、最も近い Q32.32 の値に丸める（同じ近さなら偶数）。整数部の絶対値は 2^31 未満とし、超えればエラーにする。
+- 掛け算、割り算、行列の積と点の変換は、128 ビットの整数で計算してから一度だけ丸める（最近接の偶数への丸め）。平方根は切り捨てる。
+- 桁あふれはエラーにする。黙って折り返さない。
+
+## 配布
+
+`v` で始まるタグを push すると、Linux の x86-64 と aarch64（musl で静的にリンク）と macOS の aarch64 のアーカイブ `shem-<タグ>-<ターゲット>.tar.gz` と `SHA256SUMS` を、GitHub の Releases に置く（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)）。
+タグと `Cargo.toml` の版が合わなければ、リリースは失敗する。
+
 ## 文書の翻訳
 
 README.md と CONTRIBUTING.md は英語を正とし、README.ja.md と CONTRIBUTING.ja.md をその機械翻訳とする（[ADR 0008](adr/0008-english-canonical-readme-and-contributing.md)）。
