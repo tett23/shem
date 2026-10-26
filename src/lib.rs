@@ -5,5 +5,8 @@
 //! fixed-point arithmetic only, so that its output is the same on every
 //! machine.
 
+pub mod content;
 pub mod error;
 pub mod fixed;
+pub mod flate;
+pub mod pdf;

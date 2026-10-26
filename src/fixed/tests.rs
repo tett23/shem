@@ -222,3 +222,11 @@ fn determinant() {
     assert_eq!(m(["2", "0", "0", "3", "5", "5"]).det().unwrap(), p("6"));
     assert_eq!(m(["0", "-1", "1", "0", "0", "0"]).det().unwrap(), p("1"));
 }
+
+#[test]
+fn display_in_decimal() {
+    assert_eq!(p("90").to_string(), "90");
+    assert_eq!(p("-2.5").to_string(), "-2.5");
+    assert_eq!(p("0.0041666667").to_string(), "0.004166");
+    assert_eq!(p("-0").to_string(), "0");
+}
