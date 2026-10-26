@@ -1,0 +1,3 @@
+#!/bin/sh
+# Committed ADRs may change only in their status lines and links
+exec adr-guard pre-commit --allow-status --allow-links

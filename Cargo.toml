@@ -1,0 +1,10 @@
+[package]
+name = "shem"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "A deterministic rasterizer for the subset of PDF written by Golem"
+repository = "https://github.com/tett23/shem"
+
+[dependencies]
