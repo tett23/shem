@@ -35,6 +35,13 @@ cargo test --locked
 
 Fixes of typos and of documents that do not change the specification need no ADR.
 
+## Scope
+
+v0.1 reads only the subset of PDF that the current Golem writes.
+v1 aims to be a general-purpose PDF rasterizer.
+A change that widens the scope, whether to follow Golem or to move toward v1, starts with an ADR.
+The plan of each version is in [docs/roadmap.md](docs/roadmap.md).
+
 ## ADRs
 
 - ADRs are in `docs/adr/`, named like `0001-scope-and-determinism.md`: a sequential number and a readable kebab-case name.

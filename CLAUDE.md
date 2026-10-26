@@ -1,11 +1,14 @@
 # shem
 
-shem は、Golem（https://github.com/tett23/golem ）が書く PDF の部分集合を、どの機械でも同じバイト列の PNG に描くラスタライザである。
+shem は、PDF のページを、どの機械でも同じバイト列の PNG に描くラスタライザである。
+v0.1 は、今の Golem（https://github.com/tett23/golem ）が書く PDF の部分集合に合っていればよい。
+v1 では、汎用の PDF のラスタライザを目指す（docs/roadmap.md）。
 実装言語は Rust、ライセンスは MIT とする。
 
 ## ディレクトリ構成
 
 - **docs/specifications.md** 今の振る舞いを定める仕様書。日本語で書く。ADR を参照するときはリンクを付ける。
+- **docs/roadmap.md** 版ごとの計画（v0.1、v0.x、v1 の範囲）と、まだ実装していない項目を置く。specifications.md には今の振る舞いだけを書き、版の予定を書かない。
 - **docs/adr/** ADR を置く。ファイル名は `0001-feature-details.md` のように連番の prefix と kebab-case の名前を付ける。内容はグローバルの CLAUDE.md の構成（ステータス、文脈、実装すること、実装しないこと、テスト設計、トレードオフ、参考文献）に従う。日本語で書く。
   - コミット済みの ADR はステータスの行とリンクを除き変更不可（adr-guard が強制する）。変更が必要な場合は新たな ADR を作成する。
   - ADR は行頭が `ステータス:` のステータスの行をちょうど一つ持つ。
@@ -22,7 +25,7 @@ shem は、Golem（https://github.com/tett23/golem ）が書く PDF の部分集
 ## 実装の約束
 
 - 入力から画素までの経路で浮動小数点数を使わない。整数と固定小数点の演算だけを使う（x86-64 と aarch64、Linux と macOS で同じバイト列を出すため）。
-- 描く範囲は Golem の Writer が書く PDF の部分集合に限る。範囲の外のものに出会ったときの振る舞いは ADR で決める。
+- v0.1 の描く範囲は、今の Golem の Writer が書く PDF の部分集合に限る。範囲を広げるとき（Golem への追従と、v1 に向けた拡大）は ADR から始める。範囲の外のものに出会ったときの振る舞いは ADR で決める。
 - 依存は増やさない。必要な処理は、できるかぎり自前で書き、テストを厚く書く。
 
 ## skills
