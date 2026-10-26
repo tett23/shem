@@ -1,9 +1,10 @@
 //! Interpreting a page's content into an image (docs/adr/0003).
 
+use crate::color::{self, Device, FillSpace, Separation};
 use crate::content::{self, Op, Operator};
 use crate::error::{Error, Result};
 use crate::fixed::{Fixed, Matrix};
-use crate::pdf::{Document, Page};
+use crate::pdf::{Dict, Document, Page};
 use crate::raster::{Canvas, FillRule, Path, Point, coverage};
 
 /// The largest number of pixels of a page (docs/adr/0007).
@@ -74,16 +75,22 @@ struct GraphicsState {
     ctm: Matrix,
     line_width: Fixed,
     fill: [u8; 3],
+    fill_space: FillSpace,
+    // Read by the stroke of text (docs/adr/0004).
+    #[allow(dead_code)]
+    stroke: [u8; 3],
 }
 
-struct Renderer {
+struct Renderer<'a> {
+    doc: &'a Document,
+    resources: &'a Dict,
     canvas: Canvas,
     state: GraphicsState,
     stack: Vec<GraphicsState>,
     path: Path,
 }
 
-impl Renderer {
+impl Renderer<'_> {
     fn point(&self, x: Fixed, y: Fixed) -> Result<Point> {
         to_device(&self.state.ctm, x, y)
     }
@@ -137,6 +144,32 @@ impl Renderer {
                 let rgb = self.state.fill;
                 self.fill(&path, rgb);
             }
+            Operator::FillCmyk(v) => {
+                self.state.fill_space = FillSpace::Device(Device::Cmyk);
+                self.state.fill = color::cmyk(*v);
+            }
+            Operator::StrokeCmyk(v) => self.state.stroke = color::cmyk(*v),
+            Operator::FillSpace(name) => {
+                let spaces = self
+                    .doc
+                    .get_dict(self.resources, "ColorSpace")?
+                    .unwrap_or_default();
+                let space = spaces
+                    .get(name)
+                    .ok_or_else(|| Error::new("no such color space in the resources"))?;
+                let separation = Separation::load(self.doc, space)?;
+                // The initial color of a Separation is the tint 1 (8.6.6.4).
+                self.state.fill = separation.rgb(Fixed::ONE)?;
+                self.state.fill_space = FillSpace::Separation(separation);
+            }
+            Operator::FillColor(tint) => match &self.state.fill_space {
+                FillSpace::Separation(s) => self.state.fill = s.rgb(*tint)?,
+                FillSpace::Device(_) => {
+                    return Err(Error::new(
+                        "unsupported scn with a color space other than Separation",
+                    ));
+                }
+            },
             Operator::BeginMarked | Operator::EndMarked => {}
             other => return Err(Error::new(format!("not implemented yet: {other:?}"))),
         }
@@ -151,11 +184,15 @@ pub fn render_page(doc: &Document, page: &Page, dpi: u32) -> Result<Canvas> {
     content::check_resources(doc, &page.resources, &ops).map_err(at_page)?;
     let (width, height) = page_size(&page.media_box, dpi).map_err(at_page)?;
     let mut renderer = Renderer {
+        doc,
+        resources: &page.resources,
         canvas: Canvas::new(width, height),
         state: GraphicsState {
             ctm: device_matrix(&page.media_box, dpi).map_err(at_page)?,
             line_width: Fixed::ONE,
             fill: [0, 0, 0],
+            fill_space: FillSpace::Device(Device::Gray),
+            stroke: [0, 0, 0],
         },
         stack: Vec::new(),
         path: Path::new(),
@@ -169,4 +206,4 @@ pub fn render_page(doc: &Document, page: &Page, dpi: u32) -> Result<Canvas> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
