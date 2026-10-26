@@ -35,6 +35,13 @@ cargo test --locked
 
 誤字の修正や、仕様を変えない文書の修正には ADR は要らない。
 
+## 範囲
+
+v0.1 は、今の Golem が書く PDF の部分集合だけを読む。
+v1 では、汎用の PDF のラスタライザを目指す。
+範囲を広げる変更は、Golem に追従するためのものでも、v1 に向かうためのものでも、ADR から始める。
+各版の計画は [docs/roadmap.md](docs/roadmap.md) にある。
+
 ## ADR
 
 - ADR は `docs/adr/` に置き、`0001-scope-and-determinism.md` のように、連番と、読んでわかる kebab-case の名前を付ける。
