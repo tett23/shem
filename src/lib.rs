@@ -10,6 +10,7 @@ pub mod content;
 pub mod error;
 pub mod fixed;
 pub mod flate;
+pub mod font;
 pub mod pdf;
 pub mod raster;
 pub mod render;

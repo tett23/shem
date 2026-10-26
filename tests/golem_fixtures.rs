@@ -55,3 +55,46 @@ fn every_flate_stream_inflates() {
             });
     });
 }
+
+#[test]
+fn the_pages_without_figures_render() {
+    ["sample", "sample-marks"].iter().for_each(|name| {
+        let doc = Document::parse(&fixture(name)).unwrap();
+        doc.pages().unwrap().iter().for_each(|page| {
+            let canvas =
+                shem::render::render_page(&doc, page, 72).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                canvas.pixels.iter().any(|&v| v != 255),
+                "{name}: page {} is blank",
+                page.index + 1
+            );
+        });
+    });
+}
+
+#[test]
+fn a_cid_of_noto_serif_jp_is_mapped_by_the_charset() {
+    // golem-pdf ADR 0011: in Noto Serif JP, the glyph 466 has the CID 722
+    let doc = Document::parse(&fixture("sample")).unwrap();
+    let page = &doc.pages().unwrap()[0];
+    let font = doc.get_dict(&page.resources, "Font").unwrap().unwrap();
+    let type0 = doc.resolve(&font[b"F1".as_slice()]).unwrap();
+    let cidfont = match doc
+        .get(type0.as_dict().unwrap(), "DescendantFonts")
+        .unwrap()
+        .unwrap()
+    {
+        Object::Array(a) => doc.resolve(&a[0]).unwrap(),
+        other => panic!("{other:?}"),
+    };
+    let descriptor = doc
+        .get_dict(cidfont.as_dict().unwrap(), "FontDescriptor")
+        .unwrap()
+        .unwrap();
+    let Some(Object::Stream(file)) = doc.get(&descriptor, "FontFile3").unwrap() else {
+        panic!()
+    };
+    let cff = shem::font::cff::Cff::parse(&doc.stream_data(&file).unwrap()).unwrap();
+    assert!(cff.is_cid_keyed());
+    assert_eq!(cff.gid(722).unwrap(), 466);
+}

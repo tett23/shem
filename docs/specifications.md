@@ -48,6 +48,18 @@ v0.1 は、今の Golem の Writer が書く PDF の部分集合を読む（[ADR
 - ページは白で始まる。塗る色 `c` は、不透明度 `a` で画素 `p` に `(c × a + p × (255 − a) + 127) / 255` として合成する。塗りの演算子ごとに、パス全体の覆いを求めてから一度だけ合成する。
 - 線は、線端を butt、角を miter（上限 10、超えれば bevel）とし、区間ごとの四角形と継ぎ目の多角形を、向きを正にそろえて nonzero で塗る。線の幅は利用者の空間の値に `sqrt(|det CTM|)` を掛ける。幅 0 は 1 画素とする。角を保たない CTM での線はエラーにする。
 
+## 文字
+
+フォントは、Type 0 のフォントと一つの CIDFont だけを読み、アウトラインは自前で読む。ヒンティングはしない（[ADR 0004](adr/0004-glyph-outlines-cid-mapping-and-vertical-writing.md)）。
+
+- `Encoding` は `/Identity-H` か `/Identity-V` の名前に限る。文字列は 2 バイトずつの CID とし、長さが奇数ならエラーにする。
+- `CIDFontType0` は `FontFile3 /Subtype /CIDFontType0C` の裸の CFF を読む。Top DICT に `ROS` があれば charset（形式 0、1、2）で CID からグリフ ID を引き、なければ CID をグリフ ID とする。CID-keyed の CFF は `FDArray` と `FDSelect`（形式 0、3）で局所のサブルーチンを選ぶ。`FontMatrix` は `[0.001 0 0 0.001 0 0]` だけを認める。
+- Type 2 charstring は、パスの演算子、`endchar`、サブルーチンの呼び出し、ヒントの演算子（数えるだけ）を解釈する。算術と記憶の演算子、`random`、`seac` の形の `endchar` はエラーにする。スタックは 48、呼び出しの深さは 10 までとする。
+- `CIDFontType2` は `FontFile2` の `head`、`maxp`、`loca`、`glyf` を読み、CID をグリフ ID とする。`CIDToGIDMap` は `/Identity` か省略だけを認める。2 次の曲線は 3 次に直す。複合のグリフは、点の合わせと `SCALED_COMPONENT_OFFSET` をエラーにし、入れ子は 8 段までとする。
+- 文字の描画の行列は `Trm = [Tfs·Th 0 0 Tfs 0 0] × Tm × CTM` とする。縦組みでは、グリフを位置ベクトル `v` だけ戻して置く。`v` は `W2` か、`DW2`（既定は `[880 −1000]`）の `vy` と `W`（既定は `DW`、1000）の半分の `vx` とする。
+- `Tj` の後、字ごとに字送り（横組みは `w0`、縦組みは `w1`）の分だけ `Tm` を進める。
+- `0 Tr` はグリフを塗り、`2 Tr` は塗った後に線でなぞる。線の幅は CTM で装置の空間に写す。
+
 ## 色
 
 画素は 8 ビットの RGB で、紙は白とする。ICC のプロファイルは使わない（[ADR 0005](adr/0005-device-colors-and-cmyk-conversion.md)）。

@@ -4,8 +4,11 @@ use crate::color::{self, Device, FillSpace, Separation};
 use crate::content::{self, Op, Operator};
 use crate::error::{Error, Result};
 use crate::fixed::{Fixed, Matrix};
+use crate::font::{Font, Segment};
 use crate::pdf::{Dict, Document, Page};
-use crate::raster::{Canvas, FillRule, Path, Point, coverage};
+use crate::raster::{Canvas, FillRule, Path, Point, coverage, stroke};
+use std::collections::BTreeMap;
+use std::rc::Rc;
 
 /// The largest number of pixels of a page (docs/adr/0007).
 const MAX_PIXELS: u128 = 1 << 28;
@@ -76,9 +79,13 @@ struct GraphicsState {
     line_width: Fixed,
     fill: [u8; 3],
     fill_space: FillSpace,
-    // Read by the stroke of text (docs/adr/0004).
-    #[allow(dead_code)]
     stroke: [u8; 3],
+    // The text state (ISO 32000-1 9.3): the font and its size, the
+    // horizontal scaling (Tz / 100) and the rendering mode.
+    font: Option<Rc<Font>>,
+    font_size: Fixed,
+    h_scale: Fixed,
+    render_mode: i64,
 }
 
 struct Renderer<'a> {
@@ -88,6 +95,10 @@ struct Renderer<'a> {
     state: GraphicsState,
     stack: Vec<GraphicsState>,
     path: Path,
+    // The text matrix, set by BT and Tm.
+    text_matrix: Matrix,
+    // The fonts of the resources, read once per page.
+    fonts: BTreeMap<Vec<u8>, Rc<Font>>,
 }
 
 impl Renderer<'_> {
@@ -103,6 +114,97 @@ impl Renderer<'_> {
             self.canvas.height,
         );
         self.canvas.paint(&cov, rgb);
+    }
+
+    /// The font of a name of the resources, read at its first use.
+    fn font(&mut self, name: &[u8]) -> Result<Rc<Font>> {
+        if let Some(f) = self.fonts.get(name) {
+            return Ok(f.clone());
+        }
+        let fonts = self
+            .doc
+            .get_dict(self.resources, "Font")?
+            .unwrap_or_default();
+        let obj = fonts
+            .get(name)
+            .ok_or_else(|| Error::new("no such font in the resources"))?;
+        let font = Rc::new(Font::load(self.doc, obj)?);
+        self.fonts.insert(name.to_vec(), font.clone());
+        Ok(font)
+    }
+
+    /// Shows a string: each two bytes are a CID (Identity-H and Identity-V).
+    fn show_text(&mut self, s: &[u8]) -> Result<()> {
+        let font = self
+            .state
+            .font
+            .clone()
+            .ok_or_else(|| Error::new("Tj without a font"))?;
+        if !s.len().is_multiple_of(2) {
+            return Err(Error::new("a string of odd length for a two-byte encoding"));
+        }
+        s.chunks(2).try_for_each(|pair| {
+            let cid = u16::from_be_bytes([pair[0], pair[1]]);
+            self.show_glyph(&font, cid)
+        })
+    }
+
+    fn show_glyph(&mut self, font: &Font, cid: u16) -> Result<()> {
+        let size = self.state.font_size;
+        let thousandth = |v: Fixed| v.checked_div(Fixed::from_int(1000)?);
+        // Trm = [Tfs·Th 0 0 Tfs 0 0] × Tm × CTM (ISO 32000-1 9.4.4)
+        let scale = Matrix::new([
+            size.checked_mul(self.state.h_scale)?,
+            Fixed::ZERO,
+            Fixed::ZERO,
+            size,
+            Fixed::ZERO,
+            Fixed::ZERO,
+        ]);
+        let trm = scale.concat(&self.text_matrix)?.concat(&self.state.ctm)?;
+        // In vertical writing, the glyph is placed back by its position vector (9.7.4.3).
+        let (shift, advance) = if font.is_vertical() {
+            let (w1, vx, vy) = font.vertical_metrics(cid)?;
+            let shift = Matrix::translation(
+                thousandth(vx)?.checked_neg()?,
+                thousandth(vy)?.checked_neg()?,
+            );
+            (
+                shift,
+                Matrix::translation(Fixed::ZERO, thousandth(w1)?.checked_mul(size)?),
+            )
+        } else {
+            let tx = thousandth(font.width(cid))?
+                .checked_mul(size)?
+                .checked_mul(self.state.h_scale)?;
+            (Matrix::IDENTITY, Matrix::translation(tx, Fixed::ZERO))
+        };
+        let m = font.glyph_matrix()?.concat(&shift)?.concat(&trm)?;
+        let mut path = Path::new();
+        font.outline(cid)?.iter().try_for_each(|s| {
+            match *s {
+                Segment::Move(x, y) => path.move_to(to_device(&m, x, y)?),
+                Segment::Line(x, y) => path.line_to(to_device(&m, x, y)?),
+                Segment::Curve([x1, y1, x2, y2, x3, y3]) => path.curve_to(
+                    to_device(&m, x1, y1)?,
+                    to_device(&m, x2, y2)?,
+                    to_device(&m, x3, y3)?,
+                ),
+                Segment::Close => path.close(),
+            }
+            Ok::<_, Error>(())
+        })?;
+        // Each glyph is filled, then stroked in mode 2 (9.3.6).
+        let fill = self.state.fill;
+        self.fill(&path, fill);
+        if self.state.render_mode == 2 {
+            // The line width is in user space, so the CTM decides the width.
+            let half = stroke_half_width(&self.state.ctm, self.state.line_width)?;
+            let rgb = self.state.stroke;
+            self.fill(&stroke(&path, half), rgb);
+        }
+        self.text_matrix = advance.concat(&self.text_matrix)?;
+        Ok(())
     }
 
     fn op(&mut self, op: &Operator) -> Result<()> {
@@ -171,6 +273,16 @@ impl Renderer<'_> {
                 }
             },
             Operator::BeginMarked | Operator::EndMarked => {}
+            Operator::BeginText => self.text_matrix = Matrix::IDENTITY,
+            Operator::EndText => {}
+            Operator::Font(name, size) => {
+                self.state.font = Some(self.font(name)?);
+                self.state.font_size = *size;
+            }
+            Operator::HScale(v) => self.state.h_scale = v.checked_div(Fixed::from_int(100)?)?,
+            Operator::RenderMode(m) => self.state.render_mode = *m,
+            Operator::TextMatrix(m) => self.text_matrix = *m,
+            Operator::ShowText(s) => self.show_text(s)?,
             other => return Err(Error::new(format!("not implemented yet: {other:?}"))),
         }
         Ok(())
@@ -193,9 +305,15 @@ pub fn render_page(doc: &Document, page: &Page, dpi: u32) -> Result<Canvas> {
             fill: [0, 0, 0],
             fill_space: FillSpace::Device(Device::Gray),
             stroke: [0, 0, 0],
+            font: None,
+            font_size: Fixed::ZERO,
+            h_scale: Fixed::ONE,
+            render_mode: 0,
         },
         stack: Vec::new(),
         path: Path::new(),
+        text_matrix: Matrix::IDENTITY,
+        fonts: BTreeMap::new(),
     };
     ops.iter().try_for_each(|op| {
         renderer
