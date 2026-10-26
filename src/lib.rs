@@ -12,6 +12,7 @@ pub mod error;
 pub mod fixed;
 pub mod flate;
 pub mod font;
+pub mod parallel;
 pub mod pdf;
 pub mod png;
 pub mod raster;

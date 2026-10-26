@@ -3,18 +3,22 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use std::num::NonZeroUsize;
+
 use crate::error::Error;
+use crate::parallel;
 use crate::pdf::Document;
 use crate::png::{encode_png, encode_ppm};
 use crate::render::{check_page, render_page};
 
-const USAGE: &str = "usage: shem render [--dpi <N>] [--format png|ppm] [--pages <range>] <input.pdf> <output directory>";
+const USAGE: &str = "usage: shem render [--dpi <N>] [--format png|ppm] [--pages <range>] [--jobs <N>] <input.pdf> <output directory>";
 
 const HELP: &str =
     "shem: renders the pages of a PDF to PNG or PPM images, with the same bytes on every machine.
 
 usage:
-  shem render [--dpi <N>] [--format png|ppm] [--pages <range>] <input.pdf> <output directory>
+  shem render [--dpi <N>] [--format png|ppm] [--pages <range>] [--jobs <N>]
+              <input.pdf> <output directory>
   shem --version
   shem --help
 
@@ -31,6 +35,9 @@ options:
                      between versions of shem with the same pixels
   --pages <range>    the pages to render, such as 3, 2-5 or 1,3,5-7
                      (default all)
+  --jobs <N>         the number of pages rendered at once, an integer from 1
+                     to 1024 (default: the number of cores). The output does
+                     not depend on it
 
 The size of an image is the size of the MediaBox times dpi / 72, rounded up.
 
@@ -52,6 +59,7 @@ Exit status:
 /// The options of `render`.
 struct Render {
     dpi: u32,
+    jobs: NonZeroUsize,
     ppm: bool,
     pages: Option<Vec<(usize, usize)>>,
     input: String,
@@ -82,6 +90,7 @@ fn parse_render(args: &[String]) -> std::result::Result<Render, String> {
     let mut dpi = None;
     let mut format = None;
     let mut pages = None;
+    let mut jobs = None;
     let mut positional = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -120,6 +129,18 @@ fn parse_render(args: &[String]) -> std::result::Result<Render, String> {
                     return usage_error("--pages is given twice");
                 }
             }
+            "--jobs" => {
+                let v = value("--jobs")?;
+                let n = v
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=1024).contains(n) && v.bytes().all(|c| c.is_ascii_digit()))
+                    .and_then(NonZeroUsize::new)
+                    .ok_or_else(|| format!("--jobs must be an integer from 1 to 1024: {v}"))?;
+                if jobs.replace(n).is_some() {
+                    return usage_error("--jobs is given twice");
+                }
+            }
             a if a.starts_with('-') && a.len() > 1 => {
                 return usage_error(&format!("unknown option {a}"));
             }
@@ -129,6 +150,7 @@ fn parse_render(args: &[String]) -> std::result::Result<Render, String> {
     match positional.as_slice() {
         [input, output] => Ok(Render {
             dpi: dpi.unwrap_or(150),
+            jobs: jobs.unwrap_or_else(parallel::available_jobs),
             ppm: format.unwrap_or(false),
             pages,
             input: input.clone(),
@@ -167,16 +189,20 @@ fn render(r: &Render) -> std::result::Result<(), Error> {
             numbers
         }
     };
-    // Every page is checked before any file is written (docs/adr/0002).
-    selected
-        .iter()
-        .try_for_each(|&n| check_page(&doc, &pages[n - 1], r.dpi))?;
+    // Every page is checked before any file is written (docs/adr/0002). The
+    // pages are checked and then rendered in parallel; the error reported is
+    // the one of the first page that fails (docs/adr/0009).
+    parallel::run(selected.len(), r.jobs, |k| {
+        check_page(&doc, &pages[selected[k] - 1], r.dpi)
+    })
+    .map_err(|(_, e)| e)?;
     let dir = PathBuf::from(&r.output);
     let io = |e: std::io::Error| Error::new(format!("{}: {e}", r.output));
     std::fs::create_dir_all(&dir).map_err(io)?;
     let digits = count.to_string().len().max(4);
     let extension = if r.ppm { "ppm" } else { "png" };
-    selected.iter().try_for_each(|&n| {
+    parallel::run(selected.len(), r.jobs, |k| {
+        let n = selected[k];
         let canvas = render_page(&doc, &pages[n - 1], r.dpi)?;
         let bytes = if r.ppm {
             encode_ppm(&canvas)
@@ -185,6 +211,7 @@ fn render(r: &Render) -> std::result::Result<(), Error> {
         };
         write_file(&dir, &format!("page-{n:0digits$}.{extension}"), &bytes).map_err(io)
     })
+    .map_err(|(_, e)| e)
 }
 
 /// Runs the command line and returns the exit status.

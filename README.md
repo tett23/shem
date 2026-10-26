@@ -80,6 +80,7 @@ shem render --dpi 150 input.pdf out
 This writes `out/page-0001.png`, `out/page-0002.png` and so on.
 `--format ppm` writes PPM files instead, whose bytes depend only on the pixels.
 `--pages 2-5` renders only some pages.
+Pages are rendered in parallel on every core; `--jobs <N>` sets how many at once, and the output does not depend on it.
 If any page to render is outside the subset that shem reads, shem writes no file, prints the place to standard error and exits with 1.
 `shem --help` describes every option and exit status.
 
