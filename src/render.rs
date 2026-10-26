@@ -106,6 +106,8 @@ struct Renderer<'a> {
     fonts: BTreeMap<Vec<u8>, Rc<Font>>,
     // Half of 1 point in device space, in units of 1/256 pixel.
     point_half_width: i64,
+    // Whether pixels are drawn; without it, the page is only interpreted.
+    paint: bool,
 }
 
 impl Renderer<'_> {
@@ -114,6 +116,9 @@ impl Renderer<'_> {
     }
 
     fn fill(&mut self, path: &Path, rgb: [u8; 3]) {
+        if !self.paint {
+            return;
+        }
         let cov = coverage(
             path,
             FillRule::NonZero,
@@ -379,6 +384,17 @@ impl Renderer<'_> {
 
 /// Renders a page at `dpi`. The content is checked before anything is drawn.
 pub fn render_page(doc: &Document, page: &Page, dpi: u32) -> Result<Canvas> {
+    interpret(doc, page, dpi, true)
+}
+
+/// Interprets a page without drawing pixels: the content, the resources,
+/// the fonts, the glyphs, the colors and the XObjects are read and checked
+/// as `render_page` reads them (docs/adr/0002, docs/adr/0007).
+pub fn check_page(doc: &Document, page: &Page, dpi: u32) -> Result<()> {
+    interpret(doc, page, dpi, false).map(|_| ())
+}
+
+fn interpret(doc: &Document, page: &Page, dpi: u32, paint: bool) -> Result<Canvas> {
     let at_page = |e: Error| e.at_page(page.index + 1);
     let ops: Vec<Op> = content::parse(&page.contents).map_err(at_page)?;
     content::check_resources(doc, &page.resources, &ops).map_err(at_page)?;
@@ -386,7 +402,12 @@ pub fn render_page(doc: &Document, page: &Page, dpi: u32) -> Result<Canvas> {
     let mut renderer = Renderer {
         doc,
         resources: &page.resources,
-        canvas: Canvas::new(width, height),
+        canvas: if paint {
+            Canvas::new(width, height)
+        } else {
+            Canvas::new(0, 0)
+        },
+        paint,
         state: GraphicsState {
             ctm: device_matrix(&page.media_box, dpi).map_err(at_page)?,
             line_width: Fixed::ONE,
