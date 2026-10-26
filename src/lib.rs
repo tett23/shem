@@ -8,10 +8,12 @@
 pub mod cli;
 pub mod color;
 pub mod content;
+pub mod diff;
 pub mod error;
 pub mod fixed;
 pub mod flate;
 pub mod font;
+pub mod image;
 pub mod parallel;
 pub mod pdf;
 pub mod png;
