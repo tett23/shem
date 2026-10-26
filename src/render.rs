@@ -13,6 +13,7 @@ use crate::raster::{Canvas, FillRule, Path, Point, coverage, signed_area, stroke
 const BOX_FILL: [u8; 3] = [192, 192, 192];
 const BOX_LINE: [u8; 3] = [96, 96, 96];
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 /// The largest number of pixels of a page (docs/adr/0007).
@@ -385,7 +386,7 @@ impl Renderer<'_> {
 
 /// Renders a page at `dpi`. The content is checked before anything is drawn.
 pub fn render_page(doc: &Document, page: &Page, dpi: u32) -> Result<Canvas> {
-    render_page_with(doc, page, dpi, &FontCache::new())
+    Session::single(doc, page, dpi).render(0)
 }
 
 /// Renders a page with the fonts of a cache shared by the pages of the
@@ -403,7 +404,7 @@ pub fn render_page_with(
 /// the fonts, the glyphs, the colors and the XObjects are read and checked
 /// as `render_page` reads them (docs/adr/0002, docs/adr/0007).
 pub fn check_page(doc: &Document, page: &Page, dpi: u32) -> Result<()> {
-    check_page_with(doc, page, dpi, &FontCache::new())
+    Session::single(doc, page, dpi).check(0)
 }
 
 /// Checks a page with the fonts of a cache shared by the pages of the
@@ -461,8 +462,110 @@ fn interpret(
     Ok(renderer.canvas)
 }
 
+/// A document to render at one resolution, with the cache of its fonts
+/// shared by its pages, the check and the rendering, and the threads
+/// (docs/adr/0011, docs/adr/0012). Pages are numbered from 0, as
+/// [`Page::index`].
+pub struct Session<'a> {
+    doc: &'a Document,
+    pages: Vec<Page>,
+    dpi: u32,
+    fonts: FontCache,
+}
+
+/// An error of [`Session::render_pages`].
+#[derive(Debug)]
+pub enum PageError<E> {
+    /// An error of the rendering; the error names its page.
+    Render(Error),
+    /// The error that `consume` returned for a page.
+    Consume(usize, E),
+}
+
+impl<'a> Session<'a> {
+    pub fn new(doc: &'a Document, dpi: u32) -> Result<Session<'a>> {
+        Ok(Session {
+            doc,
+            pages: doc.pages()?,
+            dpi,
+            fonts: FontCache::new(),
+        })
+    }
+
+    /// A session of one page, which is its page 0.
+    fn single(doc: &'a Document, page: &Page, dpi: u32) -> Session<'a> {
+        Session {
+            doc,
+            pages: vec![page.clone()],
+            dpi,
+            fonts: FontCache::new(),
+        }
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    fn page(&self, page: usize) -> Result<&Page> {
+        self.pages.get(page).ok_or_else(|| {
+            Error::new(format!(
+                "page {} does not exist: the document has {} pages",
+                page + 1,
+                self.pages.len()
+            ))
+        })
+    }
+
+    /// Checks one page, as [`check_page`].
+    pub fn check(&self, page: usize) -> Result<()> {
+        check_page_with(self.doc, self.page(page)?, self.dpi, &self.fonts)
+    }
+
+    /// Renders one page, as [`render_page`].
+    pub fn render(&self, page: usize) -> Result<Canvas> {
+        render_page_with(self.doc, self.page(page)?, self.dpi, &self.fonts)
+    }
+
+    /// Checks the pages on at most `jobs` threads, and returns the error of
+    /// the first page of `pages` that fails, whatever the threads do
+    /// ([`crate::parallel::run`]).
+    pub fn check_pages(&self, pages: &[usize], jobs: NonZeroUsize) -> Result<()> {
+        pages.iter().try_for_each(|&p| self.page(p).map(|_| ()))?;
+        crate::parallel::run(pages.len(), jobs, |k| self.check(pages[k])).map_err(|(_, e)| e)
+    }
+
+    /// Renders the pages on at most `jobs` threads and gives each image to
+    /// `consume` on the thread that rendered it, once per page and in any
+    /// order. After an error, no new page is started; the error returned is
+    /// the one of the first page of `pages` that failed, whatever the threads
+    /// do ([`crate::parallel::run`]).
+    pub fn render_pages<E, F>(
+        &self,
+        pages: &[usize],
+        jobs: NonZeroUsize,
+        consume: F,
+    ) -> std::result::Result<(), PageError<E>>
+    where
+        E: Send,
+        F: Fn(usize, Canvas) -> std::result::Result<(), E> + Sync,
+    {
+        pages
+            .iter()
+            .try_for_each(|&p| self.page(p).map(|_| ()))
+            .map_err(PageError::Render)?;
+        crate::parallel::run(pages.len(), jobs, |k| {
+            let canvas = self.render(pages[k]).map_err(PageError::Render)?;
+            consume(pages[k], canvas).map_err(|e| PageError::Consume(pages[k], e))
+        })
+        .map_err(|(_, e)| e)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests;
 
 #[cfg(test)]
 mod box_tests;
+
+#[cfg(test)]
+mod session_tests;
