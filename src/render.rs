@@ -372,7 +372,6 @@ impl Renderer<'_> {
             Operator::TextMatrix(m) => self.text_matrix = *m,
             Operator::ShowText(s) => self.show_text(s)?,
             Operator::Do(name) => self.placeholder(name)?,
-            other => return Err(Error::new(format!("not implemented yet: {other:?}"))),
         }
         Ok(())
     }
