@@ -48,6 +48,17 @@ v0.1 は、今の Golem の Writer が書く PDF の部分集合を読む（[ADR
 - ページは白で始まる。塗る色 `c` は、不透明度 `a` で画素 `p` に `(c × a + p × (255 − a) + 127) / 255` として合成する。塗りの演算子ごとに、パス全体の覆いを求めてから一度だけ合成する。
 - 線は、線端を butt、角を miter（上限 10、超えれば bevel）とし、区間ごとの四角形と継ぎ目の多角形を、向きを正にそろえて nonzero で塗る。線の幅は利用者の空間の値に `sqrt(|det CTM|)` を掛ける。幅 0 は 1 画素とする。角を保たない CTM での線はエラーにする。
 
+## 色
+
+画素は 8 ビットの RGB で、紙は白とする。ICC のプロファイルは使わない（[ADR 0005](adr/0005-device-colors-and-cmyk-conversion.md)）。
+
+- 色の成分は 0 から 1 に切り詰め、`round(x × 255)`（同じ近さなら偶数）で 0 から 255 にする。
+- DeviceGray の `G` は `(G, G, G)` とする（ISO 32000-1 の 10.3.2）。
+- DeviceCMYK は `R = 255 − min(255, C + K)`、`G = 255 − min(255, M + K)`、`B = 255 − min(255, Y + K)` とする（10.3.5）。
+- Separation は、代替の色空間が DeviceCMYK か DeviceGray で、変換が `N` 1 の `FunctionType 2` のものだけを読む。濃度 `t` を `Domain` に切り詰め、`C0 + t × (C1 − C0)` を代替の色空間で RGB にする。`cs` の後の色は濃度 1 とする。色材の名前は使わない。
+- `k` は塗りの色を、`K` は線の色を DeviceCMYK にする。`scn` は塗りの色空間が Separation のときだけ認める。色と色空間の初期値は DeviceGray の黒で、`q` と `Q` で保存と復元をする。
+- ほかの色空間（DeviceRGB、ICCBased など）と、ほかの関数はエラーにする。
+
 ## 決定性
 
 同じ入力と同じオプションから、x86-64 と aarch64、Linux と macOS で、バイト単位で同じ出力を出す（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)）。
