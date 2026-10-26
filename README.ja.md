@@ -36,22 +36,45 @@ shem は変化を見つけるものであり、描いた結果が正しいこと
 
 ## 状態
 
-v0.1 の範囲を `main` に実装した。まだリリースしていない。
+v0.1 の範囲を実装した。
+最初のリリース候補 v0.1.0-rc1 を [Releases](https://github.com/tett23/shem/releases) に置いている。
 設計は [docs/adr/](docs/adr/) の ADR（Architecture Decision Record）で決めている。
 仕様は [docs/specifications.md](docs/specifications.md) にある。
 
-## 使い方
+## インストール
 
-Cargo で shem をビルドする。
+[Releases](https://github.com/tett23/shem/releases) から、環境に合うアーカイブと `SHA256SUMS` を取得し、検証してから `shem` を `PATH` にあるディレクトリに置く。
+
+| アーカイブ | 環境 |
+|---|---|
+| `shem-<タグ>-x86_64-unknown-linux-musl.tar.gz` | Linux の x86-64（静的にリンク） |
+| `shem-<タグ>-aarch64-unknown-linux-musl.tar.gz` | Linux の aarch64（静的にリンク） |
+| `shem-<タグ>-aarch64-apple-darwin.tar.gz` | Apple Silicon の macOS |
+
+```sh
+tag=v0.1.0-rc1
+target=x86_64-unknown-linux-musl
+curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/shem-$tag-$target.tar.gz"
+curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS
+tar -xzf "shem-$tag-$target.tar.gz"
+```
+
+macOS では `shasum -a 256 --ignore-missing -c SHA256SUMS` を使う。
+macOS のバイナリは署名と公証をしていない。`curl` や `gh` で取得したアーカイブには検疫の属性が付かない。
+
+ソースからビルドする場合は、Cargo を使う。
 
 ```sh
 cargo build --release
 ```
 
+## 使い方
+
 PDF のすべてのページを、ディレクトリの PNG のファイルに描く。
 
 ```sh
-target/release/shem render --dpi 150 input.pdf out
+shem render --dpi 150 input.pdf out
 ```
 
 これは `out/page-0001.png`、`out/page-0002.png` などを書く。

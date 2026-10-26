@@ -10,7 +10,7 @@ v1 では、汎用の PDF のラスタライザを目指す（[roadmap.md](roadm
 
 ## 状態
 
-v0.1 の範囲（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)〜[0008](adr/0008-english-canonical-readme-and-contributing.md)）を実装した。まだリリースしていない。
+v0.1 の範囲（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)〜[0008](adr/0008-english-canonical-readme-and-contributing.md)）を実装し、v0.1.0-rc1 をプレリリースとして出した。
 版ごとの計画は [roadmap.md](roadmap.md) にある。
 
 ## コマンド
