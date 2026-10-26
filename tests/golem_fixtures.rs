@@ -57,8 +57,8 @@ fn every_flate_stream_inflates() {
 }
 
 #[test]
-fn the_pages_without_figures_render() {
-    ["sample", "sample-marks"].iter().for_each(|name| {
+fn every_page_renders() {
+    FIXTURES.iter().for_each(|&(name, _)| {
         let doc = Document::parse(&fixture(name)).unwrap();
         doc.pages().unwrap().iter().for_each(|page| {
             let canvas =

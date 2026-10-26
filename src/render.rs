@@ -5,8 +5,13 @@ use crate::content::{self, Op, Operator};
 use crate::error::{Error, Result};
 use crate::fixed::{Fixed, Matrix};
 use crate::font::{Font, Segment};
+use crate::pdf::Object;
 use crate::pdf::{Dict, Document, Page};
-use crate::raster::{Canvas, FillRule, Path, Point, coverage, stroke};
+use crate::raster::{Canvas, FillRule, Path, Point, coverage, signed_area, stroke};
+
+/// The fill and the lines of the box of an image or a form (docs/adr/0006).
+const BOX_FILL: [u8; 3] = [192, 192, 192];
+const BOX_LINE: [u8; 3] = [96, 96, 96];
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -99,6 +104,8 @@ struct Renderer<'a> {
     text_matrix: Matrix,
     // The fonts of the resources, read once per page.
     fonts: BTreeMap<Vec<u8>, Rc<Font>>,
+    // Half of 1 point in device space, in units of 1/256 pixel.
+    point_half_width: i64,
 }
 
 impl Renderer<'_> {
@@ -207,6 +214,87 @@ impl Renderer<'_> {
         Ok(())
     }
 
+    /// Draws an image or a form as a gray box with a cross (docs/adr/0006).
+    /// The contents of the XObject are not read.
+    fn placeholder(&mut self, name: &[u8]) -> Result<()> {
+        let xobjects = self
+            .doc
+            .get_dict(self.resources, "XObject")?
+            .unwrap_or_default();
+        let obj = xobjects
+            .get(name)
+            .ok_or_else(|| Error::new("no such XObject in the resources"))?;
+        let dict = self
+            .doc
+            .resolve(obj)?
+            .as_dict()
+            .cloned()
+            .ok_or_else(|| Error::new("an XObject is not a stream"))?;
+        let (rect, matrix) = match self
+            .doc
+            .get(&dict, "Subtype")?
+            .as_ref()
+            .and_then(Object::as_name)
+        {
+            // The unit square of image space (ISO 32000-1 8.9.4)
+            Some(b"Image") => (
+                [Fixed::ZERO, Fixed::ZERO, Fixed::ONE, Fixed::ONE],
+                Matrix::IDENTITY,
+            ),
+            // The BBox mapped by the Matrix of the form (8.10.1)
+            Some(b"Form") => {
+                let bbox = self
+                    .doc
+                    .get(&dict, "BBox")?
+                    .ok_or_else(|| Error::new("a form without a BBox"))?;
+                let matrix = match self.doc.get(&dict, "Matrix")? {
+                    None => Matrix::IDENTITY,
+                    Some(Object::Array(a)) if a.len() == 6 => {
+                        let v = a
+                            .iter()
+                            .map(|o| self.doc.number(o))
+                            .collect::<Result<Vec<_>>>()?;
+                        Matrix::new([v[0], v[1], v[2], v[3], v[4], v[5]])
+                    }
+                    Some(other) => {
+                        return Err(Error::new(format!("malformed Matrix {}", other.describe())));
+                    }
+                };
+                (self.doc.rectangle(&bbox)?, matrix)
+            }
+            _ => {
+                let subtype = self
+                    .doc
+                    .get(&dict, "Subtype")?
+                    .map_or("none".into(), |o| o.describe());
+                return Err(Error::new(format!("unsupported XObject Subtype {subtype}")));
+            }
+        };
+        let m = matrix.concat(&self.state.ctm)?;
+        let [x0, y0, x1, y1] = rect;
+        let corners = [
+            to_device(&m, x0, y0)?,
+            to_device(&m, x1, y0)?,
+            to_device(&m, x1, y1)?,
+            to_device(&m, x0, y1)?,
+        ];
+        if signed_area(&corners) == 0 {
+            return Ok(());
+        }
+        let mut box_path = Path::new();
+        box_path.move_to(corners[0]);
+        corners[1..].iter().for_each(|&c| box_path.line_to(c));
+        box_path.close();
+        self.fill(&box_path, BOX_FILL);
+        let mut cross = Path::new();
+        cross.move_to(corners[0]);
+        cross.line_to(corners[2]);
+        cross.move_to(corners[1]);
+        cross.line_to(corners[3]);
+        self.fill(&stroke(&cross, self.point_half_width), BOX_LINE);
+        Ok(())
+    }
+
     fn op(&mut self, op: &Operator) -> Result<()> {
         match op {
             Operator::Save => self.stack.push(self.state.clone()),
@@ -283,7 +371,7 @@ impl Renderer<'_> {
             Operator::RenderMode(m) => self.state.render_mode = *m,
             Operator::TextMatrix(m) => self.text_matrix = *m,
             Operator::ShowText(s) => self.show_text(s)?,
-            other => return Err(Error::new(format!("not implemented yet: {other:?}"))),
+            Operator::Do(name) => self.placeholder(name)?,
         }
         Ok(())
     }
@@ -314,6 +402,10 @@ pub fn render_page(doc: &Document, page: &Page, dpi: u32) -> Result<Canvas> {
         path: Path::new(),
         text_matrix: Matrix::IDENTITY,
         fonts: BTreeMap::new(),
+        point_half_width: Fixed::from_int(i64::from(dpi))
+            .and_then(|d| d.checked_div(Fixed::from_int(72)?))
+            .map_err(at_page)?
+            .to_units(7),
     };
     ops.iter().try_for_each(|op| {
         renderer
@@ -325,3 +417,6 @@ pub fn render_page(doc: &Document, page: &Page, dpi: u32) -> Result<Canvas> {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod box_tests;
