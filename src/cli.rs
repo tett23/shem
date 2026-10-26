@@ -6,11 +6,10 @@ use std::path::{Path, PathBuf};
 use std::num::NonZeroUsize;
 
 use crate::error::Error;
-use crate::font::FontCache;
 use crate::parallel;
 use crate::pdf::Document;
 use crate::png::{encode_png, encode_ppm};
-use crate::render::{check_page_with, render_page_with};
+use crate::render::{PageError, Session};
 
 const USAGE: &str = "usage: shem render [--dpi <N>] [--format png|ppm] [--pages <range>] [--jobs <N>] <input.pdf> <output directory>
        shem diff [--format png|ppm] [--jobs <N>] <before> <after> <output>";
@@ -197,8 +196,10 @@ fn write_file(dir: &Path, name: &str, data: &[u8]) -> std::io::Result<()> {
 fn render(r: &Render) -> std::result::Result<(), Error> {
     let data = std::fs::read(&r.input).map_err(|e| Error::new(e.to_string()))?;
     let doc = Document::parse(&data)?;
-    let pages = doc.pages()?;
-    let count = pages.len();
+    // The fonts are read once for the check and the rendering of every page
+    // (docs/adr/0011), and the pages go to threads (docs/adr/0009, docs/adr/0012).
+    let session = Session::new(&doc, r.dpi)?;
+    let count = session.page_count();
     let selected: Vec<usize> = match &r.pages {
         None => (1..=count).collect(),
         Some(ranges) => {
@@ -213,32 +214,28 @@ fn render(r: &Render) -> std::result::Result<(), Error> {
             numbers
         }
     };
-    // Every page is checked before any file is written (docs/adr/0002). The
-    // pages are checked and then rendered in parallel; the error reported is
-    // the one of the first page that fails (docs/adr/0009).
-    // The fonts are read once for the check and the rendering of every page
-    // (docs/adr/0011).
-    let fonts = FontCache::new();
-    parallel::run(selected.len(), r.jobs, |k| {
-        check_page_with(&doc, &pages[selected[k] - 1], r.dpi, &fonts)
-    })
-    .map_err(|(_, e)| e)?;
+    let indices: Vec<usize> = selected.iter().map(|n| n - 1).collect();
+    // Every page is checked before any file is written (docs/adr/0002).
+    session.check_pages(&indices, r.jobs)?;
     let dir = PathBuf::from(&r.output);
     let io = |e: std::io::Error| Error::new(format!("{}: {e}", r.output));
     std::fs::create_dir_all(&dir).map_err(io)?;
     let digits = count.to_string().len().max(4);
     let extension = if r.ppm { "ppm" } else { "png" };
-    parallel::run(selected.len(), r.jobs, |k| {
-        let n = selected[k];
-        let canvas = render_page_with(&doc, &pages[n - 1], r.dpi, &fonts)?;
-        let bytes = if r.ppm {
-            encode_ppm(&canvas)
-        } else {
-            encode_png(&canvas)
-        };
-        write_file(&dir, &format!("page-{n:0digits$}.{extension}"), &bytes).map_err(io)
-    })
-    .map_err(|(_, e)| e)
+    session
+        .render_pages(&indices, r.jobs, |page, canvas| {
+            let bytes = if r.ppm {
+                encode_ppm(&canvas)
+            } else {
+                encode_png(&canvas)
+            };
+            let n = page + 1;
+            write_file(&dir, &format!("page-{n:0digits$}.{extension}"), &bytes)
+        })
+        .map_err(|e| match e {
+            PageError::Render(e) => e,
+            PageError::Consume(_, e) => io(e),
+        })
 }
 
 /// The options of `diff`.

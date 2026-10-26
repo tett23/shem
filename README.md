@@ -95,6 +95,8 @@ The first compares two files; the second compares the images of two directories 
 In a diff image, red pixels are darker in the after image, blue ones are lighter, green ones are only in one image, and an orange frame surrounds the differences.
 The exit status is 0 if nothing differs, 1 if something does, and 2 on an error.
 
+The library of the crate (`shem::render::Session`, `shem::parallel::run`) may change without a new version while shem is at v0.x.
+
 ## Development
 
 Install [adr-guard](https://github.com/tett23/adr-guard) v0.8.3 or later, and enable the git hooks in each clone.

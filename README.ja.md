@@ -95,6 +95,8 @@ shem diff before after diffs
 差分の画像では、後の画像のほうが暗い画素が赤、明るい画素が青、片方にしかない画素が緑になり、違う場所を橙の枠が囲む。
 終了コードは、違いがなければ 0、違いがあれば 1、エラーなら 2 である。
 
+クレートのライブラリ（`shem::render::Session`、`shem::parallel::run`）は、shem が v0.x の間、版を上げずに変わりうる。
+
 ## 開発
 
 [adr-guard](https://github.com/tett23/adr-guard) の v0.8.3 以降をインストールし、クローンごとに git の hook を有効にする。
