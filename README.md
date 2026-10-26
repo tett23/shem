@@ -84,6 +84,17 @@ Pages are rendered in parallel on every core; `--jobs <N>` sets how many at once
 If any page to render is outside the subset that shem reads, shem writes no file, prints the place to standard error and exits with 1.
 `shem --help` describes every option and exit status.
 
+To see where two renderings differ, compare their images:
+
+```sh
+shem diff before/page-0003.png after/page-0003.png diff.png
+shem diff before after diffs
+```
+
+The first compares two files; the second compares the images of two directories by name, writes a diff image for each pair that differs, and lists the pages that differ, were added or were removed.
+In a diff image, red pixels are darker in the after image, blue ones are lighter, green ones are only in one image, and an orange frame surrounds the differences.
+The exit status is 0 if nothing differs, 1 if something does, and 2 on an error.
+
 ## Development
 
 Install [adr-guard](https://github.com/tett23/adr-guard) v0.8.3 or later, and enable the git hooks in each clone.
