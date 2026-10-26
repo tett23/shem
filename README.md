@@ -36,22 +36,45 @@ The plan is in [docs/roadmap.md](docs/roadmap.md).
 
 ## Status
 
-The scope of v0.1 is implemented on `main`, and not released yet.
+The scope of v0.1 is implemented.
+The first release candidate, v0.1.0-rc1, is on [Releases](https://github.com/tett23/shem/releases).
 The design is decided in ADRs (Architecture Decision Records) under [docs/adr/](docs/adr/).
 The specification is in [docs/specifications.md](docs/specifications.md).
 
-## Usage
+## Installation
 
-Build shem with Cargo:
+Download the archive for your platform and `SHA256SUMS` from [Releases](https://github.com/tett23/shem/releases), check it, and put `shem` on your `PATH`.
+
+| Archive | Platform |
+|---|---|
+| `shem-<tag>-x86_64-unknown-linux-musl.tar.gz` | Linux x86-64 (statically linked) |
+| `shem-<tag>-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 (statically linked) |
+| `shem-<tag>-aarch64-apple-darwin.tar.gz` | macOS on Apple Silicon |
+
+```sh
+tag=v0.1.0-rc1
+target=x86_64-unknown-linux-musl
+curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/shem-$tag-$target.tar.gz"
+curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS
+tar -xzf "shem-$tag-$target.tar.gz"
+```
+
+On macOS, use `shasum -a 256 --ignore-missing -c SHA256SUMS`.
+The macOS binary is not signed or notarized; an archive downloaded with `curl` or `gh` carries no quarantine attribute.
+
+To build from source instead, use Cargo:
 
 ```sh
 cargo build --release
 ```
 
+## Usage
+
 Render every page of a PDF to PNG files in a directory:
 
 ```sh
-target/release/shem render --dpi 150 input.pdf out
+shem render --dpi 150 input.pdf out
 ```
 
 This writes `out/page-0001.png`, `out/page-0002.png` and so on.
