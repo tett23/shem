@@ -1,0 +1,4 @@
+#!/bin/sh
+# A commit that changes README.md or CONTRIBUTING.md also changes its
+# Japanese translation (docs/adr/0008)
+exec sh "$(git rev-parse --show-toplevel)/scripts/check-translations.sh" staged "$1"
