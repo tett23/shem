@@ -10,3 +10,5 @@ pub mod error;
 pub mod fixed;
 pub mod flate;
 pub mod pdf;
+pub mod raster;
+pub mod render;
