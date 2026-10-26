@@ -4,13 +4,21 @@ use crate::fixed::Fixed;
 /// A PDF from object bodies (numbered from 1) and extra trailer entries,
 /// with a correct classic xref table.
 pub(crate) fn build_pdf(objects: &[&str], trailer_extra: &str) -> Vec<u8> {
+    let bytes: Vec<Vec<u8>> = objects.iter().map(|s| s.as_bytes().to_vec()).collect();
+    build_pdf_bytes(&bytes, trailer_extra)
+}
+
+/// A PDF from object bodies given as bytes.
+pub(crate) fn build_pdf_bytes(objects: &[Vec<u8>], trailer_extra: &str) -> Vec<u8> {
     let mut out = b"%PDF-1.6\n%\xE2\xE3\xCF\xD3\n".to_vec();
     let offsets: Vec<usize> = objects
         .iter()
         .enumerate()
         .map(|(i, body)| {
             let at = out.len();
-            out.extend(format!("{} 0 obj\n{}\nendobj\n", i + 1, body).into_bytes());
+            out.extend(format!("{} 0 obj\n", i + 1).into_bytes());
+            out.extend(body);
+            out.extend(b"\nendobj\n");
             at
         })
         .collect();
