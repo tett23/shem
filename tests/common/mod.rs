@@ -22,7 +22,7 @@ const H0: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
-fn compress(h: [u32; 8], block: &[u8]) -> [u32; 8] {
+fn compress(h: [u32; 8], block: &[u8; 64]) -> [u32; 8] {
     let mut w = [0u32; 64];
     (0..16).for_each(|i| {
         w[i] = u32::from_be_bytes([
@@ -66,8 +66,10 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     }
     tail.extend_from_slice(&bits.to_be_bytes());
     let h = data
-        .chunks_exact(64)
-        .chain(tail.chunks_exact(64))
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .chain(tail.as_chunks::<64>().0)
         .fold(H0, compress);
     let mut out = [0u8; 32];
     h.iter()
