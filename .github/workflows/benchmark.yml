@@ -51,7 +51,7 @@ jobs:
               echo "- $ref: $(git rev-parse --verify "$ref^{commit}")"
             done
             echo
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
           set --
           for ref in $REFS; do
             set -- "$@" "$ref=$RUNNER_TEMP/bin/$(git rev-parse --verify "$ref^{commit}")"
