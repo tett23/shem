@@ -37,7 +37,7 @@ The plan is in [docs/roadmap.md](docs/roadmap.md).
 ## Status
 
 The scope of v0.1 is implemented.
-The latest release candidate, v0.1.0-rc2, is on [Releases](https://github.com/tett23/shem/releases).
+The latest release candidate, v0.1.0-rc3, is on [Releases](https://github.com/tett23/shem/releases).
 The design is decided in ADRs (Architecture Decision Records) under [docs/adr/](docs/adr/).
 The specification is in [docs/specifications.md](docs/specifications.md).
 
@@ -52,7 +52,7 @@ Download the archive for your platform and `SHA256SUMS` from [Releases](https://
 | `shem-<tag>-aarch64-apple-darwin.tar.gz` | macOS on Apple Silicon |
 
 ```sh
-tag=v0.1.0-rc2
+tag=v0.1.0-rc3
 target=x86_64-unknown-linux-musl
 curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/shem-$tag-$target.tar.gz"
 curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/SHA256SUMS"

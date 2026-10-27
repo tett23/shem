@@ -10,8 +10,7 @@ v1 では、汎用の PDF のラスタライザを目指す（[roadmap.md](roadm
 
 ## 状態
 
-v0.1 の範囲（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)〜[0012](adr/0012-parallel-library-api.md)）を実装し、v0.1.0-rc2 をプレリリースとして出した。
-その後、musl の配布物でスレッドを増やすと遅くなる問題を、細かいメモリ割り当てを減らして直した（[ADR 0013](adr/0013-fewer-allocations-for-musl-threads.md)）。
+v0.1 の範囲（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)〜[0012](adr/0012-parallel-library-api.md)）と、musl の配布物でスレッドを増やすと遅くなる問題の修正（[ADR 0013](adr/0013-fewer-allocations-for-musl-threads.md)）を実装し、v0.1.0-rc3 をプレリリースとして出した。
 版ごとの計画は [roadmap.md](roadmap.md) にある。
 
 ## コマンド
