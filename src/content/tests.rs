@@ -5,7 +5,7 @@ fn n(s: &str) -> Fixed {
     Fixed::parse(s.as_bytes()).unwrap()
 }
 
-fn ops(s: &str) -> Vec<Operator> {
+fn ops(s: &str) -> Vec<Operator<'_>> {
     parse(s.as_bytes())
         .unwrap()
         .into_iter()
@@ -41,17 +41,17 @@ fn every_operator_of_the_table() {
             Operator::Restore,
             Operator::FillCmyk(["0", "0.1", "0.2", "1"].map(n)),
             Operator::StrokeCmyk(["1", "0", "0", "0"].map(n)),
-            Operator::FillSpace(b"Reg".to_vec()),
+            Operator::FillSpace(b"Reg".as_slice().into()),
             Operator::FillColor(n("1")),
             Operator::BeginText,
-            Operator::Font(b"F1".to_vec(), n("9.2126")),
+            Operator::Font(b"F1".as_slice().into(), n("9.2126")),
             Operator::HScale(n("50")),
             Operator::TextMatrix(m(["1", "0", "0", "1", "3", "4"])),
             Operator::RenderMode(2),
             Operator::ShowText(vec![0, 1]),
             Operator::RenderMode(0),
             Operator::EndText,
-            Operator::Do(b"Im1".to_vec()),
+            Operator::Do(b"Im1".as_slice().into()),
             Operator::BeginMarked,
             Operator::EndMarked,
             Operator::BeginMarked,

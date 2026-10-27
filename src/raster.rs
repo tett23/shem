@@ -21,16 +21,21 @@ const FULL: i64 = ONE64 * ONE64 * 2;
 const FLATNESS: i64 = ONE64 / 16;
 const MAX_DEPTH: u32 = 16;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Subpath {
-    pub points: Vec<Point>,
+/// A subpath of a [`Path`]: its points, and whether it is closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Subpath<'a> {
+    pub points: &'a [Point],
     pub closed: bool,
 }
 
-/// A path of line segments in device space.
+/// A path of line segments in device space: the points of every subpath in
+/// one `Vec`, and where each subpath starts, so that a path cleared and
+/// built again keeps its buffers (docs/adr/0013).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Path {
-    subpaths: Vec<Subpath>,
+    points: Vec<Point>,
+    /// The index of the first point of each subpath, and whether it is closed.
+    starts: Vec<(usize, bool)>,
 }
 
 impl Path {
@@ -38,61 +43,79 @@ impl Path {
         Path::default()
     }
 
+    /// Removes the subpaths and keeps the capacity of the buffers.
+    pub fn clear(&mut self) {
+        self.points.clear();
+        self.starts.clear();
+    }
+
     pub fn move_to(&mut self, p: Point) {
-        self.subpaths.push(Subpath {
-            points: vec![p],
-            closed: false,
-        });
+        self.starts.push((self.points.len(), false));
+        self.points.push(p);
     }
 
     /// The current point: the last point, or the start of a closed subpath.
     pub fn current_point(&self) -> Option<Point> {
-        self.subpaths.last().and_then(|s| {
-            if s.closed {
-                s.points.first().copied()
+        self.starts.last().map(|&(start, closed)| {
+            if closed {
+                self.points[start]
             } else {
-                s.points.last().copied()
+                self.points[self.points.len() - 1]
             }
         })
     }
 
     pub fn line_to(&mut self, p: Point) {
-        match self.subpaths.last_mut() {
-            Some(s) if !s.closed => s.points.push(p),
+        match self.starts.last() {
+            Some(&(_, false)) => self.points.push(p),
             _ => {
                 // After h, a segment starts a new subpath at the start of the closed one.
                 let start = self.current_point().unwrap_or(p);
-                self.subpaths.push(Subpath {
-                    points: vec![start, p],
-                    closed: false,
-                });
+                self.move_to(start);
+                self.points.push(p);
             }
         }
     }
 
     pub fn curve_to(&mut self, c1: Point, c2: Point, p: Point) {
         let start = self.current_point().unwrap_or(c1);
-        flatten_curve(start, c1, c2, p)
-            .into_iter()
-            .for_each(|q| self.line_to(q));
+        flatten_curve_into(start, c1, c2, p, |q| self.line_to(q));
     }
 
     pub fn close(&mut self) {
-        if let Some(s) = self.subpaths.last_mut() {
-            s.closed = true;
+        if let Some(last) = self.starts.last_mut() {
+            last.1 = true;
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.subpaths.is_empty()
+        self.starts.is_empty()
     }
 
-    pub fn subpaths(&self) -> &[Subpath] {
-        &self.subpaths
+    pub fn subpaths(&self) -> impl Iterator<Item = Subpath<'_>> {
+        let ends = self
+            .starts
+            .iter()
+            .skip(1)
+            .map(|&(start, _)| start)
+            .chain(std::iter::once(self.points.len()));
+        self.starts
+            .iter()
+            .zip(ends)
+            .map(|(&(start, closed), end)| Subpath {
+                points: &self.points[start..end],
+                closed,
+            })
     }
 
-    pub fn push(&mut self, subpath: Subpath) {
-        self.subpaths.push(subpath);
+    /// Adds a closed polygon, reversed if its signed area is negative.
+    fn push_positive(&mut self, polygon: &[Point]) {
+        let start = self.points.len();
+        self.starts.push((start, true));
+        self.points.extend_from_slice(polygon);
+        if signed_area(polygon) < 0 {
+            self.points[start..].reverse();
+        }
     }
 }
 
@@ -123,11 +146,23 @@ fn flatness(p0: Point, p1: Point, p2: Point, p3: Point) -> i64 {
 /// `p3`, by de Casteljau's subdivision at the midpoint.
 pub fn flatten_curve(p0: Point, p1: Point, p2: Point, p3: Point) -> Vec<Point> {
     let mut out = Vec::new();
-    // A stack of curves still to split, the first curve on top.
-    let mut stack = vec![([p0, p1, p2, p3], 0u32)];
-    while let Some(([a, b, c, d], depth)) = stack.pop() {
+    flatten_curve_into(p0, p1, p2, p3, |q| out.push(q));
+    out
+}
+
+/// The points of [`flatten_curve`], given to `emit` in order. The curves
+/// still to split are on a stack of fixed size, the first curve on top: a
+/// split takes one curve and puts two of the next level, so the stack holds
+/// at most one curve of each level and the curve of the top level, MAX_DEPTH
+/// + 1 in all.
+fn flatten_curve_into(p0: Point, p1: Point, p2: Point, p3: Point, mut emit: impl FnMut(Point)) {
+    let mut stack = [([p0, p1, p2, p3], 0u32); MAX_DEPTH as usize + 1];
+    let mut len = 1;
+    while len > 0 {
+        len -= 1;
+        let ([a, b, c, d], depth) = stack[len];
         if depth >= MAX_DEPTH || flatness(a, b, c, d) <= FLATNESS {
-            out.push(d);
+            emit(d);
             continue;
         }
         let ab = mid(a, b);
@@ -136,46 +171,49 @@ pub fn flatten_curve(p0: Point, p1: Point, p2: Point, p3: Point) -> Vec<Point> {
         let abc = mid(ab, bc);
         let bcd = mid(bc, cd);
         let m = mid(abc, bcd);
-        stack.push(([m, bcd, cd, d], depth + 1));
-        stack.push(([a, ab, abc, m], depth + 1));
+        stack[len] = ([m, bcd, cd, d], depth + 1);
+        stack[len + 1] = ([a, ab, abc, m], depth + 1);
+        len += 2;
     }
-    out
 }
 
 /// A cell: (row, column, cover, area).
 pub(crate) type Cell = (i32, i32, i64, i64);
 
-/// The cells sorted by row and column, with the values of the same cell
-/// added. The sums of integers do not depend on the order of the additions,
-/// so this gives the cells of a map from (row, column) (docs/adr/0011).
-fn merge(mut cells: Vec<Cell>) -> Vec<Cell> {
+/// Sorts the cells by row and column and adds the values of the same cell
+/// into one. The sums of integers do not depend on the order of the
+/// additions, so this gives the cells of a map from (row, column)
+/// (docs/adr/0011).
+fn merge(cells: &mut Vec<Cell>) {
     cells.sort_unstable_by_key(|&(row, col, _, _)| (row, col));
-    cells
-        .into_iter()
-        .fold(Vec::new(), |mut out: Vec<Cell>, (row, col, cover, area)| {
-            match out.last_mut() {
-                Some(last) if (last.0, last.1) == (row, col) => {
-                    last.2 += cover;
-                    last.3 += area;
-                }
-                _ => out.push((row, col, cover, area)),
-            }
-            out
-        })
+    // dedup_by gives the later cell first, and keeps the earlier one.
+    cells.dedup_by(|later, earlier| {
+        let same = (later.0, later.1) == (earlier.0, earlier.1);
+        if same {
+            earlier.2 += later.2;
+            earlier.3 += later.3;
+        }
+        same
+    });
 }
 
-/// The points where a segment crosses the multiples of ONE of one
-/// coordinate, from `a` to `b`. `y_of` interpolates the other coordinate.
-fn crossings(a: i64, b: i64) -> Vec<i64> {
+/// The multiples of ONE strictly between `a` and `b`, from `a` to `b`.
+fn crossings(a: i64, b: i64) -> impl Iterator<Item = i64> {
     let (lo, hi) = (a.min(b), a.max(b));
     let first = lo.div_euclid(ONE64) + 1;
     let last = (hi - 1).div_euclid(ONE64);
-    let ks: Vec<i64> = (first..=last).map(|k| k * ONE64).collect();
-    if a <= b {
-        ks
-    } else {
-        ks.into_iter().rev().collect()
-    }
+    let count = (last - first + 1).max(0);
+    (0..count).map(move |i| if a <= b { first + i } else { last - i } * ONE64)
+}
+
+/// Calls `f` with each two consecutive items.
+fn pairs<T: Copy>(items: impl Iterator<Item = T>, mut f: impl FnMut(T, T)) {
+    items.fold(None, |prev, item| {
+        if let Some(p) = prev {
+            f(p, item);
+        }
+        Some(item)
+    });
 }
 
 fn interpolate(a0: i64, a1: i64, b0: i64, b1: i64, at: i64) -> i64 {
@@ -198,29 +236,18 @@ pub(crate) fn render_line(add: &mut impl FnMut(i32, i32, i64, i64), p0: Point, p
         return;
     }
     // Split at the rows, with y exact and x interpolated.
-    let mut row_points = vec![(x0, y0)];
-    row_points.extend(
-        crossings(y0, y1)
-            .into_iter()
-            .map(|y| (interpolate(y0, y1, x0, x1, y), y)),
-    );
-    row_points.push((x1, y1));
-    row_points.windows(2).for_each(|w| {
-        let ((ax, ay), (bx, by)) = (w[0], w[1]);
+    let rows = std::iter::once((x0, y0))
+        .chain(crossings(y0, y1).map(|y| (interpolate(y0, y1, x0, x1, y), y)))
+        .chain(std::iter::once((x1, y1)));
+    pairs(rows, |(ax, ay), (bx, by)| {
         let row = ay.min(by).div_euclid(ONE64);
         let (ylo, yhi) = (ay.min(by), ay.max(by));
         // Split at the columns, with x exact and y interpolated within the row.
-        let mut points = vec![(ax, ay)];
-        if ax != bx {
-            points.extend(
-                crossings(ax, bx)
-                    .into_iter()
-                    .map(|x| (x, interpolate(ax, bx, ay, by, x).clamp(ylo, yhi))),
-            );
-        }
-        points.push((bx, by));
-        points.windows(2).for_each(|v| {
-            let ((cx, cy), (dx, dy)) = (v[0], v[1]);
+        let columns = (ax != bx).then(|| crossings(ax, bx)).into_iter().flatten();
+        let points = std::iter::once((ax, ay))
+            .chain(columns.map(|x| (x, interpolate(ax, bx, ay, by, x).clamp(ylo, yhi))))
+            .chain(std::iter::once((bx, by)));
+        pairs(points, |(cx, cy), (dx, dy)| {
             let col = cx.min(dx).div_euclid(ONE64);
             let (fx0, fx1) = (cx - col * ONE64, dx - col * ONE64);
             let height = dy - cy;
@@ -242,6 +269,14 @@ fn alpha(value: i64, rule: FillRule) -> u8 {
     ((v * 255 + FULL / 2) / FULL) as u8
 }
 
+/// The buffers of filling: the cells and the pixels, kept between the
+/// fills of a page (docs/adr/0013).
+#[derive(Clone, Debug, Default)]
+pub struct Scratch {
+    cells: Vec<Cell>,
+    pixels: Vec<(usize, usize, u8)>,
+}
+
 /// The pixels a path covers on a `width` × `height` canvas, as (x, y,
 /// opacity) in the order of rows and columns, without the empty ones. Every
 /// subpath is closed for filling.
@@ -251,10 +286,21 @@ pub fn coverage(
     width: usize,
     height: usize,
 ) -> Vec<(usize, usize, u8)> {
-    let mut cells: Vec<Cell> = Vec::new();
+    coverage_with(path, rule, width, height, &mut Scratch::default()).to_vec()
+}
+
+/// [`coverage`] in the buffers of `scratch`.
+pub fn coverage_with<'s>(
+    path: &Path,
+    rule: FillRule,
+    width: usize,
+    height: usize,
+    scratch: &'s mut Scratch,
+) -> &'s [(usize, usize, u8)] {
+    let Scratch { cells, pixels } = scratch;
+    cells.clear();
     let mut add = |row, col, cover, area| cells.push((row, col, cover, area));
-    path.subpaths
-        .iter()
+    path.subpaths()
         .filter(|s| s.points.len() > 1)
         .for_each(|s| {
             s.points
@@ -262,53 +308,62 @@ pub fn coverage(
                 .for_each(|w| render_line(&mut add, w[0], w[1]));
             render_line(&mut add, s.points[s.points.len() - 1], s.points[0]);
         });
-    sweep(&merge(cells), rule, width, height)
+    merge(cells);
+    pixels.clear();
+    sweep_into(cells, rule, width, height, pixels);
+    pixels
 }
 
 /// The pixels of the cells, sorted by row and column with one cell each.
+#[cfg(test)]
 pub(crate) fn sweep(
     cells: &[Cell],
     rule: FillRule,
     width: usize,
     height: usize,
 ) -> Vec<(usize, usize, u8)> {
-    let (w, h) = (width as i64, height as i64);
     let mut out = Vec::new();
-    let mut row_cells = cells.iter().peekable();
-    while let Some(&&(row, _, _, _)) = row_cells.peek() {
-        let cells_of_row: Vec<(i32, i64, i64)> = std::iter::from_fn(|| {
-            row_cells
-                .next_if(|c| c.0 == row)
-                .map(|&(_, col, cover, area)| (col, cover, area))
-        })
-        .collect();
-        if !(0..h).contains(&i64::from(row)) {
-            continue;
-        }
-        let mut cover = 0i64;
-        cells_of_row
-            .iter()
-            .enumerate()
-            .for_each(|(i, &(col, c, area))| {
-                cover += c;
-                let col = i64::from(col);
-                if (0..w).contains(&col) {
-                    let a = alpha(cover * 2 * ONE64 - area, rule);
-                    if a > 0 {
-                        out.push((col as usize, row as usize, a));
-                    }
-                }
-                let next = cells_of_row.get(i + 1).map_or(w, |&(c, _, _)| i64::from(c));
-                let a = alpha(cover * 2 * ONE64, rule);
-                if a > 0 {
-                    (col + 1).max(0)..next.min(w)
-                } else {
-                    0..0
-                }
-                .for_each(|x| out.push((x as usize, row as usize, a)));
-            });
-    }
+    sweep_into(cells, rule, width, height, &mut out);
     out
+}
+
+/// Adds the pixels of the cells to `out`.
+fn sweep_into(
+    cells: &[Cell],
+    rule: FillRule,
+    width: usize,
+    height: usize,
+    out: &mut Vec<(usize, usize, u8)>,
+) {
+    let (w, h) = (width as i64, height as i64);
+    cells
+        .chunk_by(|a, b| a.0 == b.0)
+        .filter(|row_cells| (0..h).contains(&i64::from(row_cells[0].0)))
+        .for_each(|row_cells| {
+            let row = row_cells[0].0 as usize;
+            let mut cover = 0i64;
+            row_cells
+                .iter()
+                .enumerate()
+                .for_each(|(i, &(_, col, c, area))| {
+                    cover += c;
+                    let col = i64::from(col);
+                    if (0..w).contains(&col) {
+                        let a = alpha(cover * 2 * ONE64 - area, rule);
+                        if a > 0 {
+                            out.push((col as usize, row, a));
+                        }
+                    }
+                    let next = row_cells.get(i + 1).map_or(w, |&(_, c, _, _)| i64::from(c));
+                    let a = alpha(cover * 2 * ONE64, rule);
+                    if a > 0 {
+                        (col + 1).max(0)..next.min(w)
+                    } else {
+                        0..0
+                    }
+                    .for_each(|x| out.push((x as usize, row, a)));
+                });
+        });
 }
 
 /// Twice the signed area of a polygon (the shoelace formula).
@@ -318,17 +373,6 @@ pub fn signed_area(points: &[Point]) -> i128 {
         .zip(points.iter().cycle().skip(1))
         .map(|(a, b)| i128::from(a.0) * i128::from(b.1) - i128::from(b.0) * i128::from(a.1))
         .sum()
-}
-
-/// The polygon with a positive signed area.
-fn positive(mut points: Vec<Point>) -> Subpath {
-    if signed_area(&points) < 0 {
-        points.reverse();
-    }
-    Subpath {
-        points,
-        closed: true,
-    }
 }
 
 fn add(p: Point, v: (i64, i64)) -> Point {
@@ -356,12 +400,12 @@ fn direction(a: Point, b: Point) -> (i64, i64) {
     )
 }
 
-/// The polygon of the join at `v` between the directions `d1` and `d2`:
-/// a miter if it is within the limit of 10, a bevel otherwise.
-fn join(v: Point, d1: (i64, i64), d2: (i64, i64), half: i64) -> Option<Subpath> {
+/// Adds the polygon of the join at `v` between the directions `d1` and
+/// `d2` to `out`: a miter if it is within the limit of 10, a bevel otherwise.
+fn join(out: &mut Path, v: Point, d1: (i64, i64), d2: (i64, i64), half: i64) {
     let cross = i128::from(d1.0) * i128::from(d2.1) - i128::from(d1.1) * i128::from(d2.0);
     if cross == 0 {
-        return None;
+        return;
     }
     let sign = if cross > 0 { -1 } else { 1 };
     let n1 = normal(d1, half * sign);
@@ -383,9 +427,9 @@ fn join(v: Point, d1: (i64, i64), d2: (i64, i64), half: i64) -> Option<Subpath> 
             div_round(h2 * i128::from(n2.1 - n1.1), det) as i64,
             div_round(h2 * i128::from(n1.0 - n2.0), det) as i64,
         );
-        Some(positive(vec![v, a, add(v, m), b]))
+        out.push_positive(&[v, a, add(v, m), b]);
     } else {
-        Some(positive(vec![v, a, b]))
+        out.push_positive(&[v, a, b]);
     }
 }
 
@@ -393,33 +437,39 @@ fn join(v: Point, d1: (i64, i64), d2: (i64, i64), half: i64) -> Option<Subpath> 
 /// butt caps and miter joins (limit 10), as positive polygons to fill with
 /// the nonzero rule.
 pub fn stroke(path: &Path, half: i64) -> Path {
-    let polygons = path.subpaths.iter().flat_map(|s| {
-        let mut points: Vec<Point> = s.points.clone();
-        points.dedup();
-        if s.closed && points.len() > 1 && points.first() != points.last() {
-            points.push(points[0]);
-        }
-        let segments: Vec<(Point, Point)> = points
+    let mut out = Path::new();
+    stroke_into(path, half, &mut out);
+    out
+}
+
+/// Adds the polygons of [`stroke`] to `out`.
+pub fn stroke_into(path: &Path, half: i64, out: &mut Path) {
+    path.subpaths().for_each(|s| {
+        // The segments between the points, without the repeated points,
+        // and the segment back to the start of a closed subpath.
+        let points = s.points;
+        let open = points
             .windows(2)
             .map(|w| (w[0], w[1]))
-            .filter(|(a, b)| a != b)
-            .collect();
-        let quads = segments.iter().map(move |&(a, b)| {
-            let n = normal(direction(a, b), half);
-            positive(vec![add(a, n), add(b, n), add(b, neg(n)), add(a, neg(n))])
-        });
+            .filter(|(a, b)| a != b);
+        let (first, last) = (points[0], points[points.len() - 1]);
         let closing =
-            (s.closed && segments.len() > 1).then(|| (segments[segments.len() - 1], segments[0]));
-        let joins = segments
-            .windows(2)
-            .map(|w| (w[0], w[1]))
-            .chain(closing)
-            .filter_map(move |(p, q)| join(p.1, direction(p.0, p.1), direction(q.0, q.1), half));
-        quads.chain(joins).collect::<Vec<_>>()
+            (s.closed && open.clone().next().is_some() && first != last).then_some((last, first));
+        let segments = open.chain(closing);
+        segments.clone().for_each(|(a, b)| {
+            let n = normal(direction(a, b), half);
+            out.push_positive(&[add(a, n), add(b, n), add(b, neg(n)), add(a, neg(n))]);
+        });
+        let joins = segments.clone().zip(segments.clone().skip(1));
+        let around = segments
+            .clone()
+            .nth(1)
+            .and(s.closed.then_some(()))
+            .and_then(|()| segments.clone().last().zip(segments.clone().next()));
+        joins
+            .chain(around)
+            .for_each(|(p, q)| join(out, p.1, direction(p.0, p.1), direction(q.0, q.1), half));
     });
-    Path {
-        subpaths: polygons.collect(),
-    }
 }
 
 /// `c` over `p` with opacity `a`, rounded: `(c a + p (255 − a) + 127) / 255`.
@@ -460,4 +510,10 @@ impl Canvas {
 }
 
 #[cfg(test)]
+mod reference;
+
+#[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod reference_tests;

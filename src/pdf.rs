@@ -504,7 +504,7 @@ fn read_xref(data: &[u8], at: usize) -> Result<(Xref, Dict)> {
                         ) => {
                             let num = u32::try_from(start + i)
                                 .map_err(|_| Error::new("object number out of range"))?;
-                            match kind.as_slice() {
+                            match kind {
                                 b"n" => {
                                     let offset = usize::try_from(offset)
                                         .map_err(|_| Error::new("negative offset"))?;

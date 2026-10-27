@@ -7,7 +7,9 @@ use crate::fixed::{Fixed, Matrix};
 use crate::font::{Font, FontCache, Segment};
 use crate::pdf::Object;
 use crate::pdf::{Dict, Document, Page};
-use crate::raster::{Canvas, FillRule, Path, Point, coverage, signed_area, stroke};
+use crate::raster::{
+    Canvas, FillRule, Path, Point, Scratch, coverage_with, signed_area, stroke_into,
+};
 
 /// The fill and the lines of the box of an image or a form (docs/adr/0006).
 const BOX_FILL: [u8; 3] = [192, 192, 192];
@@ -110,6 +112,11 @@ struct Renderer<'a> {
     point_half_width: i64,
     // Whether pixels are drawn; without it, the page is only interpreted.
     paint: bool,
+    // The buffers that the glyphs, the strokes and the fills of the page
+    // reuse (docs/adr/0013).
+    glyph: Path,
+    outline: Path,
+    scratch: Scratch,
 }
 
 impl Renderer<'_> {
@@ -121,13 +128,23 @@ impl Renderer<'_> {
         if !self.paint {
             return;
         }
-        let cov = coverage(
+        let cov = coverage_with(
             path,
             FillRule::NonZero,
             self.canvas.width,
             self.canvas.height,
+            &mut self.scratch,
         );
-        self.canvas.paint(&cov, rgb);
+        self.canvas.paint(cov, rgb);
+    }
+
+    /// Fills the stroke of a path, `half` units on each side.
+    fn fill_stroke(&mut self, path: &Path, half: i64, rgb: [u8; 3]) {
+        let mut outline = std::mem::take(&mut self.outline);
+        outline.clear();
+        stroke_into(path, half, &mut outline);
+        self.fill(&outline, rgb);
+        self.outline = outline;
     }
 
     /// The font of a name of the resources, read at its first use.
@@ -194,7 +211,8 @@ impl Renderer<'_> {
             (Matrix::IDENTITY, Matrix::translation(tx, Fixed::ZERO))
         };
         let m = font.glyph_matrix()?.concat(&shift)?.concat(&trm)?;
-        let mut path = Path::new();
+        let mut path = std::mem::take(&mut self.glyph);
+        path.clear();
         font.outline(cid)?.iter().try_for_each(|s| {
             match *s {
                 Segment::Move(x, y) => path.move_to(to_device(&m, x, y)?),
@@ -211,12 +229,17 @@ impl Renderer<'_> {
         // Each glyph is filled, then stroked in mode 2 (9.3.6).
         let fill = self.state.fill;
         self.fill(&path, fill);
-        if self.state.render_mode == 2 {
+        let stroked = if self.state.render_mode == 2 {
             // The line width is in user space, so the CTM decides the width.
-            let half = stroke_half_width(&self.state.ctm, self.state.line_width)?;
-            let rgb = self.state.stroke;
-            self.fill(&stroke(&path, half), rgb);
-        }
+            stroke_half_width(&self.state.ctm, self.state.line_width).map(|half| {
+                let rgb = self.state.stroke;
+                self.fill_stroke(&path, half, rgb);
+            })
+        } else {
+            Ok(())
+        };
+        self.glyph = path;
+        stroked?;
         self.text_matrix = advance.concat(&self.text_matrix)?;
         Ok(())
     }
@@ -298,7 +321,7 @@ impl Renderer<'_> {
         cross.line_to(corners[2]);
         cross.move_to(corners[1]);
         cross.line_to(corners[3]);
-        self.fill(&stroke(&cross, self.point_half_width), BOX_LINE);
+        self.fill_stroke(&cross, self.point_half_width, BOX_LINE);
         Ok(())
     }
 
@@ -337,9 +360,11 @@ impl Renderer<'_> {
                 self.path.close();
             }
             Operator::Fill => {
-                let path = std::mem::take(&mut self.path);
+                let mut path = std::mem::take(&mut self.path);
                 let rgb = self.state.fill;
                 self.fill(&path, rgb);
+                path.clear();
+                self.path = path;
             }
             Operator::FillCmyk(v) => {
                 self.state.fill_space = FillSpace::Device(Device::Cmyk);
@@ -352,7 +377,7 @@ impl Renderer<'_> {
                     .get_dict(self.resources, "ColorSpace")?
                     .unwrap_or_default();
                 let space = spaces
-                    .get(name)
+                    .get(name.as_ref())
                     .ok_or_else(|| Error::new("no such color space in the resources"))?;
                 let separation = Separation::load(self.doc, space)?;
                 // The initial color of a Separation is the tint 1 (8.6.6.4).
@@ -434,6 +459,9 @@ fn interpret(
             Canvas::new(0, 0)
         },
         paint,
+        glyph: Path::new(),
+        outline: Path::new(),
+        scratch: Scratch::default(),
         state: GraphicsState {
             ctm: device_matrix(&page.media_box, dpi).map_err(at_page)?,
             line_width: Fixed::ONE,

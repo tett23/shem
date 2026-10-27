@@ -324,11 +324,16 @@ pub fn encode_png(canvas: &Canvas) -> Vec<u8> {
 
 /// A binary PPM (P6) of the pixels.
 pub fn encode_ppm(canvas: &Canvas) -> Vec<u8> {
-    [
-        format!("P6\n{} {}\n255\n", canvas.width, canvas.height).as_bytes(),
-        &canvas.pixels,
-    ]
-    .concat()
+    let mut out = Vec::new();
+    write_ppm(canvas, &mut out).expect("writing to a Vec does not fail");
+    out
+}
+
+/// Writes the bytes of [`encode_ppm`] without making them in memory first
+/// (docs/adr/0013).
+pub fn write_ppm(canvas: &Canvas, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    write!(out, "P6\n{} {}\n255\n", canvas.width, canvas.height)?;
+    out.write_all(&canvas.pixels)
 }
 
 #[cfg(test)]

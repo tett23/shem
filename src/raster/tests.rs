@@ -257,7 +257,7 @@ fn degenerate_segments_are_dropped() {
     let mut path = Path::new();
     path.move_to((PX, PX));
     path.line_to((PX, PX));
-    assert!(stroke(&path, i64::from(PX)).subpaths().is_empty());
+    assert!(stroke(&path, i64::from(PX)).subpaths().next().is_none());
 }
 
 #[test]
@@ -268,8 +268,7 @@ fn polygons_of_a_stroke_are_positive() {
     path.line_to((8 * PX, 8 * PX));
     stroke(&path, 64)
         .subpaths()
-        .iter()
-        .for_each(|s| assert!(signed_area(&s.points) > 0));
+        .for_each(|s| assert!(signed_area(s.points) > 0));
 }
 
 // --- the cells in a Vec (docs/adr/0011)
@@ -284,7 +283,6 @@ fn reference_coverage(path: &Path, rule: FillRule, w: usize, h: usize) -> Vec<(u
         e.1 += area;
     };
     path.subpaths()
-        .iter()
         .filter(|s| s.points.len() > 1)
         .for_each(|s| {
             s.points

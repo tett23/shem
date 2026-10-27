@@ -146,7 +146,20 @@ impl Fixed {
 /// nearest, ties to even. The fraction is doubled digit by digit, so the
 /// result is exact for any number of digits.
 fn fraction_units(digits: &[u8]) -> i128 {
-    let mut fraction: Vec<u8> = digits.iter().map(|c| c - b'0').collect();
+    // The digits of most numbers fit on the stack, so reading them allocates
+    // nothing (docs/adr/0013).
+    let mut stack = [0u8; 32];
+    let mut heap = Vec::new();
+    let fraction: &mut [u8] = if digits.len() <= stack.len() {
+        &mut stack[..digits.len()]
+    } else {
+        heap.resize(digits.len(), 0);
+        &mut heap
+    };
+    fraction
+        .iter_mut()
+        .zip(digits)
+        .for_each(|(d, c)| *d = c - b'0');
     // Doubling the decimal fraction moves its first binary digit out as the carry.
     let mut next_bit = || {
         fraction.iter_mut().rev().fold(0u8, |carry, d| {
