@@ -175,6 +175,11 @@ fn options_may_come_anywhere_after_the_subcommand() {
     assert_eq!(code, 0, "{stderr}");
     let ppm = std::fs::read(out.join("page-0001.ppm")).unwrap();
     assert!(ppm.starts_with(b"P6\n"));
+    // The file written as it is rendered is the bytes of encode_ppm (docs/adr/0013).
+    let data = std::fs::read(fixture("sample")).unwrap();
+    let doc = shem::pdf::Document::parse(&data).unwrap();
+    let canvas = shem::render::render_page(&doc, &doc.pages().unwrap()[0], 36).unwrap();
+    assert_eq!(ppm, shem::png::encode_ppm(&canvas));
 }
 
 #[test]

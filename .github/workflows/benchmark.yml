@@ -1,0 +1,59 @@
+# Measures the time of `shem render` of the kanikosen fixture with several
+# --jobs, built as the release builds x86_64-unknown-linux-musl, for the
+# records of docs/benchmarks/ (docs/adr/0013). It runs only by hand.
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      refs:
+        description: The commits to build and compare, separated by spaces (HEAD is the commit of the run)
+        required: true
+        default: v0.1.0-rc2 HEAD
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
+          rustup default stable
+      - name: Build
+        env:
+          REFS: ${{ inputs.refs }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          for ref in $REFS; do
+            commit=$(git rev-parse --verify "$ref^{commit}")
+            git worktree add --detach "$RUNNER_TEMP/src-$commit" "$commit"
+            (cd "$RUNNER_TEMP/src-$commit" && cargo build --release --locked --target x86_64-unknown-linux-musl)
+            cp "$RUNNER_TEMP/src-$commit/target/x86_64-unknown-linux-musl/release/shem" "$RUNNER_TEMP/bin/$commit"
+            echo "$ref: $commit, $("$RUNNER_TEMP/bin/$commit" --version)"
+          done
+      - name: Measure
+        env:
+          REFS: ${{ inputs.refs }}
+        run: |
+          {
+            echo "## Benchmark"
+            echo
+            echo "- CPU: $(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -n 1), $(nproc) processors"
+            echo "- PDF: tests/fixtures/golem/kanikosen.pdf, $(sha256sum tests/fixtures/golem/kanikosen.pdf | cut -d ' ' -f 1)"
+            for ref in $REFS; do
+              echo "- $ref: $(git rev-parse --verify "$ref^{commit}")"
+            done
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          set --
+          for ref in $REFS; do
+            set -- "$@" "$ref=$RUNNER_TEMP/bin/$(git rev-parse --verify "$ref^{commit}")"
+          done
+          sh scripts/ci/benchmark.sh tests/fixtures/golem/kanikosen.pdf "$@" | tee -a "$GITHUB_STEP_SUMMARY"

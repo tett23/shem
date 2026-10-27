@@ -9,9 +9,13 @@ use crate::error::{Error, Result};
 use crate::fixed::{Fixed, Matrix};
 use crate::pdf::lexer::{Lexer, Token, object_from};
 use crate::pdf::{Dict, Document, Object};
+use std::borrow::Cow;
 
+/// An operator. The names of `cs`, `Tf` and `Do` are slices of the content
+/// when they have no `#` escapes, so that reading them allocates nothing
+/// (docs/adr/0013).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Operator {
+pub enum Operator<'a> {
     Save,
     Restore,
     Concat(Matrix),
@@ -23,25 +27,41 @@ pub enum Operator {
     Fill,
     FillCmyk([Fixed; 4]),
     StrokeCmyk([Fixed; 4]),
-    FillSpace(Vec<u8>),
+    FillSpace(Cow<'a, [u8]>),
     FillColor(Fixed),
     BeginText,
     EndText,
-    Font(Vec<u8>, Fixed),
+    Font(Cow<'a, [u8]>, Fixed),
     HScale(Fixed),
     TextMatrix(Matrix),
     RenderMode(i64),
     ShowText(Vec<u8>),
-    Do(Vec<u8>),
+    Do(Cow<'a, [u8]>),
     BeginMarked,
     EndMarked,
 }
 
 /// An operator and the offset of its keyword in the content.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Op {
+pub struct Op<'a> {
     pub offset: usize,
-    pub operator: Operator,
+    pub operator: Operator<'a>,
+}
+
+/// An operand: a name as its token, or another object.
+#[derive(Debug)]
+enum Operand<'a> {
+    Name(Cow<'a, [u8]>),
+    Object(Object),
+}
+
+impl Operand<'_> {
+    fn number(&self) -> Option<Fixed> {
+        match self {
+            Operand::Object(o) => o.as_number().and_then(|r| r.ok()),
+            Operand::Name(_) => None,
+        }
+    }
 }
 
 /// Where an operator is allowed (ISO 32000-1, Annex L, Figure 9).
@@ -59,23 +79,30 @@ enum Place {
     Paint,
 }
 
-fn numbers<const N: usize>(operands: &[Object]) -> Option<[Fixed; N]> {
+fn numbers<const N: usize>(operands: &[Operand]) -> Option<[Fixed; N]> {
     if operands.len() != N {
         return None;
     }
-    let values: Vec<Fixed> = operands
+    let values: [Option<Fixed>; N] = std::array::from_fn(|i| operands[i].number());
+    values
         .iter()
-        .map(|o| o.as_number().and_then(|r| r.ok()))
-        .collect::<Option<Vec<_>>>()?;
-    values.try_into().ok()
+        .all(Option::is_some)
+        .then(|| values.map(Option::unwrap))
 }
 
-/// The operator of keyword `k` with its operands, or `None` if the operands
-/// are wrong. An unknown keyword is `Err`.
-fn operator(k: &[u8], operands: &[Object]) -> std::result::Result<Option<(Operator, Place)>, ()> {
+/// The operator of keyword `k` with its operands, which it may take, or
+/// `None` if the operands are wrong. An unknown keyword is `Err`.
+fn operator<'a>(
+    k: &[u8],
+    operands: &mut [Operand<'a>],
+) -> std::result::Result<Option<(Operator<'a>, Place)>, ()> {
     use Operator::*;
-    let none = |op: Operator, place| Ok(operands.is_empty().then_some((op, place)));
-    let name = |o: &Object| o.as_name().map(<[u8]>::to_vec);
+    let empty = operands.is_empty();
+    let none = |op: Operator<'a>, place| Ok(empty.then_some((op, place)));
+    let name = |o: &mut Operand<'a>| match o {
+        Operand::Name(n) => Some(std::mem::take(n)),
+        Operand::Object(_) => None,
+    };
     Ok(match k {
         b"q" => return none(Save, Place::Page),
         b"Q" => return none(Restore, Place::Page),
@@ -98,19 +125,21 @@ fn operator(k: &[u8], operands: &[Object]) -> std::result::Result<Option<(Operat
         b"BT" => return none(BeginText, Place::Page),
         b"ET" => return none(EndText, Place::Text),
         b"Tf" => match operands {
-            [n, size] => name(n)
-                .zip(size.as_number().and_then(|r| r.ok()))
-                .map(|(n, s)| (Font(n, s), Place::Anywhere)),
+            [n, size] => size
+                .number()
+                .and_then(|s| name(n).map(|n| (Font(n, s), Place::Anywhere))),
             _ => None,
         },
         b"Tz" => numbers::<1>(operands).map(|[v]| (HScale(v), Place::Anywhere)),
         b"Tm" => numbers::<6>(operands).map(|v| (TextMatrix(Matrix::new(v)), Place::Text)),
         b"Tr" => match operands {
-            [Object::Int(mode)] => Some((RenderMode(*mode), Place::Anywhere)),
+            [Operand::Object(Object::Int(mode))] => Some((RenderMode(*mode), Place::Anywhere)),
             _ => None,
         },
         b"Tj" => match operands {
-            [Object::String(s)] => Some((ShowText(s.clone()), Place::Text)),
+            [Operand::Object(Object::String(s))] => {
+                Some((ShowText(std::mem::take(s)), Place::Text))
+            }
             _ => None,
         },
         b"Do" => match operands {
@@ -118,9 +147,10 @@ fn operator(k: &[u8], operands: &[Object]) -> std::result::Result<Option<(Operat
             _ => None,
         },
         b"BDC" => match operands {
-            [Object::Name(_), Object::Dict(_) | Object::Name(_)] => {
-                Some((BeginMarked, Place::Anywhere))
-            }
+            [
+                Operand::Name(_),
+                Operand::Name(_) | Operand::Object(Object::Dict(_)),
+            ] => Some((BeginMarked, Place::Anywhere)),
             _ => None,
         },
         b"EMC" => return none(EndMarked, Place::Anywhere),
@@ -143,7 +173,9 @@ struct State {
 }
 
 impl State {
-    fn check(&mut self, k: &str, op: &Operator, place: Place) -> std::result::Result<(), String> {
+    /// Checks an operator; the name of its keyword `k` is made only for an error.
+    fn check(&mut self, k: &[u8], op: &Operator, place: Place) -> std::result::Result<(), String> {
+        let k = || keyword_name(k);
         if self.in_path
             && !matches!(
                 op,
@@ -154,13 +186,13 @@ impl State {
                     | Operator::Fill
             )
         {
-            return Err(format!("{k} inside a path"));
+            return Err(format!("{} inside a path", k()));
         }
         match place {
-            Place::Page if self.in_text => return Err(format!("{k} inside a text object")),
-            Place::Text if !self.in_text => return Err(format!("{k} outside a text object")),
-            Place::Path if !self.in_path => return Err(format!("{k} without a current point")),
-            Place::Paint if self.in_text => return Err(format!("{k} inside a text object")),
+            Place::Page if self.in_text => return Err(format!("{} inside a text object", k())),
+            Place::Text if !self.in_text => return Err(format!("{} outside a text object", k())),
+            Place::Path if !self.in_path => return Err(format!("{} without a current point", k())),
+            Place::Paint if self.in_text => return Err(format!("{} inside a text object", k())),
             _ => {}
         }
         match op {
@@ -200,28 +232,30 @@ impl State {
 }
 
 /// Reads and checks the operators of a content stream.
-pub fn parse(content: &[u8]) -> Result<Vec<Op>> {
+pub fn parse(content: &[u8]) -> Result<Vec<Op<'_>>> {
     let mut lx = Lexer::new(content, 0);
-    let mut operands: Vec<Object> = Vec::new();
+    let mut operands: Vec<Operand> = Vec::new();
     let mut state = State::default();
     let mut ops = Vec::new();
     while let Some((at, token)) = lx.next_token()? {
         match token {
-            Token::Keyword(k) if !matches!(k.as_slice(), b"true" | b"false" | b"null") => {
-                let name = keyword_name(&k);
-                let (op, place) = match operator(&k, &operands) {
+            Token::Keyword(k) if !matches!(k, b"true" | b"false" | b"null") => {
+                let (op, place) = match operator(k, &mut operands) {
                     Err(()) => {
-                        return Err(
-                            Error::new(format!("unsupported operator {name}")).at_offset(at)
-                        );
+                        return Err(Error::new(format!(
+                            "unsupported operator {}",
+                            keyword_name(k)
+                        ))
+                        .at_offset(at));
                     }
                     Ok(None) => {
-                        return Err(Error::new(format!("wrong operands of {name}")).at_offset(at));
+                        return Err(Error::new(format!("wrong operands of {}", keyword_name(k)))
+                            .at_offset(at));
                     }
                     Ok(Some(p)) => p,
                 };
                 state
-                    .check(&name, &op, place)
+                    .check(k, &op, place)
                     .map_err(|m| Error::new(m).at_offset(at))?;
                 ops.push(Op {
                     offset: at,
@@ -229,7 +263,8 @@ pub fn parse(content: &[u8]) -> Result<Vec<Op>> {
                 });
                 operands.clear();
             }
-            token => operands.push(object_from(&mut lx, at, token, false)?),
+            Token::Name(n) => operands.push(Operand::Name(n)),
+            token => operands.push(Operand::Object(object_from(&mut lx, at, token, false)?)),
         }
     }
     if !operands.is_empty() {
@@ -257,7 +292,7 @@ pub fn check_resources(doc: &Document, resources: &Dict, ops: &[Op]) -> Result<(
             Operator::Do(n) => ("XObject", &xobjects, n),
             _ => return Ok(()),
         };
-        if dict.contains_key(name) {
+        if dict.contains_key(name.as_ref()) {
             Ok(())
         } else {
             Err(

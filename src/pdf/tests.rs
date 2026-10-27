@@ -407,3 +407,17 @@ fn replace_bytes(data: &[u8], from: &str, to: &str) -> Vec<u8> {
         .unwrap();
     [&data[..at], to.as_bytes(), &data[at + from.len()..]].concat()
 }
+
+#[test]
+fn keywords_and_plain_names_are_slices_of_the_data() {
+    use lexer::{Lexer, Token};
+    use std::borrow::Cow;
+    let data = b"/F1 /F#20G BT Tj";
+    let mut lx = Lexer::new(data, 0);
+    let mut next = || lx.next_token().unwrap().unwrap().1;
+    assert!(matches!(next(), Token::Name(Cow::Borrowed(b"F1"))));
+    // A name with an escape is decoded into a Vec (7.3.5).
+    assert!(matches!(next(), Token::Name(Cow::Owned(n)) if n == b"F G"));
+    assert!(matches!(next(), Token::Keyword(k) if std::ptr::eq(k.as_ptr(), data[11..].as_ptr())));
+    assert_eq!(next(), Token::Keyword(b"Tj"));
+}

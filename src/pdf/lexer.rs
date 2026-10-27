@@ -4,18 +4,21 @@
 use super::{Dict, Object, Ref};
 use crate::error::{Error, Result};
 use crate::fixed::Fixed;
+use std::borrow::Cow;
 
+/// A token. Keywords, and names without `#` escapes, are slices of the data,
+/// so that reading them allocates nothing (docs/adr/0013).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Token {
+pub enum Token<'a> {
     Int(i64),
     Real(Fixed),
-    Name(Vec<u8>),
+    Name(Cow<'a, [u8]>),
     String(Vec<u8>),
     ArrayOpen,
     ArrayClose,
     DictOpen,
     DictClose,
-    Keyword(Vec<u8>),
+    Keyword(&'a [u8]),
 }
 
 pub fn is_whitespace(c: u8) -> bool {
@@ -102,7 +105,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// The next token and its offset, or `None` at the end.
-    pub fn next_token(&mut self) -> Result<Option<(usize, Token)>> {
+    pub fn next_token(&mut self) -> Result<Option<(usize, Token<'a>)>> {
         self.skip();
         let start = self.pos;
         let Some(&c) = self.data.get(start) else {
@@ -141,26 +144,29 @@ impl<'a> Lexer<'a> {
                 if is_number(word) {
                     number(word).map_err(|e| e.at_offset(start))?
                 } else {
-                    Token::Keyword(word.to_vec())
+                    Token::Keyword(word)
                 }
             }
         };
         Ok(Some((start, token)))
     }
 
-    pub fn peek_token(&self) -> Result<Option<(usize, Token)>> {
+    pub fn peek_token(&self) -> Result<Option<(usize, Token<'a>)>> {
         self.clone().next_token()
     }
 
-    fn name(&mut self) -> Result<Token> {
+    fn name(&mut self) -> Result<Token<'a>> {
         let start = self.pos;
         self.pos += 1;
         let end = self.data[self.pos..]
             .iter()
             .position(|&c| !is_regular(c))
             .map_or(self.data.len(), |n| self.pos + n);
-        let raw = &self.data[self.pos..end];
+        let raw: &'a [u8] = &self.data[self.pos..end];
         self.pos = end;
+        if !raw.contains(&b'#') {
+            return Ok(Token::Name(Cow::Borrowed(raw)));
+        }
         let mut out = Vec::with_capacity(raw.len());
         let mut i = 0;
         while i < raw.len() {
@@ -179,13 +185,15 @@ impl<'a> Lexer<'a> {
                 i += 1;
             }
         }
-        Ok(Token::Name(out))
+        Ok(Token::Name(Cow::Owned(out)))
     }
 
-    fn hex_string(&mut self) -> Result<Token> {
+    fn hex_string(&mut self) -> Result<Token<'a>> {
         let start = self.pos;
         self.pos += 1;
-        let mut digits = Vec::new();
+        // The bytes, and the high digit of the byte still to complete.
+        let mut out = Vec::new();
+        let mut high: Option<u8> = None;
         loop {
             match self.data.get(self.pos) {
                 None => return Err(self.err(start, "unterminated hexadecimal string")),
@@ -197,21 +205,23 @@ impl<'a> Lexer<'a> {
                 Some(&c) => {
                     let v = hex_value(c)
                         .ok_or_else(|| self.err(start, "malformed hexadecimal string"))?;
-                    digits.push(v);
+                    high = match high {
+                        None => Some(v),
+                        Some(h) => {
+                            out.push(h << 4 | v);
+                            None
+                        }
+                    };
                     self.pos += 1;
                 }
             }
         }
         // An odd final digit is followed by an implied 0 (7.3.4.3).
-        Ok(Token::String(
-            digits
-                .chunks(2)
-                .map(|p| p[0] << 4 | p.get(1).copied().unwrap_or(0))
-                .collect(),
-        ))
+        out.extend(high.map(|h| h << 4));
+        Ok(Token::String(out))
     }
 
-    fn literal_string(&mut self) -> Result<Token> {
+    fn literal_string(&mut self) -> Result<Token<'a>> {
         let start = self.pos;
         self.pos += 1;
         let mut out = Vec::new();
@@ -285,7 +295,7 @@ impl<'a> Lexer<'a> {
     }
 }
 
-fn number(word: &[u8]) -> Result<Token> {
+fn number(word: &[u8]) -> Result<Token<'static>> {
     if word.contains(&b'.') {
         Fixed::parse(word).map(Token::Real)
     } else {
@@ -315,7 +325,7 @@ pub fn object_from(lx: &mut Lexer, at: usize, token: Token, refs: bool) -> Resul
     match token {
         Token::Int(i) => Ok(if refs { reference(lx, i)? } else { None }.unwrap_or(Object::Int(i))),
         Token::Real(v) => Ok(Object::Real(v)),
-        Token::Name(n) => Ok(Object::Name(n)),
+        Token::Name(n) => Ok(Object::Name(n.into_owned())),
         Token::String(s) => Ok(Object::String(s)),
         Token::ArrayOpen => {
             let mut items = Vec::new();
@@ -340,7 +350,7 @@ pub fn object_from(lx: &mut Lexer, at: usize, token: Token, refs: bool) -> Resul
                         if t == Token::DictClose {
                             return Err(Error::new("dictionary key without a value").at_offset(a));
                         }
-                        dict.insert(key, object_from(lx, a, t, refs)?);
+                        dict.insert(key.into_owned(), object_from(lx, a, t, refs)?);
                     }
                     Some((a, _)) => {
                         return Err(Error::new("dictionary key is not a name").at_offset(a));
@@ -348,15 +358,14 @@ pub fn object_from(lx: &mut Lexer, at: usize, token: Token, refs: bool) -> Resul
                 }
             }
         }
-        Token::Keyword(k) => match k.as_slice() {
+        Token::Keyword(k) => match k {
             b"true" => Ok(Object::Bool(true)),
             b"false" => Ok(Object::Bool(false)),
             b"null" => Ok(Object::Null),
-            _ => Err(Error::new(format!(
-                "unexpected keyword {}",
-                String::from_utf8_lossy(&k)
-            ))
-            .at_offset(at)),
+            _ => Err(
+                Error::new(format!("unexpected keyword {}", String::from_utf8_lossy(k)))
+                    .at_offset(at),
+            ),
         },
         Token::ArrayClose | Token::DictClose => {
             Err(Error::new("unexpected end of an array or a dictionary").at_offset(at))

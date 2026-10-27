@@ -11,6 +11,7 @@ v1 では、汎用の PDF のラスタライザを目指す（[roadmap.md](roadm
 ## 状態
 
 v0.1 の範囲（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)〜[0012](adr/0012-parallel-library-api.md)）を実装し、v0.1.0-rc2 をプレリリースとして出した。
+その後、musl の配布物でスレッドを増やすと遅くなる問題を、細かいメモリ割り当てを減らして直した（[ADR 0013](adr/0013-fewer-allocations-for-musl-threads.md)）。
 版ごとの計画は [roadmap.md](roadmap.md) にある。
 
 ## コマンド
@@ -139,6 +140,16 @@ v0.1 は、今の Golem の Writer が書く PDF の部分集合を読む（[ADR
 - 桁あふれはエラーにする。黙って折り返さない。
 
 速さの記録は `docs/benchmarks/` に置く（[2026-10-27-parallel-render.md](benchmarks/2026-10-27-parallel-render.md)、[2026-10-27-speed-up.md](benchmarks/2026-10-27-speed-up.md)）。フォントとグリフのアウトラインの使い回しなど、出力のバイト列を変えない高速化は、仕様の振る舞いを変えない（[ADR 0011](adr/0011-speed-up-without-changing-bytes.md)）。
+
+musl のメモリ割り当ては一つの錠で守られ、割り当てのたびにスレッドが待ち合う。
+そこで、ページの検査と描画の割り当ての回数は、グリフ、線分、曲線の数に比例させない（[ADR 0013](adr/0013-fewer-allocations-for-musl-threads.md)）。
+
+- パスは、すべての点を一つの `Vec` に入れ、グリフのパス、線の多角形、塗りの作業用の場所（`raster::Scratch`）は、ページを描く間は使い回す。
+- 内容のストリームの字句のキーワードと、`#` のない名前は、元のバイト列のスライスとして扱う。演算子 `cs`、`Tf`、`Do` の名前も、内容のバイト列を借りる。
+- `shem render` の PPM は、画素を間に別の `Vec` を作らずにファイルへ書く。
+- 結合テスト `tests/allocations.rs` が、同じグリフの 101 個と 1 個の割り当ての差がグリフあたり 4 回以下であることと、長方形、線分、曲線の数に比例しないことを確かめる。
+- 結合テスト `tests/kanikosen.rs` が、Golem の kanikosen の fixture のすべてのページを 72 dpi と 150 dpi で描き、PNG と PPM のバイト列が v0.1.0-rc2 と同じであることを確かめる。
+- 速さは、手動で起動するワークフロー Benchmark（`.github/workflows/benchmark.yml`）で、x86-64 の musl のビルドを ubuntu-24.04 で測る。
 
 ## 配布
 

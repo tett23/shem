@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 use crate::error::Error;
 use crate::parallel;
 use crate::pdf::Document;
-use crate::png::{encode_png, encode_ppm};
+use crate::png::{encode_png, encode_ppm, write_ppm};
 use crate::render::{PageError, Session};
 
 const USAGE: &str = "usage: shem render [--dpi <N>] [--format png|ppm] [--pages <range>] [--jobs <N>] <input.pdf> <output directory>
@@ -185,8 +185,19 @@ fn parse_render(args: &[String]) -> std::result::Result<Render, String> {
 
 /// Writes a file under a temporary name and renames it.
 fn write_file(dir: &Path, name: &str, data: &[u8]) -> std::io::Result<()> {
+    write_file_with(dir, name, |f| f.write_all(data))
+}
+
+/// Writes a file with `write` under a temporary name and renames it.
+fn write_file_with(
+    dir: &Path,
+    name: &str,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let tmp = dir.join(format!(".{name}.tmp"));
-    let result = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, dir.join(name)));
+    let result = std::fs::File::create(&tmp)
+        .and_then(|mut f| write(&mut f))
+        .and_then(|()| std::fs::rename(&tmp, dir.join(name)));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -224,13 +235,14 @@ fn render(r: &Render) -> std::result::Result<(), Error> {
     let extension = if r.ppm { "ppm" } else { "png" };
     session
         .render_pages(&indices, r.jobs, |page, canvas| {
-            let bytes = if r.ppm {
-                encode_ppm(&canvas)
-            } else {
-                encode_png(&canvas)
-            };
             let n = page + 1;
-            write_file(&dir, &format!("page-{n:0digits$}.{extension}"), &bytes)
+            let name = format!("page-{n:0digits$}.{extension}");
+            if r.ppm {
+                // The pixels go to the file as they are (docs/adr/0013).
+                write_file_with(&dir, &name, |f| write_ppm(&canvas, f))
+            } else {
+                write_file(&dir, &name, &encode_png(&canvas))
+            }
         })
         .map_err(|e| match e {
             PageError::Render(e) => e,
