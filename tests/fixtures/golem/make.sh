@@ -55,3 +55,8 @@ copy_fonts "$work/truetype"
 cp "$src/modules/golem-font/test/fonts/SourceSerifVariable-Roman.ttf" "$work/truetype/fonts/latin.ttf"
 awk '{ sub(/fonts\/latin\.otf/, "fonts/latin.ttf"); print }' "$driver/test/fixtures/figures/style.toml" > "$work/truetype/style.toml"
 build "$work/truetype" truetype
+
+# kanikosen: Golem's kanikosen fixture as it is (129 pages, vertical), for
+# the measurements of speed (docs/adr/0013)
+cp -R "$driver/test/fixtures/kanikosen" "$work/kanikosen"
+build "$work/kanikosen" kanikosen

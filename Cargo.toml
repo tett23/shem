@@ -8,3 +8,8 @@ description = "A deterministic PDF rasterizer"
 repository = "https://github.com/tett23/shem"
 
 [dependencies]
+
+# The tests render every page of the fixtures; without optimization, they
+# take ten times as long. Overflow checks and debug assertions stay on.
+[profile.test]
+opt-level = 1

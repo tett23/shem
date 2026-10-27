@@ -1,5 +1,7 @@
 //! The PDFs that Golem writes are in the subset of v0.1 (docs/adr/0002).
 
+mod common;
+
 use shem::content;
 use shem::pdf::{Document, Object};
 
@@ -11,11 +13,12 @@ fn fixture(name: &str) -> Vec<u8> {
     .unwrap()
 }
 
-const FIXTURES: [(&str, usize); 4] = [
+const FIXTURES: [(&str, usize); 5] = [
     ("sample", 3),
     ("sample-marks", 3),
     ("figures", 2),
     ("truetype", 2),
+    ("kanikosen", 129),
 ];
 
 #[test]
@@ -31,6 +34,38 @@ fn every_page_parses_and_its_resources_exist() {
             content::check_resources(&doc, &page.resources, &ops).unwrap();
         });
     });
+}
+
+/// The operators of every page are those that shem read before the changes
+/// of docs/adr/0013: the SHA-256 of their `Debug` form is in
+/// tests/fixtures/golem/operators.sha256. To write the list again after an
+/// intended change, run this test with SHEM_UPDATE_GOLDEN=1.
+#[test]
+fn every_page_has_the_same_operators_as_before() {
+    let path = format!(
+        "{}/tests/fixtures/golem/operators.sha256",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let actual: String = FIXTURES
+        .iter()
+        .flat_map(|&(name, _)| {
+            let doc = Document::parse(&fixture(name)).unwrap();
+            doc.pages()
+                .unwrap()
+                .iter()
+                .map(|page| {
+                    let ops = content::parse(&page.contents).unwrap();
+                    let digest = common::sha256_hex(format!("{ops:?}").as_bytes());
+                    format!("{digest}  {name} page {}\n", page.index + 1)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if common::update() {
+        std::fs::write(&path, &actual).unwrap();
+        return;
+    }
+    assert_eq!(actual, std::fs::read_to_string(&path).unwrap());
 }
 
 #[test]

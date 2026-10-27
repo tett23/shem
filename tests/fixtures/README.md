@@ -11,6 +11,14 @@ PDFs written by Golem, for the tests of the subset of PDF that shem reads
 | `sample-marks.pdf` | the same with the Japanese crop marks (`--marks japanese`, with `bleed = "3mm"`), for the Separation `/Reg` |
 | `figures.pdf` | Golem's `figures` fixture: an SVG, a PDF and a JPEG figure, as the golden `pdf-figures.txt` makes it |
 | `truetype.pdf` | the `figures` fixture with the TrueType Source Serif (variable) as the Latin font, for `CIDFontType2` and `FontFile2` |
+| `kanikosen.pdf` | Golem's `kanikosen` fixture as it is (129 pages, vertical), for the measurements of speed and the bytes of many pages (docs/adr/0013) |
+
+Two lists record what shem read and wrote before the changes of docs/adr/0013:
+
+- `kanikosen.sha256`: the SHA-256 of every file of `shem render --dpi <72|150> --format <png|ppm>` of `kanikosen.pdf`, made with v0.1.0-rc2. `tests/kanikosen.rs` checks it.
+- `operators.sha256`: the SHA-256 of the `Debug` form of the operators of every page of every PDF here. `tests/golem_fixtures.rs` checks it.
+
+To write them again after an intended change, run the tests with `SHEM_UPDATE_GOLDEN=1`.
 
 They were made by `make.sh` with Golem at commit
 `1254092a2ed5a7fd29bb6f1affb53806cf76c694` (`golem 0.1.0-rc3`), the commit
