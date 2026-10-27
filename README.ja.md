@@ -37,7 +37,7 @@ shem は変化を見つけるものであり、描いた結果が正しいこと
 ## 状態
 
 v0.1 の範囲を実装した。
-最新のリリース候補 v0.1.0-rc2 を [Releases](https://github.com/tett23/shem/releases) に置いている。
+最新のリリース候補 v0.1.0-rc3 を [Releases](https://github.com/tett23/shem/releases) に置いている。
 設計は [docs/adr/](docs/adr/) の ADR（Architecture Decision Record）で決めている。
 仕様は [docs/specifications.md](docs/specifications.md) にある。
 
@@ -52,7 +52,7 @@ v0.1 の範囲を実装した。
 | `shem-<タグ>-aarch64-apple-darwin.tar.gz` | Apple Silicon の macOS |
 
 ```sh
-tag=v0.1.0-rc2
+tag=v0.1.0-rc3
 target=x86_64-unknown-linux-musl
 curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/shem-$tag-$target.tar.gz"
 curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/SHA256SUMS"
