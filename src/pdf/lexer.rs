@@ -45,6 +45,25 @@ fn is_delimiter(c: u8) -> bool {
     )
 }
 
+/// The class of each byte: 0 for a regular character, 1 for whitespace,
+/// 2 for a delimiter (7.2.3), looked up once per byte (docs/adr/0015).
+const CLASS: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let ws = [0u8, b'\t', b'\n', 0x0c, b'\r', b' '];
+    let mut i = 0;
+    while i < ws.len() {
+        t[ws[i] as usize] = 1;
+        i += 1;
+    }
+    let delims = [b'(', b')', b'<', b'>', b'[', b']', b'{', b'}', b'/', b'%'];
+    let mut i = 0;
+    while i < delims.len() {
+        t[delims[i] as usize] = 2;
+        i += 1;
+    }
+    t
+};
+
 fn is_regular(c: u8) -> bool {
     !is_whitespace(c) && !is_delimiter(c)
 }
@@ -58,6 +77,7 @@ fn hex_value(c: u8) -> Option<u8> {
     }
 }
 
+#[cfg(test)]
 /// Whether a run of regular characters is a number (7.3.3).
 fn is_number(s: &[u8]) -> bool {
     let body = s
@@ -101,7 +121,7 @@ impl<'a> Lexer<'a> {
     /// Skips whitespace and comments.
     fn skip(&mut self) {
         while let Some(&c) = self.data.get(self.pos) {
-            if is_whitespace(c) {
+            if CLASS[usize::from(c)] == 1 {
                 self.pos += 1;
             } else if c == b'%' {
                 while self
@@ -148,14 +168,33 @@ impl<'a> Lexer<'a> {
                 return Err(self.err(start, format!("unexpected {}", c as char)));
             }
             _ => {
-                let end = self.data[start..]
-                    .iter()
-                    .position(|&c| !is_regular(c))
-                    .map_or(self.data.len(), |n| start + n);
+                // One pass finds the end of the word and whether it is a
+                // number: an optional sign, then digits and at most one dot,
+                // with at least one digit, as `is_number` says.
+                let (mut digits, mut dots, mut others) = (0usize, 0usize, 0usize);
+                let mut end = start;
+                while let Some(&c) = self.data.get(end) {
+                    if CLASS[usize::from(c)] != 0 {
+                        break;
+                    }
+                    match c {
+                        b'0'..=b'9' => digits += 1,
+                        b'.' => dots += 1,
+                        b'+' | b'-' if end == start => {}
+                        _ => others += 1,
+                    }
+                    end += 1;
+                }
                 self.pos = end;
                 let word = &self.data[start..end];
-                if is_number(word) {
-                    number(word).map_err(|e| e.at_offset(start))?
+                if digits > 0 && dots <= 1 && others == 0 {
+                    if dots == 1 {
+                        Fixed::parse(word)
+                            .map(Token::Real)
+                            .map_err(|e| e.at_offset(start))?
+                    } else {
+                        integer(word).map_err(|e| e.at_offset(start))?
+                    }
                 } else {
                     Token::Keyword(word)
                 }
@@ -295,6 +334,34 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// An integer of digits with an optional sign, read without making a
+/// string: the same values and the same error as `str::parse::<i64>`.
+fn integer(word: &[u8]) -> Result<Token<'static>> {
+    let (negative, body) = match word.first() {
+        Some(b'-') => (true, &word[1..]),
+        Some(b'+') => (false, &word[1..]),
+        _ => (false, word),
+    };
+    // Negative values are accumulated downward, so that i64::MIN fits.
+    let value = body.iter().try_fold(0i64, |v, &c| {
+        let d = i64::from(c - b'0');
+        v.checked_mul(10).and_then(|v| {
+            if negative {
+                v.checked_sub(d)
+            } else {
+                v.checked_add(d)
+            }
+        })
+    });
+    value.map(Token::Int).ok_or_else(|| {
+        Error::new(format!(
+            "integer out of range: {}",
+            String::from_utf8_lossy(word)
+        ))
+    })
+}
+
+#[cfg(test)]
 fn number(word: &[u8]) -> Result<Token<'static>> {
     if word.contains(&b'.') {
         Fixed::parse(word).map(Token::Real)
@@ -391,5 +458,57 @@ fn reference(lx: &mut Lexer, num: i64) -> Result<Option<Object>> {
             Ok(Some(Object::Ref(Ref { num, generation })))
         }
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod one_pass_tests {
+    use super::*;
+
+    #[test]
+    fn words_are_read_as_the_rule_of_numbers_says() {
+        // docs/adr/0015: the one pass gives the token of `is_number` and
+        // `number`, with the same values and errors.
+        let mut state = 0x0015_000fu64;
+        let mut next = |n: u64| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+        };
+        let alphabet = b"+-.0123456789e9";
+        let specials: [&[u8]; 8] = [
+            b"9223372036854775807",
+            b"9223372036854775808",
+            b"-9223372036854775808",
+            b"-9223372036854775809",
+            b"+0",
+            b"-.5",
+            b"00000000000000000000001",
+            b"+",
+        ];
+        (0..100_000).for_each(|k| {
+            let word: Vec<u8> = if k % 50 == 0 {
+                specials[(k / 50) % specials.len()].to_vec()
+            } else {
+                (0..1 + next(24))
+                    .map(|_| alphabet[next(15) as usize])
+                    .collect()
+            };
+            let mut data = word.clone();
+            data.push(b' ');
+            let new = Lexer::new(&data, 0)
+                .next_token()
+                .map(|t| t.map(|(_, t)| t))
+                .map_err(|e| e.to_string());
+            let old = if is_number(&word) {
+                number(&word)
+                    .map(Some)
+                    .map_err(|e| e.at_offset(0).to_string())
+            } else {
+                Ok(Some(Token::Keyword(&word)))
+            };
+            assert_eq!(new, old, "{}", String::from_utf8_lossy(&word));
+        });
     }
 }
