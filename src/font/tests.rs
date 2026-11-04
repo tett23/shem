@@ -1,6 +1,8 @@
 //! Fonts in PDF and the drawing of text (docs/adr/0004).
 
+use super::Metrics;
 use crate::error::Result;
+use crate::fixed::Fixed;
 use crate::font::truetype::tests::{font, simple};
 use crate::pdf::Document;
 use crate::pdf::tests::build_pdf_bytes;
@@ -284,4 +286,49 @@ fn what_v0_1_does_not_read() {
         ..Text::default()
     };
     assert!(e(&opentype, draw).contains("FontFile3"));
+}
+
+#[test]
+fn metrics_find_the_first_range_of_a_cid() {
+    // docs/adr/0014: sorted ranges are searched by bisection, others in
+    // order; both give the first range that holds the CID, as W and W2 do.
+    let v = |n: i64| vec![Fixed::from_int(n).unwrap()];
+    let linear = |m: &Metrics, cid: u32| {
+        m.ranges
+            .iter()
+            .find(|(a, b, _)| (*a..=*b).contains(&cid))
+            .map(|(_, _, v)| v.clone())
+    };
+    let mut state = 0x0014_0002u64;
+    let mut next = || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    };
+    (0..300).for_each(|k| {
+        let mut start = 0u32;
+        let ranges: Vec<(u32, u32, Vec<Fixed>)> = (0..(next() % 40))
+            .map(|i| {
+                // Every third set overlaps or goes back.
+                let (a, b) = if k % 3 == 0 && i % 7 == 3 {
+                    let a = (next() % 300) as u32;
+                    (a, a + (next() % 20) as u32)
+                } else {
+                    let a = start + (next() % 5) as u32;
+                    (a, a + (next() % 4) as u32)
+                };
+                start = b + 1;
+                (a, b, v(i as i64))
+            })
+            .collect();
+        let m = Metrics::new(ranges);
+        (0..320).for_each(|cid| {
+            assert_eq!(
+                m.get(cid).map(<[Fixed]>::to_vec),
+                linear(&m, cid),
+                "{k} {cid}"
+            );
+        });
+    });
 }

@@ -239,14 +239,61 @@ pub fn bias(count: usize) -> i64 {
 const MAX_STACK: usize = 48;
 const MAX_DEPTH: usize = 10;
 
+/// The argument stack of a charstring, of at most MAX_STACK numbers, on the
+/// stack of the thread: an operator takes the arguments without
+/// allocating (docs/adr/0014).
+#[derive(Clone, Copy)]
+struct Stack {
+    items: [i64; MAX_STACK],
+    len: usize,
+}
+
+impl Stack {
+    const EMPTY: Stack = Stack {
+        items: [0; MAX_STACK],
+        len: 0,
+    };
+
+    fn push(&mut self, v: i64) -> Result<()> {
+        if self.len >= MAX_STACK {
+            return Err(Error::new("charstring stack overflow"));
+        }
+        self.items[self.len] = v;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<i64> {
+        self.len = self.len.checked_sub(1)?;
+        Some(self.items[self.len])
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn remove_first(&mut self) {
+        self.items.copy_within(1..self.len, 0);
+        self.len -= 1;
+    }
+}
+
+impl std::ops::Deref for Stack {
+    type Target = [i64];
+
+    fn deref(&self) -> &[i64] {
+        &self.items[..self.len]
+    }
+}
+
 /// The interpreter of a Type 2 charstring. Numbers are 16.16 fixed point.
-struct Interpreter<'a> {
+struct Interpreter<'a, 'o> {
     global: &'a [Vec<u8>],
     local: &'a [Vec<u8>],
-    stack: Vec<i64>,
+    stack: Stack,
     x: i64,
     y: i64,
-    out: Vec<Segment>,
+    out: &'o mut Vec<Segment>,
     open: bool,
     stems: usize,
     width_seen: bool,
@@ -260,7 +307,7 @@ fn fixed16(v: i64) -> Result<Fixed> {
         .ok_or_else(Error::overflow)
 }
 
-impl Interpreter<'_> {
+impl Interpreter<'_, '_> {
     fn point(&self) -> Result<(Fixed, Fixed)> {
         Ok((fixed16(self.x)?, fixed16(self.y)?))
     }
@@ -271,7 +318,7 @@ impl Interpreter<'_> {
         if !self.width_seen {
             self.width_seen = true;
             if extra && !self.stack.is_empty() {
-                self.stack.remove(0);
+                self.stack.remove_first();
             }
         }
     }
@@ -317,8 +364,9 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    fn args(&mut self) -> Vec<i64> {
-        std::mem::take(&mut self.stack)
+    /// Takes the arguments, and leaves the stack empty.
+    fn args(&mut self) -> Stack {
+        std::mem::replace(&mut self.stack, Stack::EMPTY)
     }
 
     fn wrong(name: &str) -> Error {
@@ -334,14 +382,7 @@ impl Interpreter<'_> {
         let mut i = 0;
         while i < code.len() {
             let b0 = code[i];
-            let push = |v: i64, stack: &mut Vec<i64>| {
-                if stack.len() >= MAX_STACK {
-                    Err(Error::new("charstring stack overflow"))
-                } else {
-                    stack.push(v);
-                    Ok(())
-                }
-            };
+            let push = |v: i64, stack: &mut Stack| stack.push(v);
             match b0 {
                 32..=246 => {
                     push((i64::from(b0) - 139) << 16, &mut self.stack)?;
@@ -434,14 +475,14 @@ impl Interpreter<'_> {
             }
             21 => {
                 self.width(self.stack.len() > 2);
-                match self.args().as_slice() {
+                match &*self.args() {
                     [dx, dy] => self.move_to(*dx, *dy)?,
                     _ => return Err(Self::wrong("rmoveto")),
                 }
             }
             22 | 4 => {
                 self.width(self.stack.len() > 1);
-                match (op, self.args().as_slice()) {
+                match (op, &*self.args()) {
                     (22, [dx]) => self.move_to(*dx, 0)?,
                     (4, [dy]) => self.move_to(0, *dy)?,
                     _ => return Err(Self::wrong("hmoveto or vmoveto")),
@@ -544,7 +585,7 @@ impl Interpreter<'_> {
 
     fn escaped(&mut self, op: u8) -> Result<()> {
         let a = self.args();
-        match (op, a.as_slice()) {
+        match (op, &*a) {
             // dotsection, deprecated: no effect
             (0, _) => {}
             (35, [d @ .., _fd]) if d.len() == 12 => {
@@ -591,13 +632,26 @@ pub fn charstring_outline(
     global: &[Vec<u8>],
     local: &[Vec<u8>],
 ) -> Result<Vec<Segment>> {
+    let mut out = Vec::new();
+    charstring_outline_into(code, global, local, &mut out)?;
+    Ok(out)
+}
+
+/// [`charstring_outline`] into `out`, which is cleared first.
+pub fn charstring_outline_into(
+    code: &[u8],
+    global: &[Vec<u8>],
+    local: &[Vec<u8>],
+    out: &mut Vec<Segment>,
+) -> Result<()> {
+    out.clear();
     let mut it = Interpreter {
         global,
         local,
-        stack: Vec::new(),
+        stack: Stack::EMPTY,
         x: 0,
         y: 0,
-        out: Vec::new(),
+        out,
         open: false,
         stems: 0,
         width_seen: false,
@@ -607,7 +661,7 @@ pub fn charstring_outline(
     if !it.ended {
         return Err(Error::new("charstring without endchar"));
     }
-    Ok(it.out)
+    Ok(())
 }
 
 /// A CFF font.
@@ -777,13 +831,20 @@ impl Cff {
 
     /// The outline of a glyph, in units of the FontMatrix (1/1000 em).
     pub fn outline(&self, gid: u16) -> Result<Vec<Segment>> {
+        let mut out = Vec::new();
+        self.outline_into(gid, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Cff::outline`] into `out`, which is cleared first.
+    pub fn outline_into(&self, gid: u16, out: &mut Vec<Segment>) -> Result<()> {
         let g = usize::from(gid);
         let code = self
             .charstrings
             .get(g)
             .ok_or_else(|| Error::new(format!("glyph {gid} is not in the font")))?;
         let fd = self.fd_select.as_ref().map_or(0, |s| usize::from(s[g]));
-        charstring_outline(code, &self.global, &self.local[fd])
+        charstring_outline_into(code, &self.global, &self.local[fd], out)
     }
 }
 

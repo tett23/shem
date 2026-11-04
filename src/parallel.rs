@@ -18,9 +18,26 @@ where
     E: Send,
     F: Fn(usize) -> Result<(), E> + Sync,
 {
+    run_with(count, jobs, || (), |(), i| task(i))
+}
+
+/// [`run`] with a state for each thread: `init` makes it when the thread
+/// starts, and `task(state, i)` gets the state of its thread.
+pub fn run_with<S, E, I, F>(
+    count: usize,
+    jobs: NonZeroUsize,
+    init: I,
+    task: F,
+) -> Result<(), (usize, E)>
+where
+    E: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize) -> Result<(), E> + Sync,
+{
     let threads = jobs.get().min(count);
     if threads <= 1 {
-        return (0..count).try_for_each(|i| task(i).map_err(|e| (i, e)));
+        let mut state = init();
+        return (0..count).try_for_each(|i| task(&mut state, i).map_err(|e| (i, e)));
     }
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
@@ -29,12 +46,13 @@ where
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {
+                    let mut state = init();
                     while !stop.load(Ordering::SeqCst) {
                         let i = next.fetch_add(1, Ordering::SeqCst);
                         if i >= count {
                             break;
                         }
-                        if let Err(e) = task(i) {
+                        if let Err(e) = task(&mut state, i) {
                             stop.store(true, Ordering::SeqCst);
                             failures
                                 .lock()

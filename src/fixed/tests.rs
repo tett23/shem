@@ -230,3 +230,53 @@ fn display_in_decimal() {
     assert_eq!(p("0.0041666667").to_string(), "0.004166");
     assert_eq!(p("-0").to_string(), "0");
 }
+
+/// A xorshift64* generator, for inputs that are the same on every run.
+fn next(state: &mut u64) -> u64 {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+}
+
+#[test]
+fn short_fractions_equal_the_doubling_of_the_digits() {
+    // docs/adr/0014: up to 19 digits, the fraction is computed with one
+    // division, which must give the units of the exact doubling.
+    let mut state = 0x0014_0001u64;
+    (0..20000).for_each(|k| {
+        let len = 1 + (next(&mut state) % 19) as usize;
+        let digits: Vec<u8> = (0..len)
+            .map(|i| {
+                // Some fractions are ties, halves and runs of 9 and 0.
+                match k % 5 {
+                    0 => b'5',
+                    1 => b"09"[(i + k) % 2],
+                    2 if i + 1 < len => b'0',
+                    _ => b'0' + (next(&mut state) % 10) as u8,
+                }
+            })
+            .collect();
+        assert_eq!(
+            fraction_units(&digits),
+            fraction_units_by_doubling(&digits),
+            "0.{}",
+            String::from_utf8_lossy(&digits)
+        );
+    });
+    // Exact ties of 2^-33 and its odd multiples have 33 digits, past the
+    // short path; the doubling still reads them.
+    [
+        "5",
+        "25",
+        "0000000002328306436538696289062",
+        "9999999999999999999",
+    ]
+    .iter()
+    .for_each(|d| {
+        assert_eq!(
+            fraction_units(d.as_bytes()),
+            fraction_units_by_doubling(d.as_bytes())
+        )
+    });
+}

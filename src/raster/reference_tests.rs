@@ -168,12 +168,25 @@ fn a_cleared_path_is_like_a_new_one() {
 
 #[test]
 fn coverages_equal_the_reference_with_one_scratch() {
-    let mut rng = Rng(0x0013_0004);
-    let (w, h) = (40, 30);
+    coverages_equal_the_reference(0x0013_0004, 40, 30, -2560, 12800, 200);
+}
+
+#[test]
+fn coverages_of_small_and_large_paths_equal_the_reference() {
+    // docs/adr/0014: small paths are summed in a dense grid, large ones by
+    // sorting the cells; both, and paths far outside, equal the reference.
+    coverages_equal_the_reference(0x0014_0003, 12, 9, -512, 3584, 300);
+    coverages_equal_the_reference(0x0014_0004, 600, 500, -25600, 179200, 60);
+    coverages_equal_the_reference(0x0014_0005, 40, 30, -40000, -20000, 50);
+    coverages_equal_the_reference(0x0014_0006, 40, 30, 20000, 40000, 50);
+}
+
+fn coverages_equal_the_reference(seed: u64, w: usize, h: usize, lo: i64, hi: i64, n: usize) {
+    let mut rng = Rng(seed);
     let mut scratch = Scratch::default();
-    (0..200).for_each(|_| {
+    (0..n).for_each(|_| {
         // Some points are outside the canvas.
-        let cmds = random_cmds(&mut rng, true, -2560, 12800);
+        let cmds = random_cmds(&mut rng, true, lo, hi);
         let (path, reference) = (build(&cmds), build_old(&cmds));
         [FillRule::NonZero, FillRule::EvenOdd]
             .iter()

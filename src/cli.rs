@@ -239,9 +239,9 @@ fn render(r: &Render) -> std::result::Result<(), Error> {
             let name = format!("page-{n:0digits$}.{extension}");
             if r.ppm {
                 // The pixels go to the file as they are (docs/adr/0013).
-                write_file_with(&dir, &name, |f| write_ppm(&canvas, f))
+                write_file_with(&dir, &name, |f| write_ppm(canvas, f))
             } else {
-                write_file(&dir, &name, &encode_png(&canvas))
+                write_file(&dir, &name, &encode_png(canvas))
             }
         })
         .map_err(|e| match e {

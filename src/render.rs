@@ -1,7 +1,7 @@
 //! Interpreting a page's content into an image (docs/adr/0003).
 
 use crate::color::{self, Device, FillSpace, Separation};
-use crate::content::{self, Op, Operator};
+use crate::content::{self, Op, Operator, Text};
 use crate::error::{Error, Result};
 use crate::fixed::{Fixed, Matrix};
 use crate::font::{Font, FontCache, Segment};
@@ -117,6 +117,7 @@ struct Renderer<'a> {
     glyph: Path,
     outline: Path,
     scratch: Scratch,
+    segments: Vec<Segment>,
 }
 
 impl Renderer<'_> {
@@ -140,6 +141,9 @@ impl Renderer<'_> {
 
     /// Fills the stroke of a path, `half` units on each side.
     fn fill_stroke(&mut self, path: &Path, half: i64, rgb: [u8; 3]) {
+        if !self.paint {
+            return;
+        }
         let mut outline = std::mem::take(&mut self.outline);
         outline.clear();
         stroke_into(path, half, &mut outline);
@@ -165,19 +169,18 @@ impl Renderer<'_> {
     }
 
     /// Shows a string: each two bytes are a CID (Identity-H and Identity-V).
-    fn show_text(&mut self, s: &[u8]) -> Result<()> {
+    fn show_text(&mut self, s: &Text) -> Result<()> {
         let font = self
             .state
             .font
             .clone()
             .ok_or_else(|| Error::new("Tj without a font"))?;
-        if !s.len().is_multiple_of(2) {
+        if !s.bytes().count().is_multiple_of(2) {
             return Err(Error::new("a string of odd length for a two-byte encoding"));
         }
-        s.chunks(2).try_for_each(|pair| {
-            let cid = u16::from_be_bytes([pair[0], pair[1]]);
-            self.show_glyph(&font, cid)
-        })
+        let mut bytes = s.bytes();
+        std::iter::from_fn(|| Some(u16::from_be_bytes([bytes.next()?, bytes.next()?])))
+            .try_for_each(|cid| self.show_glyph(&font, cid))
     }
 
     fn show_glyph(&mut self, font: &Font, cid: u16) -> Result<()> {
@@ -213,19 +216,39 @@ impl Renderer<'_> {
         let m = font.glyph_matrix()?.concat(&shift)?.concat(&trm)?;
         let mut path = std::mem::take(&mut self.glyph);
         path.clear();
-        font.outline(cid)?.iter().try_for_each(|s| {
-            match *s {
-                Segment::Move(x, y) => path.move_to(to_device(&m, x, y)?),
-                Segment::Line(x, y) => path.line_to(to_device(&m, x, y)?),
-                Segment::Curve([x1, y1, x2, y2, x3, y3]) => path.curve_to(
-                    to_device(&m, x1, y1)?,
-                    to_device(&m, x2, y2)?,
-                    to_device(&m, x3, y3)?,
-                ),
-                Segment::Close => path.close(),
-            }
-            Ok::<_, Error>(())
-        })?;
+        // Without painting, the points are only checked: making the path,
+        // which cannot fail, is left to the rendering (docs/adr/0014).
+        let paint = self.paint;
+        font.outline_with(cid, &mut self.segments)?
+            .iter()
+            .try_for_each(|s| {
+                match *s {
+                    Segment::Move(x, y) => {
+                        let p = to_device(&m, x, y)?;
+                        if paint {
+                            path.move_to(p);
+                        }
+                    }
+                    Segment::Line(x, y) => {
+                        let p = to_device(&m, x, y)?;
+                        if paint {
+                            path.line_to(p);
+                        }
+                    }
+                    Segment::Curve([x1, y1, x2, y2, x3, y3]) => {
+                        let (c1, c2, p) = (
+                            to_device(&m, x1, y1)?,
+                            to_device(&m, x2, y2)?,
+                            to_device(&m, x3, y3)?,
+                        );
+                        if paint {
+                            path.curve_to(c1, c2, p);
+                        }
+                    }
+                    Segment::Close => path.close(),
+                }
+                Ok::<_, Error>(())
+            })?;
         // Each glyph is filled, then stroked in mode 2 (9.3.6).
         let fill = self.state.fill;
         self.fill(&path, fill);
@@ -422,7 +445,9 @@ pub fn render_page_with(
     dpi: u32,
     cache: &FontCache,
 ) -> Result<Canvas> {
-    interpret(doc, page, dpi, true, cache)
+    let mut ws = Workspace::default();
+    interpret(doc, page, dpi, true, cache, &mut ws)?;
+    Ok(ws.canvas)
 }
 
 /// Interprets a page without drawing pixels: the content, the resources,
@@ -435,7 +460,29 @@ pub fn check_page(doc: &Document, page: &Page, dpi: u32) -> Result<()> {
 /// Checks a page with the fonts of a cache shared by the pages of the
 /// document (docs/adr/0011).
 pub fn check_page_with(doc: &Document, page: &Page, dpi: u32, cache: &FontCache) -> Result<()> {
-    interpret(doc, page, dpi, false, cache).map(|_| ())
+    interpret(doc, page, dpi, false, cache, &mut Workspace::default())
+}
+
+/// The buffers that a thread keeps between the pages it checks and renders
+/// (docs/adr/0014): the operators, the stack of graphics states, the paths,
+/// the cells and pixels of filling, and the image.
+#[derive(Default)]
+pub struct Workspace {
+    ops: Vec<Op<'static>>,
+    stack: Vec<GraphicsState>,
+    scratch: Scratch,
+    glyph: Path,
+    outline: Path,
+    path: Path,
+    canvas: Canvas,
+    segments: Vec<Segment>,
+}
+
+/// An empty `Vec` of operators of another content, in the allocation of
+/// `ops` when the standard library reuses it.
+fn recycle<'b>(mut ops: Vec<Op<'_>>) -> Vec<Op<'b>> {
+    ops.clear();
+    ops.into_iter().map(|_| unreachable!()).collect()
 }
 
 fn interpret(
@@ -444,26 +491,43 @@ fn interpret(
     dpi: u32,
     paint: bool,
     cache: &FontCache,
-) -> Result<Canvas> {
+    ws: &mut Workspace,
+) -> Result<()> {
     let at_page = |e: Error| e.at_page(page.index + 1);
-    let ops: Vec<Op> = content::parse(&page.contents).map_err(at_page)?;
-    content::check_resources(doc, &page.resources, &ops).map_err(at_page)?;
-    let (width, height) = page_size(&page.media_box, dpi).map_err(at_page)?;
+    let mut ops: Vec<Op> = recycle(std::mem::take(&mut ws.ops));
+    let result = interpret_ops(doc, page, dpi, paint, cache, ws, &mut ops).map_err(at_page);
+    ws.ops = recycle(ops);
+    result
+}
+
+fn interpret_ops<'c>(
+    doc: &Document,
+    page: &'c Page,
+    dpi: u32,
+    paint: bool,
+    cache: &FontCache,
+    ws: &mut Workspace,
+    ops: &mut Vec<Op<'c>>,
+) -> Result<()> {
+    content::parse_into(&page.contents, ops)?;
+    content::check_resources(doc, &page.resources, ops)?;
+    let (width, height) = page_size(&page.media_box, dpi)?;
+    let mut canvas = std::mem::take(&mut ws.canvas);
+    if paint {
+        canvas.reset(width, height);
+    }
     let mut renderer = Renderer {
         doc,
         cache,
         resources: &page.resources,
-        canvas: if paint {
-            Canvas::new(width, height)
-        } else {
-            Canvas::new(0, 0)
-        },
+        canvas,
         paint,
-        glyph: Path::new(),
-        outline: Path::new(),
-        scratch: Scratch::default(),
+        glyph: std::mem::take(&mut ws.glyph),
+        outline: std::mem::take(&mut ws.outline),
+        scratch: std::mem::take(&mut ws.scratch),
+        segments: std::mem::take(&mut ws.segments),
         state: GraphicsState {
-            ctm: device_matrix(&page.media_box, dpi).map_err(at_page)?,
+            ctm: device_matrix(&page.media_box, dpi)?,
             line_width: Fixed::ONE,
             fill: [0, 0, 0],
             fill_space: FillSpace::Device(Device::Gray),
@@ -473,21 +537,29 @@ fn interpret(
             h_scale: Fixed::ONE,
             render_mode: 0,
         },
-        stack: Vec::new(),
-        path: Path::new(),
+        stack: std::mem::take(&mut ws.stack),
+        path: std::mem::take(&mut ws.path),
         text_matrix: Matrix::IDENTITY,
         fonts: BTreeMap::new(),
         point_half_width: Fixed::from_int(i64::from(dpi))
-            .and_then(|d| d.checked_div(Fixed::from_int(72)?))
-            .map_err(at_page)?
+            .and_then(|d| d.checked_div(Fixed::from_int(72)?))?
             .to_units(7),
     };
-    ops.iter().try_for_each(|op| {
+    renderer.stack.clear();
+    renderer.path.clear();
+    let result = ops.iter().try_for_each(|op| {
         renderer
             .op(&op.operator)
-            .map_err(|e| at_page(e.at_offset(op.offset)))
-    })?;
-    Ok(renderer.canvas)
+            .map_err(|e| e.at_offset(op.offset))
+    });
+    ws.canvas = renderer.canvas;
+    ws.glyph = renderer.glyph;
+    ws.outline = renderer.outline;
+    ws.scratch = renderer.scratch;
+    ws.stack = renderer.stack;
+    ws.path = renderer.path;
+    ws.segments = renderer.segments;
+    result
 }
 
 /// A document to render at one resolution, with the cache of its fonts
@@ -554,12 +626,27 @@ impl<'a> Session<'a> {
         render_page_with(self.doc, self.page(page)?, self.dpi, &self.fonts)
     }
 
+    /// Checks one page in the buffers of `ws`.
+    pub fn check_with(&self, ws: &mut Workspace, page: usize) -> Result<()> {
+        interpret(self.doc, self.page(page)?, self.dpi, false, &self.fonts, ws)
+    }
+
+    /// Renders one page in the buffers of `ws`; the image stays in `ws`
+    /// until the next page.
+    pub fn render_with<'w>(&self, ws: &'w mut Workspace, page: usize) -> Result<&'w Canvas> {
+        interpret(self.doc, self.page(page)?, self.dpi, true, &self.fonts, ws)?;
+        Ok(&ws.canvas)
+    }
+
     /// Checks the pages on at most `jobs` threads, and returns the error of
     /// the first page of `pages` that fails, whatever the threads do
     /// ([`crate::parallel::run`]).
     pub fn check_pages(&self, pages: &[usize], jobs: NonZeroUsize) -> Result<()> {
         pages.iter().try_for_each(|&p| self.page(p).map(|_| ()))?;
-        crate::parallel::run(pages.len(), jobs, |k| self.check(pages[k])).map_err(|(_, e)| e)
+        crate::parallel::run_with(pages.len(), jobs, Workspace::default, |ws, k| {
+            self.check_with(ws, pages[k])
+        })
+        .map_err(|(_, e)| e)
     }
 
     /// Renders the pages on at most `jobs` threads and gives each image to
@@ -575,14 +662,14 @@ impl<'a> Session<'a> {
     ) -> std::result::Result<(), PageError<E>>
     where
         E: Send,
-        F: Fn(usize, Canvas) -> std::result::Result<(), E> + Sync,
+        F: Fn(usize, &Canvas) -> std::result::Result<(), E> + Sync,
     {
         pages
             .iter()
             .try_for_each(|&p| self.page(p).map(|_| ()))
             .map_err(PageError::Render)?;
-        crate::parallel::run(pages.len(), jobs, |k| {
-            let canvas = self.render(pages[k]).map_err(PageError::Render)?;
+        crate::parallel::run_with(pages.len(), jobs, Workspace::default, |ws, k| {
+            let canvas = self.render_with(ws, pages[k]).map_err(PageError::Render)?;
             consume(pages[k], canvas).map_err(|e| PageError::Consume(pages[k], e))
         })
         .map_err(|(_, e)| e)

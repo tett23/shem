@@ -33,8 +33,8 @@ fn every_image_is_the_same_bytes_as_before() {
         session
             .render_pages(&pages, jobs, |page, canvas| {
                 let n = page + 1;
-                let png = common::sha256_hex(&encode_png(&canvas));
-                let ppm = common::sha256_hex(&encode_ppm(&canvas));
+                let png = common::sha256_hex(&encode_png(canvas));
+                let ppm = common::sha256_hex(&encode_ppm(canvas));
                 let mut lines = lines.lock().unwrap();
                 lines.push(format!("{png}  {dpi}-png/page-{n:04}.png"));
                 lines.push(format!("{ppm}  {dpi}-ppm/page-{n:04}.ppm"));

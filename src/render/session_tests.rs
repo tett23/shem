@@ -32,7 +32,7 @@ fn render_pages_gives_the_images_of_render() {
                 let got: Mutex<Vec<(usize, Canvas)>> = Mutex::new(Vec::new());
                 session
                     .render_pages(&all, jobs(j), |page, canvas| {
-                        got.lock().unwrap().push((page, canvas));
+                        got.lock().unwrap().push((page, canvas.clone()));
                         Ok::<(), ()>(())
                     })
                     .unwrap_or_else(|_| panic!("{name}"));

@@ -14,11 +14,24 @@ pub enum Token<'a> {
     Real(Fixed),
     Name(Cow<'a, [u8]>),
     String(Vec<u8>),
+    /// The digits and the whitespace of a hexadecimal string.
+    HexString(&'a [u8]),
     ArrayOpen,
     ArrayClose,
     DictOpen,
     DictClose,
     Keyword(&'a [u8]),
+}
+
+/// The bytes of the raw text of a hexadecimal string: two digits each,
+/// whitespace ignored, and an implied 0 after an odd final digit
+/// (ISO 32000-1 7.3.4.3). The text must have been checked by the lexer.
+pub fn hex_bytes(raw: &[u8]) -> impl Iterator<Item = u8> + Clone + '_ {
+    let mut digits = raw.iter().filter_map(|&c| hex_value(c));
+    std::iter::from_fn(move || {
+        let high = digits.next()?;
+        Some(high << 4 | digits.next().unwrap_or(0))
+    })
 }
 
 pub fn is_whitespace(c: u8) -> bool {
@@ -188,37 +201,24 @@ impl<'a> Lexer<'a> {
         Ok(Token::Name(Cow::Owned(out)))
     }
 
+    /// A hexadecimal string, checked and kept as the slice between `<` and
+    /// `>`, so that reading it allocates nothing; [`hex_bytes`] decodes it.
     fn hex_string(&mut self) -> Result<Token<'a>> {
         let start = self.pos;
-        self.pos += 1;
-        // The bytes, and the high digit of the byte still to complete.
-        let mut out = Vec::new();
-        let mut high: Option<u8> = None;
-        loop {
-            match self.data.get(self.pos) {
-                None => return Err(self.err(start, "unterminated hexadecimal string")),
-                Some(b'>') => {
-                    self.pos += 1;
-                    break;
-                }
-                Some(&c) if is_whitespace(c) => self.pos += 1,
-                Some(&c) => {
-                    let v = hex_value(c)
-                        .ok_or_else(|| self.err(start, "malformed hexadecimal string"))?;
-                    high = match high {
-                        None => Some(v),
-                        Some(h) => {
-                            out.push(h << 4 | v);
-                            None
-                        }
-                    };
-                    self.pos += 1;
-                }
-            }
+        let data: &'a [u8] = self.data;
+        let len = data[start + 1..]
+            .iter()
+            .position(|&c| c == b'>')
+            .ok_or_else(|| self.err(start, "unterminated hexadecimal string"))?;
+        let raw = &data[start + 1..start + 1 + len];
+        if !raw
+            .iter()
+            .all(|&c| is_whitespace(c) || hex_value(c).is_some())
+        {
+            return Err(self.err(start, "malformed hexadecimal string"));
         }
-        // An odd final digit is followed by an implied 0 (7.3.4.3).
-        out.extend(high.map(|h| h << 4));
-        Ok(Token::String(out))
+        self.pos = start + len + 2;
+        Ok(Token::HexString(raw))
     }
 
     fn literal_string(&mut self) -> Result<Token<'a>> {
@@ -327,6 +327,7 @@ pub fn object_from(lx: &mut Lexer, at: usize, token: Token, refs: bool) -> Resul
         Token::Real(v) => Ok(Object::Real(v)),
         Token::Name(n) => Ok(Object::Name(n.into_owned())),
         Token::String(s) => Ok(Object::String(s)),
+        Token::HexString(raw) => Ok(Object::String(hex_bytes(raw).collect())),
         Token::ArrayOpen => {
             let mut items = Vec::new();
             loop {
