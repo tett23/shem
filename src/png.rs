@@ -526,8 +526,13 @@ fn deflate_with(data: &[u8], match_len: impl Fn(&[u8], usize, usize, usize) -> u
                 } else {
                     k + 1
                 };
+                // The positions inside a run (after k) are chained to the one
+                // before them, which the search knows without reading `prev`:
+                // it takes the run at once, and reads `prev` only at the start
+                // of a run, or where the tries or the window end the search,
+                // and an entry left from 32 KiB before points outside the
+                // window. So their entries are not written (docs/adr/0015).
                 prev[k % WINDOW] = head[h];
-                (k + 1..g).for_each(|j| prev[j % WINDOW] = (j - 1) as u32);
                 head[h] = (g - 1) as u32;
                 if g < end {
                     h = if g == k + 1 {

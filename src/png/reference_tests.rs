@@ -170,3 +170,20 @@ fn streams_of_runs_are_the_bytes_of_the_reference() {
         assert_eq!(zlib(&data), old::zlib(&data), "{k}: {} bytes", data.len());
     });
 }
+
+#[test]
+fn runs_longer_than_the_window_are_the_bytes_of_the_reference() {
+    // docs/adr/0015: the entries inside a run are not written; runs longer
+    // than the window, and patterns at the distance of the window, read the
+    // entries left from before.
+    let mut rng = Rng(0x0015_000e);
+    (0..12u64).for_each(|k| {
+        let mut data = Vec::new();
+        (0..3 + rng.below(4)).for_each(|_| {
+            let run = [32767, 32768, 32769, 40000, 70000, 200][rng.below(6) as usize];
+            data.extend(std::iter::repeat_n((k % 3) as u8, run));
+            (0..rng.below(300)).for_each(|_| data.push(rng.below(4) as u8));
+        });
+        assert_eq!(zlib(&data), old::zlib(&data), "{k}: {} bytes", data.len());
+    });
+}
