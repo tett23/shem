@@ -217,19 +217,35 @@ fn distance_code(distance: usize) -> usize {
     }
 }
 
+/// The distance codes, reversed, for the five bits of each.
+const DIST_CODES: [u32; 30] = {
+    let mut t = [0u32; 30];
+    let mut d = 0;
+    while d < 30 {
+        t[d] = reverse(d as u32, 5);
+        d += 1;
+    }
+    t
+};
+
+/// A length and a distance: the length code, its extra bits, the distance
+/// code and its extra bits, at most 8 + 5 + 5 + 13 = 31 bits, put at once
+/// (docs/adr/0015).
 fn length_and_distance(w: &mut BitWriter, length: usize, distance: usize) {
     let l = usize::from(LENGTH_CODE[length]);
-    literal(w, 257 + l as u32);
-    w.put(
-        (length - usize::from(LENGTH_BASE[l])) as u32,
-        u32::from(LENGTH_EXTRA[l]),
-    );
+    let (code, len) = LITERALS[257 + l];
     let d = distance_code(distance);
-    w.put(reverse(d as u32, 5), 5);
-    w.put(
-        (distance - usize::from(DIST_BASE[d])) as u32,
-        u32::from(DIST_EXTRA[d]),
-    );
+    let length_extra = u32::from(LENGTH_EXTRA[l]);
+    let dist_extra = u32::from(DIST_EXTRA[d]);
+    let mut bits = code;
+    let mut count = len;
+    bits |= ((length - usize::from(LENGTH_BASE[l])) as u32) << count;
+    count += length_extra;
+    bits |= DIST_CODES[d] << count;
+    count += 5;
+    bits |= ((distance - usize::from(DIST_BASE[d])) as u32) << count;
+    count += dist_extra;
+    w.put(bits, count);
 }
 
 const WINDOW: usize = 32768;
