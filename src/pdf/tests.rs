@@ -421,3 +421,64 @@ fn keywords_and_plain_names_are_slices_of_the_data() {
     assert!(matches!(next(), Token::Keyword(k) if std::ptr::eq(k.as_ptr(), data[11..].as_ptr())));
     assert_eq!(next(), Token::Keyword(b"Tj"));
 }
+
+#[test]
+fn pages_on_threads_are_the_pages_on_one_thread() {
+    // docs/adr/0015: the contents are decoded on threads, and the error is
+    // the one of the first page that fails, whatever the threads do.
+    let jobs = |n| std::num::NonZeroUsize::new(n).unwrap();
+    let page = |contents: &str| {
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents {contents} >>")
+    };
+    // Pages 2 and 4 have contents that are not streams; page 3 a stream.
+    let doc_bytes = build_pdf(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 >>",
+            &page("7 0 R"),
+            &page("1"),
+            &page("7 0 R"),
+            &page("(x)"),
+            "<< /Length 3 >>\nstream\nq Q\nendstream",
+        ],
+        "/Root 1 0 R",
+    );
+    let doc = Document::parse(&doc_bytes).unwrap();
+    let one = doc.pages().map_err(|e| e.to_string());
+    assert!(one.is_err());
+    [2, 3, 8].iter().for_each(|&n| {
+        (0..20).for_each(|_| {
+            assert_eq!(
+                doc.pages_with(jobs(n)).map_err(|e| e.to_string()).err(),
+                one.clone().err()
+            );
+        });
+    });
+    // The fixtures of Golem give the same pages.
+    ["sample", "kanikosen"].iter().for_each(|name| {
+        let data = std::fs::read(format!(
+            "{}/tests/fixtures/golem/{name}.pdf",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let doc = Document::parse(&data).unwrap();
+        let summary = |pages: Vec<Page>| {
+            pages
+                .iter()
+                .map(|p| {
+                    (
+                        p.index,
+                        p.object,
+                        p.media_box,
+                        p.contents.clone(),
+                        format!("{:?}", p.resources),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            summary(doc.pages_with(jobs(4)).unwrap()),
+            summary(doc.pages().unwrap())
+        );
+    });
+}

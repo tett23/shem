@@ -280,3 +280,27 @@ fn short_fractions_equal_the_doubling_of_the_digits() {
         )
     });
 }
+
+#[test]
+fn products_by_the_identity_are_the_other_matrix() {
+    // docs/adr/0015: concat skips the identity, which the products give.
+    let mut state = 0x0015_0009u64;
+    (0..5000).for_each(|k| {
+        let m = Matrix::new(std::array::from_fn(|_| {
+            Fixed::from_raw((next(&mut state) as i64) >> (k % 40))
+        }));
+        let product = |a: &Matrix, b: &Matrix| -> Result<Matrix> {
+            Ok(Matrix {
+                a: narrow(wide(a.a, b.a) + wide(a.b, b.c))?,
+                b: narrow(wide(a.a, b.b) + wide(a.b, b.d))?,
+                c: narrow(wide(a.c, b.a) + wide(a.d, b.c))?,
+                d: narrow(wide(a.c, b.b) + wide(a.d, b.d))?,
+                e: narrow(wide(a.e, b.a) + wide(a.f, b.c) + widen(b.e))?,
+                f: narrow(wide(a.e, b.b) + wide(a.f, b.d) + widen(b.f))?,
+            })
+        };
+        assert_eq!(m.concat(&Matrix::IDENTITY), product(&m, &Matrix::IDENTITY));
+        assert_eq!(Matrix::IDENTITY.concat(&m), product(&Matrix::IDENTITY, &m));
+        assert_eq!(Ok(m), product(&m, &Matrix::IDENTITY));
+    });
+}

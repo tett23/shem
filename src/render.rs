@@ -3,13 +3,11 @@
 use crate::color::{self, Device, FillSpace, Separation};
 use crate::content::{self, Op, Operator, Text};
 use crate::error::{Error, Result};
-use crate::fixed::{Fixed, Matrix};
+use crate::fixed::{Fixed, Matrix, round_shift};
 use crate::font::{Font, FontCache, Segment};
 use crate::pdf::Object;
 use crate::pdf::{Dict, Document, Page};
-use crate::raster::{
-    Canvas, FillRule, Path, Point, Scratch, coverage_with, signed_area, stroke_into,
-};
+use crate::raster::{Canvas, FillRule, Path, Point, Scratch, signed_area, stroke_into};
 
 /// The fill and the lines of the box of an image or a form (docs/adr/0006).
 const BOX_FILL: [u8; 3] = [192, 192, 192];
@@ -61,6 +59,56 @@ pub fn to_device(ctm: &Matrix, x: Fixed, y: Fixed) -> Result<Point> {
     let (dx, dy) = ctm.apply(x, y)?;
     let unit = |v: Fixed| i32::try_from(v.to_units(8)).map_err(|_| Error::overflow());
     Ok((unit(dx)?, unit(dy)?))
+}
+
+/// [`to_device`] of a point that [`fits_in_device`] has shown to fit: the
+/// same sum and the same two roundings, without the checks.
+pub fn to_device_fitting(m: &Matrix, x: Fixed, y: Fixed) -> Point {
+    let (x, y) = (i128::from(x.raw()), i128::from(y.raw()));
+    let map = |p: Fixed, q: Fixed, t: Fixed| {
+        let sum = i128::from(p.raw()) * x + i128::from(q.raw()) * y + (i128::from(t.raw()) << 32);
+        let raw = round_shift(sum, 32) as i64;
+        round_shift_i64(raw, 24) as i32
+    };
+    (map(m.a, m.c, m.e), map(m.b, m.d, m.f))
+}
+
+/// [`round_shift`] of an i64.
+fn round_shift_i64(v: i64, s: u32) -> i64 {
+    let q = v >> s;
+    let r = v - (q << s);
+    let half = 1i64 << (s - 1);
+    if r > half || (r == half && q & 1 == 1) {
+        q + 1
+    } else {
+        q
+    }
+}
+
+/// Whether [`to_device`] maps every point of `segments` through `m`
+/// without an overflow, shown by bounds: with X and Y the largest absolute
+/// values of the coordinates, `|a x + c y + e|` is at most `|a| X + |c| Y +
+/// |e|`, the rounding to 2^-32 adds at most one unit, and the rounding to
+/// 1/256 pixel one more, which must stay below 2^31 (docs/adr/0015). If the
+/// bounds do not show it, the points may still fit.
+pub fn fits_in_device(m: &Matrix, segments: &[Segment]) -> bool {
+    fits_with_extent(m, crate::font::extent(segments))
+}
+
+/// [`fits_in_device`] from the largest absolute values of the coordinates.
+fn fits_with_extent(m: &Matrix, (mx, my): (u64, u64)) -> bool {
+    // The bound of |p x + q y + t| in units of 2^-64.
+    let bound = |p: Fixed, q: Fixed, t: Fixed| -> Option<u128> {
+        let px = u128::from(p.raw().unsigned_abs()).checked_mul(u128::from(mx))?;
+        let qy = u128::from(q.raw().unsigned_abs()).checked_mul(u128::from(my))?;
+        px.checked_add(qy)?
+            .checked_add(u128::from(t.raw().unsigned_abs()) << 32)
+    };
+    // raw ≤ S / 2^32 + 1 and units ≤ raw / 2^24 + 1 ≤ 2^31 − 1.
+    let limit: u128 = ((((1u128 << 31) - 2) << 24) - 1) << 32;
+    [bound(m.a, m.c, m.e), bound(m.b, m.d, m.f)]
+        .iter()
+        .all(|b| b.is_some_and(|b| b <= limit))
 }
 
 /// Half the width of a stroke in device space, in units of 1/256 pixel. The
@@ -129,14 +177,8 @@ impl Renderer<'_> {
         if !self.paint {
             return;
         }
-        let cov = coverage_with(
-            path,
-            FillRule::NonZero,
-            self.canvas.width,
-            self.canvas.height,
-            &mut self.scratch,
-        );
-        self.canvas.paint(cov, rgb);
+        self.canvas
+            .fill(path, FillRule::NonZero, rgb, &mut self.scratch);
     }
 
     /// Fills the stroke of a path, `half` units on each side.
@@ -219,28 +261,35 @@ impl Renderer<'_> {
         // Without painting, the points are only checked: making the path,
         // which cannot fail, is left to the rendering (docs/adr/0014).
         let paint = self.paint;
-        font.outline_with(cid, &mut self.segments)?
-            .iter()
-            .try_for_each(|s| {
+        let (outline, extent) = font.outline_and_extent(cid, &mut self.segments)?;
+        // When the bounds show that every point fits, the check need not
+        // map them, and the rendering maps them without the checks
+        // (docs/adr/0015).
+        let fits = fits_with_extent(&m, extent);
+        if paint || !fits {
+            let point = |x: Fixed, y: Fixed| {
+                if fits {
+                    Ok(to_device_fitting(&m, x, y))
+                } else {
+                    to_device(&m, x, y)
+                }
+            };
+            outline.iter().try_for_each(|s| {
                 match *s {
                     Segment::Move(x, y) => {
-                        let p = to_device(&m, x, y)?;
+                        let p = point(x, y)?;
                         if paint {
                             path.move_to(p);
                         }
                     }
                     Segment::Line(x, y) => {
-                        let p = to_device(&m, x, y)?;
+                        let p = point(x, y)?;
                         if paint {
                             path.line_to(p);
                         }
                     }
                     Segment::Curve([x1, y1, x2, y2, x3, y3]) => {
-                        let (c1, c2, p) = (
-                            to_device(&m, x1, y1)?,
-                            to_device(&m, x2, y2)?,
-                            to_device(&m, x3, y3)?,
-                        );
+                        let (c1, c2, p) = (point(x1, y1)?, point(x2, y2)?, point(x3, y3)?);
                         if paint {
                             path.curve_to(c1, c2, p);
                         }
@@ -249,6 +298,7 @@ impl Renderer<'_> {
                 }
                 Ok::<_, Error>(())
             })?;
+        }
         // Each glyph is filled, then stroked in mode 2 (9.3.6).
         let fill = self.state.fill;
         self.fill(&path, fill);
@@ -584,9 +634,15 @@ pub enum PageError<E> {
 
 impl<'a> Session<'a> {
     pub fn new(doc: &'a Document, dpi: u32) -> Result<Session<'a>> {
+        Session::with_jobs(doc, dpi, NonZeroUsize::MIN)
+    }
+
+    /// [`Session::new`], with the contents of the pages decoded on at most
+    /// `jobs` threads ([`Document::pages_with`]).
+    pub fn with_jobs(doc: &'a Document, dpi: u32, jobs: NonZeroUsize) -> Result<Session<'a>> {
         Ok(Session {
             doc,
-            pages: doc.pages()?,
+            pages: doc.pages_with(jobs)?,
             dpi,
             fonts: FontCache::new(),
         })

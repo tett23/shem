@@ -220,3 +220,61 @@ fn strokes_equal_the_reference() {
         assert_eq!(owned(&out), [before, expected].concat(), "{cmds:?}");
     });
 }
+
+#[test]
+fn interpolation_in_i64_equals_the_one_in_i128() {
+    // docs/adr/0015: the i64 path of `interpolate` gives the quotient of
+    // `div_round` in i128, also at the extremes of the coordinates.
+    let mut rng = Rng(0x0015_0006);
+    let extreme = [i64::from(i32::MIN), i64::from(i32::MAX), 0, 1, -1];
+    (0..200_000).for_each(|k| {
+        let mut v = |span: i64| match k % 7 {
+            0 => extreme[rng.range(0, 5) as usize],
+            _ => rng.range(-span, span),
+        };
+        let span = [256, 1 << 16, 1 << 31][k % 3];
+        let (a0, a1, b0, b1) = (v(span), v(span), v(span), v(span));
+        if a0 == a1 {
+            return;
+        }
+        // `at` is between a0 and a1, as the crossings of a segment are.
+        let (lo, hi) = (a0.min(a1), a0.max(a1));
+        let at = match k % 5 {
+            0 => lo,
+            1 => hi,
+            _ => lo + rng.range(0, hi - lo + 1),
+        };
+        let expected = b0
+            + crate::fixed::div_round(
+                i128::from(b1 - b0) * i128::from(at - a0),
+                i128::from(a1 - a0),
+            ) as i64;
+        assert_eq!(
+            interpolate(a0, a1, b0, b1, at),
+            expected,
+            "{a0} {a1} {b0} {b1} {at}"
+        );
+    });
+}
+
+#[test]
+fn filling_a_canvas_paints_the_coverage() {
+    // docs/adr/0015: compositing as the pixels are swept gives the image of
+    // painting the coverage, for small and large paths, over paths before.
+    let mut rng = Rng(0x0015_0008);
+    [(40, 30, -2560, 12800), (600, 500, -25600, 179200)]
+        .iter()
+        .for_each(|&(w, h, lo, hi)| {
+            let mut scratch = Scratch::default();
+            let mut filled = Canvas::new(w, h);
+            let mut painted = Canvas::new(w, h);
+            (0..40).for_each(|k| {
+                let path = build(&random_cmds(&mut rng, true, lo, hi));
+                let rule = [FillRule::NonZero, FillRule::EvenOdd][k % 2];
+                let rgb = [rng.range(0, 256) as u8, rng.range(0, 256) as u8, k as u8];
+                filled.fill(&path, rule, rgb, &mut scratch);
+                painted.paint(&coverage(&path, rule, w, h), rgb);
+                assert!(filled == painted, "{k}");
+            });
+        });
+}

@@ -209,7 +209,7 @@ fn render(r: &Render) -> std::result::Result<(), Error> {
     let doc = Document::parse(&data)?;
     // The fonts are read once for the check and the rendering of every page
     // (docs/adr/0011), and the pages go to threads (docs/adr/0009, docs/adr/0012).
-    let session = Session::new(&doc, r.dpi)?;
+    let session = Session::with_jobs(&doc, r.dpi, r.jobs)?;
     let count = session.page_count();
     let selected: Vec<usize> = match &r.pages {
         None => (1..=count).collect(),

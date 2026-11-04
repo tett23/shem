@@ -128,14 +128,19 @@ impl Metrics {
     }
 }
 
+/// An outline in the cache, and its [`extent`].
+type OutlineAndExtent = (Arc<[Segment]>, (u64, u64));
+
 /// A Type 0 font with one CIDFont, as Golem embeds it.
 pub struct Font {
     program: Program,
     /// The outline of each glyph ID, interpreted at its first use (docs/adr/0011).
-    outlines: Vec<OnceLock<Result<Arc<[Segment]>>>>,
+    /// With the largest absolute values of its coordinates (docs/adr/0015).
+    outlines: Vec<OnceLock<Result<OutlineAndExtent>>>,
     /// How many outlines were interpreted, for the tests of the cache.
     interpretations: AtomicUsize,
     vertical: bool,
+    glyph_matrix: Result<Matrix>,
     widths: Metrics,
     default_width: Fixed,
     vertical_metrics: Metrics,
@@ -220,6 +225,7 @@ impl Font {
             Program::TrueType(t) => t.glyph_count(),
         };
         Ok(Font {
+            glyph_matrix: Font::compute_glyph_matrix(&program),
             program,
             outlines: (0..glyphs).map(|_| OnceLock::new()).collect(),
             interpretations: AtomicUsize::new(0),
@@ -238,7 +244,13 @@ impl Font {
     /// The matrix from glyph space to text space: the FontMatrix of a CFF
     /// (always 1/1000 in v0.1), 1/unitsPerEm for TrueType.
     pub fn glyph_matrix(&self) -> Result<Matrix> {
-        let s = match &self.program {
+        self.glyph_matrix.clone()
+    }
+
+    /// [`Font::glyph_matrix`], computed once when the font is read
+    /// (docs/adr/0015).
+    fn compute_glyph_matrix(program: &Program) -> Result<Matrix> {
+        let s = match program {
             Program::Cff(_) => Fixed::parse(b"0.001")?,
             Program::TrueType(t) => {
                 Fixed::ONE.checked_div(Fixed::from_int(i64::from(t.units_per_em()))?)?
@@ -272,12 +284,22 @@ impl Font {
     /// the buffer of a thread is reused by the glyphs, and the outline is
     /// copied once into the cache (docs/adr/0014).
     pub fn outline_with(&self, cid: u16, buffer: &mut Vec<Segment>) -> Result<Arc<[Segment]>> {
+        self.outline_and_extent(cid, buffer).map(|(o, _)| o)
+    }
+
+    /// [`Font::outline_with`] and the largest absolute values of the x and
+    /// y coordinates of the outline, as raw Q32.32 values ([`extent`]).
+    pub fn outline_and_extent(
+        &self,
+        cid: u16,
+        buffer: &mut Vec<Segment>,
+    ) -> Result<OutlineAndExtent> {
         let gid = self.gid(cid)?;
         match self.outlines.get(usize::from(gid)) {
             Some(cell) => cell
                 .get_or_init(|| {
                     self.interpret_outline_into(cid, buffer)
-                        .map(|()| Arc::from(buffer.as_slice()))
+                        .map(|()| (Arc::from(buffer.as_slice()), extent(buffer)))
                 })
                 .clone(),
             None => Err(Error::new(format!("glyph {gid} is not in the font"))),
@@ -327,6 +349,24 @@ impl Font {
             }
         }
     }
+}
+
+/// The largest absolute values of the x and of the y coordinates of the
+/// points of an outline, as raw Q32.32 values.
+pub fn extent(segments: &[Segment]) -> (u64, u64) {
+    let wider = |(x, y): (u64, u64), px: Fixed, py: Fixed| {
+        (
+            x.max(px.raw().unsigned_abs()),
+            y.max(py.raw().unsigned_abs()),
+        )
+    };
+    segments.iter().fold((0, 0), |acc, s| match *s {
+        Segment::Move(x, y) | Segment::Line(x, y) => wider(acc, x, y),
+        Segment::Curve([x1, y1, x2, y2, x3, y3]) => {
+            wider(wider(wider(acc, x1, y1), x2, y2), x3, y3)
+        }
+        Segment::Close => acc,
+    })
 }
 
 /// The font of one object, read at its first use; an error is kept too.

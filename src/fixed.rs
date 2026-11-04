@@ -297,6 +297,14 @@ impl Matrix {
     /// `self × o`: the transformation that applies `self` first, then `o`.
     /// Each element is a sum of products computed exactly and rounded once.
     pub fn concat(&self, o: &Matrix) -> Result<Matrix> {
+        // The products by the identity are exact, so they are the other
+        // matrix (docs/adr/0015).
+        if *o == Matrix::IDENTITY {
+            return Ok(*self);
+        }
+        if *self == Matrix::IDENTITY {
+            return Ok(*o);
+        }
         Ok(Matrix {
             a: narrow(wide(self.a, o.a) + wide(self.b, o.c))?,
             b: narrow(wide(self.a, o.b) + wide(self.b, o.d))?,
