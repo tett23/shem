@@ -12,8 +12,29 @@ const MAX_BITS: usize = 15;
 pub fn adler32(data: &[u8]) -> u32 {
     const MOD: u32 = 65521;
     // 5552 is the largest n for which the sums cannot overflow u32 (zlib's NMAX).
+    // The bytes of a chunk are taken 16 at a time, into 16 lanes: lane l
+    // sums its bytes (A_l) and, after each block, A_l again (B_l). Over n
+    // bytes, a grows by Σ A_l and b by n a + Σ (16 B_l − l A_l), the sums of
+    // the bytes one by one (docs/adr/0015). The rest goes byte by byte.
     let (a, b) = data.chunks(5552).fold((1u32, 0u32), |(a, b), chunk| {
-        let (a, b) = chunk.iter().fold((a, b), |(a, b), &c| {
+        let blocks = chunk.chunks_exact(16);
+        let rest = blocks.remainder();
+        let n = (chunk.len() - rest.len()) as u64;
+        let (lanes_a, lanes_b) = blocks.fold(([0u32; 16], [0u32; 16]), |(mut la, mut lb), block| {
+            (0..16).for_each(|l| {
+                la[l] += u32::from(block[l]);
+                lb[l] += la[l];
+            });
+            (la, lb)
+        });
+        let sum_a: u64 = lanes_a.iter().map(|&v| u64::from(v)).sum();
+        let sum_b: u64 = (0..16)
+            .map(|l| 16 * u64::from(lanes_b[l]) - l as u64 * u64::from(lanes_a[l]))
+            .sum();
+        let a64 = u64::from(a) + sum_a;
+        let b64 = u64::from(b) + n * u64::from(a) + sum_b;
+        let (a, b) = ((a64 % u64::from(MOD)) as u32, (b64 % u64::from(MOD)) as u32);
+        let (a, b) = rest.iter().fold((a, b), |(a, b), &c| {
             let a = a + u32::from(c);
             (a, b + a)
         });
