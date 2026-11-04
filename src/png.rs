@@ -301,6 +301,18 @@ fn run_group(
     if c == 0 || data[c - 1] != b || data[c + 1] != b || data[c + 2] != b {
         return None;
     }
+    let r = match *run_at_i {
+        Some((v, r)) if v == b => r,
+        _ => {
+            let r = run_length(&data[i..i + max], b);
+            *run_at_i = Some((b, r));
+            r
+        }
+    };
+    // The candidate just before a run of at least `max` matches it to `max`.
+    if r == max && c + 1 == i {
+        return Some(Group::Done(max, 1));
+    }
     // The lowest candidate the tries and the window allow.
     let low = c
         .saturating_sub(MAX_CHAIN - tries - 1)
@@ -310,15 +322,8 @@ fn run_group(
     if count < 2 {
         return None;
     }
-    let a0 = run_length(&data[c..c + max], b);
-    let r = match *run_at_i {
-        Some((v, r)) if v == b => r,
-        _ => {
-            let r = run_length(&data[i..i + max], b);
-            *run_at_i = Some((b, r));
-            r
-        }
-    };
+    // The run from c matters up to max, and when r < max, up to r + 1.
+    let a0 = run_length(&data[c..c + max.min(r + 1)], b);
     let at = |k: usize| (a0 + k, i - (c - k));
     let better = |len: usize, dist: usize| (len > best_len).then_some((len, dist));
     if r == max {

@@ -20,13 +20,14 @@ pub fn adler32(data: &[u8]) -> u32 {
         let blocks = chunk.chunks_exact(16);
         let rest = blocks.remainder();
         let n = (chunk.len() - rest.len()) as u64;
-        let (lanes_a, lanes_b) = blocks.fold(([0u32; 16], [0u32; 16]), |(mut la, mut lb), block| {
-            (0..16).for_each(|l| {
-                la[l] += u32::from(block[l]);
-                lb[l] += la[l];
+        let (lanes_a, lanes_b) =
+            blocks.fold(([0u32; 16], [0u32; 16]), |(mut la, mut lb), block| {
+                (0..16).for_each(|l| {
+                    la[l] += u32::from(block[l]);
+                    lb[l] += la[l];
+                });
+                (la, lb)
             });
-            (la, lb)
-        });
         let sum_a: u64 = lanes_a.iter().map(|&v| u64::from(v)).sum();
         let sum_b: u64 = (0..16)
             .map(|l| 16 * u64::from(lanes_b[l]) - l as u64 * u64::from(lanes_a[l]))
