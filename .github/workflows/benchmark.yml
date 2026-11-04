@@ -56,6 +56,7 @@ jobs:
             echo "## Benchmark"
             echo
             echo "- CPU: $(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -n 1), $(nproc) processors"
+            echo "- Topology: $(lscpu | sed -n 's/^\(Thread(s) per core\|Core(s) per socket\|Socket(s)\):[[:space:]]*/\1 /p' | paste -sd ',' -)"
             echo "- PDF: tests/fixtures/golem/kanikosen.pdf, $(sha256sum tests/fixtures/golem/kanikosen.pdf | cut -d ' ' -f 1)"
             echo "- Images: $DPI dpi, $FORMAT"
             for ref in $REFS; do
