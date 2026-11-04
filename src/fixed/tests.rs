@@ -304,3 +304,33 @@ fn products_by_the_identity_are_the_other_matrix() {
         assert_eq!(Ok(m), product(&m, &Matrix::IDENTITY));
     });
 }
+
+#[test]
+fn divisions_by_integers_are_the_divisions_in_i128() {
+    // docs/adr/0015: by a positive integer, checked_div divides in i64.
+    let mut state = 0x0015_000cu64;
+    let extremes = [i64::MIN, i64::MAX, 0, 1, -1, i64::MIN + 1];
+    (0..50000).for_each(|k| {
+        let a = if k % 9 == 0 {
+            extremes[k % 6]
+        } else {
+            (next(&mut state) as i64) >> (k % 50)
+        };
+        let int = [1i64, 2, 3, 72, 100, 1000, 7, i64::from(i32::MAX)][k % 8];
+        let b = int << 32;
+        let reference = Fixed::from_wide(div_round(i128::from(a) << 32, i128::from(b)));
+        assert_eq!(Fixed(a).checked_div(Fixed(b)), reference, "{a} / {int}");
+    });
+}
+
+#[test]
+fn short_fractions_in_u64_equal_the_doubling() {
+    let mut state = 0x0015_000du64;
+    (0..20000).for_each(|_| {
+        let len = 1 + (next(&mut state) % 9) as usize;
+        let digits: Vec<u8> = (0..len)
+            .map(|_| b'0' + (next(&mut state) % 10) as u8)
+            .collect();
+        assert_eq!(fraction_units(&digits), fraction_units_by_doubling(&digits));
+    });
+}

@@ -215,32 +215,23 @@ fn crossings(a: i64, b: i64) -> impl Iterator<Item = i64> {
 /// The product fits in i64 for most segments, whose division is faster
 /// and gives the same quotient (docs/adr/0015).
 fn interpolate(a0: i64, a1: i64, b0: i64, b1: i64, at: i64) -> i64 {
-    match (b1 - b0).checked_mul(at - a0) {
-        Some(n) => b0 + div_round_i64(n, a1 - a0),
+    // With a negative divisor, both are negated; a product that does not
+    // fit, or whose negation does not, goes through i128.
+    let d = a1 - a0;
+    let n = (b1 - b0).checked_mul(at - a0);
+    let (n, d) = if d < 0 {
+        (n.and_then(i64::checked_neg), -d)
+    } else {
+        (n, d)
+    };
+    match n {
+        Some(n) => b0 + crate::fixed::div_round_i64(n, d),
         None => {
             b0 + div_round(
                 i128::from(b1 - b0) * i128::from(at - a0),
                 i128::from(a1 - a0),
             ) as i64
         }
-    }
-}
-
-/// [`div_round`] in i64: `n / d` rounded to the nearest, ties to even. The
-/// divisor is not i64::MIN, so its absolute value is an i64.
-fn div_round_i64(n: i64, d: i64) -> i64 {
-    let (n, d) = if d < 0 {
-        (n.wrapping_neg(), -d)
-    } else {
-        (n, d)
-    };
-    let q = n.div_euclid(d);
-    let r = n.rem_euclid(d);
-    // 2 r is compared as r against d − r, which does not overflow.
-    match r.cmp(&(d - r)) {
-        std::cmp::Ordering::Greater => q + 1,
-        std::cmp::Ordering::Equal if q & 1 == 1 => q + 1,
-        _ => q,
     }
 }
 
