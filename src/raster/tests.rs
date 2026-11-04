@@ -325,3 +325,9 @@ fn coverage_is_as_before() {
         }
     });
 }
+
+#[test]
+fn an_opaque_pixel_is_its_color() {
+    // docs/adr/0015: paint_pixel writes the color for an opacity of 255.
+    (0..=255u8).for_each(|c| (0..=255u8).for_each(|p| assert_eq!(composite(c, 255, p), c)));
+}

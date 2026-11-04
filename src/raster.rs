@@ -638,6 +638,11 @@ impl Canvas {
     pub fn paint_pixel(&mut self, x: usize, y: usize, a: u8, rgb: [u8; 3]) {
         let i = (y * self.width + x) * 3;
         let p = &mut self.pixels[i..i + 3];
+        // An opaque pixel is the color: (c · 255 + 127) / 255 = c.
+        if a == 255 {
+            p.copy_from_slice(&rgb);
+            return;
+        }
         p[0] = composite(rgb[0], a, p[0]);
         p[1] = composite(rgb[1], a, p[1]);
         p[2] = composite(rgb[2], a, p[2]);
