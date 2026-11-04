@@ -85,3 +85,21 @@ fn streams_and_their_corruptions_inflate_as_before() {
         });
     });
 }
+
+#[test]
+fn adler32_is_the_reference() {
+    let mut rng = Rng(0x0015_000b);
+    (0..300).for_each(|k| {
+        let len = rng.below(if k % 10 == 0 { 40_000 } else { 100 }) as usize;
+        let data: Vec<u8> = (0..len)
+            .map(|_| {
+                if k % 3 == 0 {
+                    255
+                } else {
+                    rng.below(256) as u8
+                }
+            })
+            .collect();
+        assert_eq!(adler32(&data), old::adler32(&data), "{len}");
+    });
+}

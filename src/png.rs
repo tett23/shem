@@ -454,17 +454,36 @@ fn deflate_with(data: &[u8], match_len: impl Fn(&[u8], usize, usize, usize) -> u
         }
         if best_len >= MIN_MATCH {
             length_and_distance(&mut w, best_len, best_dist);
-            // The hash of the next position is the last one shifted by 5 bits
-            // with the new byte: the mask drops the byte that leaves.
+            // In a run of one byte b, the positions that start `b b b` share
+            // their hash, and each is chained to the one before it; the run
+            // is found 8 bytes at a time (docs/adr/0015). Elsewhere, the hash
+            // of the next position is the last one shifted by 5 bits with the
+            // new byte: the mask drops the byte that leaves.
             let end = (i + best_len).min(last);
-            let mut h = if i < end { hash(data, i) } else { 0 };
-            (i..end).for_each(|k| {
+            let mask = (1 << HASH_BITS) - 1;
+            let mut k = i;
+            let mut h = if k < end { hash(data, k) } else { 0 };
+            while k < end {
+                let b = data[k];
+                let g = if data[k + 1] == b && data[k + 2] == b {
+                    // Positions k.. whose three bytes are in the run.
+                    let run = run_length(&data[k..end + 2], b);
+                    k + run - 2
+                } else {
+                    k + 1
+                };
                 prev[k % WINDOW] = head[h];
-                head[h] = k as u32;
-                if k + 1 < end {
-                    h = ((h << 5) ^ usize::from(data[k + 3])) & ((1 << HASH_BITS) - 1);
+                (k + 1..g).for_each(|j| prev[j % WINDOW] = (j - 1) as u32);
+                head[h] = (g - 1) as u32;
+                if g < end {
+                    h = if g == k + 1 {
+                        ((h << 5) ^ usize::from(data[g + 2])) & mask
+                    } else {
+                        hash(data, g)
+                    };
                 }
-            });
+                k = g;
+            }
             i += best_len;
         } else {
             literal(&mut w, u32::from(data[i]));
