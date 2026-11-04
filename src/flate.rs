@@ -17,17 +17,18 @@ pub fn adler32(data: &[u8]) -> u32 {
     // bytes, a grows by Σ A_l and b by n a + Σ (16 B_l − l A_l), the sums of
     // the bytes one by one (docs/adr/0015). The rest goes byte by byte.
     let (a, b) = data.chunks(5552).fold((1u32, 0u32), |(a, b), chunk| {
-        let blocks = chunk.chunks_exact(16);
-        let rest = blocks.remainder();
+        let (blocks, rest) = chunk.as_chunks::<16>();
         let n = (chunk.len() - rest.len()) as u64;
         let (lanes_a, lanes_b) =
-            blocks.fold(([0u32; 16], [0u32; 16]), |(mut la, mut lb), block| {
-                (0..16).for_each(|l| {
-                    la[l] += u32::from(block[l]);
-                    lb[l] += la[l];
+            blocks
+                .iter()
+                .fold(([0u32; 16], [0u32; 16]), |(mut la, mut lb), block| {
+                    (0..16).for_each(|l| {
+                        la[l] += u32::from(block[l]);
+                        lb[l] += la[l];
+                    });
+                    (la, lb)
                 });
-                (la, lb)
-            });
         let sum_a: u64 = lanes_a.iter().map(|&v| u64::from(v)).sum();
         let sum_b: u64 = (0..16)
             .map(|l| 16 * u64::from(lanes_b[l]) - l as u64 * u64::from(lanes_a[l]))

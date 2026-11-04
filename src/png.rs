@@ -50,9 +50,8 @@ const CRC_TABLES: [[u32; 256]; 8] = {
 /// The CRC-32 register after `data`, from the register `c`: 8 bytes at a
 /// time, the same register as byte by byte (docs/adr/0015).
 fn crc32_update(c: u32, data: &[u8]) -> u32 {
-    let words = data.chunks_exact(8);
-    let rest = words.remainder();
-    let c = words.fold(c, |c, w| {
+    let (words, rest) = data.as_chunks::<8>();
+    let c = words.iter().fold(c, |c, w| {
         let lo = c ^ u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
         let hi = u32::from_le_bytes([w[4], w[5], w[6], w[7]]);
         let t = &CRC_TABLES;
