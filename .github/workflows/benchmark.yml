@@ -10,6 +10,14 @@ on:
         description: The commits to build and compare, separated by spaces (HEAD is the commit of the run)
         required: true
         default: v0.1.0-rc2 HEAD
+      dpi:
+        description: The resolution of the images
+        required: true
+        default: "72"
+      format:
+        description: The format of the images, png or ppm
+        required: true
+        default: ppm
 
 permissions:
   contents: read
@@ -41,12 +49,15 @@ jobs:
       - name: Measure
         env:
           REFS: ${{ inputs.refs }}
+          DPI: ${{ inputs.dpi }}
+          FORMAT: ${{ inputs.format }}
         run: |
           {
             echo "## Benchmark"
             echo
             echo "- CPU: $(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -n 1), $(nproc) processors"
             echo "- PDF: tests/fixtures/golem/kanikosen.pdf, $(sha256sum tests/fixtures/golem/kanikosen.pdf | cut -d ' ' -f 1)"
+            echo "- Images: $DPI dpi, $FORMAT"
             for ref in $REFS; do
               echo "- $ref: $(git rev-parse --verify "$ref^{commit}")"
             done
