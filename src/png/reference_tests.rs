@@ -138,3 +138,35 @@ fn crc32_is_the_reference() {
         assert_eq!(crc32(&data), old::crc32(&data));
     });
 }
+
+#[test]
+fn streams_of_runs_are_the_bytes_of_the_reference() {
+    // docs/adr/0015: the candidates of a run are taken at once. Rows of
+    // runs with sparse bytes, as filtered pages are, at all lengths of runs
+    // around the limits of a match (3, 258) and of the tries (128).
+    let mut rng = Rng(0x0015_000a);
+    (0..200u64).for_each(|k| {
+        let width = 1 + rng.below(400) as usize;
+        let rows = 1 + rng.below(if k % 10 == 0 { 300 } else { 40 }) as usize;
+        let alphabet = [1u64, 2, 3, 255][(k % 4) as usize];
+        let mut data = Vec::with_capacity(width * rows);
+        let mut row: Vec<u8> = vec![0; width];
+        (0..rows).for_each(|_| {
+            // A row is often the one before, changed in a few places.
+            if rng.below(3) == 0 {
+                row.iter_mut().for_each(|b| *b = 0);
+            }
+            (0..rng.below(6)).for_each(|_| {
+                let at = rng.below(width as u64) as usize;
+                let len = [1, 2, 3, 4, 127, 128, 129, 257, 258, 259][rng.below(10) as usize];
+                let v = rng.below(alphabet + 1) as u8;
+                row[at..(at + len).min(width)]
+                    .iter_mut()
+                    .for_each(|b| *b = v);
+            });
+            data.push(rng.below(5) as u8);
+            data.extend_from_slice(&row);
+        });
+        assert_eq!(zlib(&data), old::zlib(&data), "{k}: {} bytes", data.len());
+    });
+}

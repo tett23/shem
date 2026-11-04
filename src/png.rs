@@ -231,6 +231,138 @@ fn match_length(data: &[u8], candidate: usize, i: usize, max: usize) -> usize {
         .count()
 }
 
+/// What a run of candidates gives: the match that ends the search, or the
+/// best match among them if it is longer than the one before, the last
+/// candidate of the run, and how many candidates it has.
+enum Group {
+    Done(usize, usize),
+    Next {
+        best: Option<(usize, usize)>,
+        last: usize,
+        count: usize,
+    },
+}
+
+/// The candidates `c`, `c − 1`, … that lie in one run of the byte `b =
+/// data[c]`, taken at once, if there are at least two of them, as many as
+/// the tries left and the window allow.
+///
+/// Each position of the run starts the three bytes `b b b`, so it was
+/// chained to the one before it. With A the length of the run from a
+/// candidate and R the length of the run of `b` at `i`, the match is A if A
+/// < R, R if A > R, and at least R if A = R, all at most `max`. Along the
+/// candidates, A grows by one, so the lengths grow while A < R, peak at A =
+/// R, and stay at R after it. A candidate wins only with a longer match, so
+/// the best of the run is the first with its longest length.
+fn run_group(
+    data: &[u8],
+    i: usize,
+    c: usize,
+    max: usize,
+    tries: usize,
+    best_len: usize,
+    run_at_i: &mut Option<(u8, usize)>,
+) -> Option<Group> {
+    let b = data[c];
+    if c == 0 || data[c - 1] != b || data[c + 1] != b || data[c + 2] != b {
+        return None;
+    }
+    // The lowest candidate the tries and the window allow.
+    let low = c
+        .saturating_sub(MAX_CHAIN - tries - 1)
+        .max(i.saturating_sub(WINDOW));
+    let last = c - run_back(data, low, c, b);
+    let count = c - last + 1;
+    if count < 2 {
+        return None;
+    }
+    let a0 = run_length(&data[c..c + max], b);
+    let r = match *run_at_i {
+        Some((v, r)) if v == b => r,
+        _ => {
+            let r = run_length(&data[i..i + max], b);
+            *run_at_i = Some((b, r));
+            r
+        }
+    };
+    let at = |k: usize| (a0 + k, i - (c - k));
+    let better = |len: usize, dist: usize| (len > best_len).then_some((len, dist));
+    if r == max {
+        // The run at i is at least `max`: the lengths are min(A, max).
+        if a0 + count > max {
+            let k = max.saturating_sub(a0);
+            return Some(Group::Done(max, i - (c - k)));
+        }
+        let (len, dist) = at(count - 1);
+        return Some(Group::Next {
+            best: better(len, dist),
+            last,
+            count,
+        });
+    }
+    // r < max.
+    let best = if a0 > r {
+        better(r, i - c)
+    } else if a0 + count - 1 < r {
+        let (len, dist) = at(count - 1);
+        better(len, dist)
+    } else {
+        let k = r - a0;
+        let before = if k > 0 {
+            better(r - 1, i - (c - (k - 1)))
+        } else {
+            None
+        };
+        let peak = c - k;
+        let len = match_length(data, peak, i, max);
+        let floor = before.map_or(best_len, |(l, _)| l);
+        let best = if len > floor {
+            Some((len, i - peak))
+        } else {
+            before
+        };
+        if len == max {
+            return Some(Group::Done(max, i - peak));
+        }
+        best
+    };
+    Some(Group::Next { best, last, count })
+}
+
+/// The number of bytes at the start of `s` that are `b`, 8 at a time.
+fn run_length(s: &[u8], b: u8) -> usize {
+    let word = u64::from_ne_bytes([b; 8]);
+    let mut n = 0;
+    while let Some(w) = s.get(n..n + 8) {
+        let diff = u64::from_le_bytes(w.try_into().unwrap_or([0; 8])) ^ word;
+        if diff != 0 {
+            return n + (diff.trailing_zeros() / 8) as usize;
+        }
+        n += 8;
+    }
+    n + s[n..].iter().take_while(|&&v| v == b).count()
+}
+
+/// The number of bytes before `end`, down to `low`, that are `b`, 8 at a
+/// time.
+fn run_back(data: &[u8], low: usize, end: usize, b: u8) -> usize {
+    let word = u64::from_ne_bytes([b; 8]);
+    let mut n = 0;
+    while end - n >= low + 8 {
+        let at = end - n - 8;
+        let diff = u64::from_le_bytes(data[at..at + 8].try_into().unwrap_or([0; 8])) ^ word;
+        if diff != 0 {
+            return n + (diff.leading_zeros() / 8) as usize;
+        }
+        n += 8;
+    }
+    n + data[low..end - n]
+        .iter()
+        .rev()
+        .take_while(|&&v| v == b)
+        .count()
+}
+
 /// Raw Deflate: one block with the fixed Huffman code, greedy LZ77 over a
 /// window of 32 KiB with hash chains of at most 128 candidates. The
 /// longest match wins; among equal lengths, the nearest.
@@ -265,8 +397,37 @@ fn deflate_with(data: &[u8], match_len: impl Fn(&[u8], usize, usize, usize) -> u
             let max = MAX_MATCH.min(data.len() - i);
             let mut candidate = head[hash(data, i)];
             let mut tries = 0;
+            let mut run_at_i = None;
             while candidate != NONE && i - candidate as usize <= WINDOW && tries < MAX_CHAIN {
                 let c = candidate as usize;
+                // The candidates in a run of one byte come in the chain one
+                // after another, and their lengths follow from the lengths
+                // of the runs, so a run is taken at once (docs/adr/0015).
+                if let Some(group) = run_group(data, i, c, max, tries, best_len, &mut run_at_i) {
+                    match group {
+                        Group::Done(len, dist) => {
+                            best_len = len;
+                            best_dist = dist;
+                            break;
+                        }
+                        Group::Next { best, last, count } => {
+                            if let Some((len, dist)) = best {
+                                best_len = len;
+                                best_dist = dist;
+                            }
+                            tries += count;
+                            if tries >= MAX_CHAIN {
+                                break;
+                            }
+                            let next = prev[last % WINDOW];
+                            if next == NONE || next as usize >= last {
+                                break;
+                            }
+                            candidate = next;
+                            continue;
+                        }
+                    }
+                }
                 // A candidate whose byte at the end of the best match differs
                 // cannot be longer, so its length is not counted
                 // (docs/adr/0015); it still counts as a try.
@@ -283,30 +444,6 @@ fn deflate_with(data: &[u8], match_len: impl Fn(&[u8], usize, usize, usize) -> u
                     }
                 }
                 tries += 1;
-                // In a run of one byte b, the candidate i − 1 matches to the
-                // end of the run (len), and the candidates of the run before
-                // it, i − 2 down to its start, come next in the chain: each
-                // was chained to the one before it. Their bytes at len are
-                // b, and the byte at i + len is not, since the match would
-                // go on, so none is longer: they are counted as tries
-                // without reading them (docs/adr/0015).
-                let mut c = c;
-                if c + 1 == i && best_len < max && best_len >= MIN_MATCH {
-                    let b = data[i];
-                    if data[c] == b && data[i + 1] == b && data[i + 2] == b {
-                        let room = MAX_CHAIN - tries;
-                        let start = (c.saturating_sub(room)..c)
-                            .rev()
-                            .take_while(|&j| data[j] == b)
-                            .last()
-                            .unwrap_or(c);
-                        tries += c - start;
-                        c = start;
-                        if tries >= MAX_CHAIN {
-                            break;
-                        }
-                    }
-                }
                 let next = prev[c % WINDOW];
                 // An entry older than the window was overwritten; stop there.
                 if next == NONE || next >= candidate {
