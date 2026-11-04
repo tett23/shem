@@ -14,7 +14,7 @@ const BOX_FILL: [u8; 3] = [192, 192, 192];
 const BOX_LINE: [u8; 3] = [96, 96, 96];
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The largest number of pixels of a page (docs/adr/0007).
 const MAX_PIXELS: u128 = 1 << 28;
@@ -545,21 +545,27 @@ fn interpret(
 ) -> Result<()> {
     let at_page = |e: Error| e.at_page(page.index + 1);
     let mut ops: Vec<Op> = recycle(std::mem::take(&mut ws.ops));
-    let result = interpret_ops(doc, page, dpi, paint, cache, ws, &mut ops).map_err(at_page);
+    let result = interpret_ops((doc, dpi, cache), page, paint, ws, &mut ops, true).map_err(at_page);
     ws.ops = recycle(ops);
     result
 }
 
+/// What every page of a rendering shares: the document, the resolution and
+/// the cache of the fonts.
+type Context<'d> = (&'d Document, u32, &'d FontCache);
+
 fn interpret_ops<'c>(
-    doc: &Document,
+    (doc, dpi, cache): Context,
     page: &'c Page,
-    dpi: u32,
     paint: bool,
-    cache: &FontCache,
     ws: &mut Workspace,
     ops: &mut Vec<Op<'c>>,
+    parse: bool,
 ) -> Result<()> {
-    content::parse_into(&page.contents, ops)?;
+    // Operators parsed by the check of the page are given as they are.
+    if parse {
+        content::parse_into(&page.contents, ops)?;
+    }
     content::check_resources(doc, &page.resources, ops)?;
     let (width, height) = page_size(&page.media_box, dpi)?;
     let mut canvas = std::mem::take(&mut ws.canvas);
@@ -618,9 +624,28 @@ fn interpret_ops<'c>(
 /// [`Page::index`].
 pub struct Session<'a> {
     doc: &'a Document,
-    pages: Vec<Page>,
+    pages: Pages<'a>,
     dpi: u32,
     fonts: FontCache,
+    /// The operators of each page that the check parsed, until the page is
+    /// rendered; only for pages borrowed by [`Session::from_pages`], whose
+    /// contents outlive the session (docs/adr/0015).
+    parsed: Vec<Mutex<Option<Vec<Op<'a>>>>>,
+}
+
+/// The pages of a session: its own, or borrowed.
+enum Pages<'a> {
+    Owned(Vec<Page>),
+    Borrowed(&'a [Page]),
+}
+
+impl Pages<'_> {
+    fn as_slice(&self) -> &[Page] {
+        match self {
+            Pages::Owned(v) => v,
+            Pages::Borrowed(s) => s,
+        }
+    }
 }
 
 /// An error of [`Session::render_pages`].
@@ -642,34 +667,55 @@ impl<'a> Session<'a> {
     pub fn with_jobs(doc: &'a Document, dpi: u32, jobs: NonZeroUsize) -> Result<Session<'a>> {
         Ok(Session {
             doc,
-            pages: doc.pages_with(jobs)?,
+            pages: Pages::Owned(doc.pages_with(jobs)?),
             dpi,
             fonts: FontCache::new(),
+            parsed: Vec::new(),
         })
+    }
+
+    /// A session of pages read before ([`Document::pages_with`]), which it
+    /// borrows. The check of a page keeps the operators it parsed, and the
+    /// rendering of the page uses them instead of parsing the content again
+    /// (docs/adr/0015). The results are those of [`Session::new`].
+    pub fn from_pages(doc: &'a Document, pages: &'a [Page], dpi: u32) -> Session<'a> {
+        Session {
+            doc,
+            pages: Pages::Borrowed(pages),
+            dpi,
+            fonts: FontCache::new(),
+            parsed: pages.iter().map(|_| Mutex::new(None)).collect(),
+        }
     }
 
     /// A session of one page, which is its page 0.
     fn single(doc: &'a Document, page: &Page, dpi: u32) -> Session<'a> {
         Session {
             doc,
-            pages: vec![page.clone()],
+            pages: Pages::Owned(vec![page.clone()]),
             dpi,
             fonts: FontCache::new(),
+            parsed: Vec::new(),
         }
     }
 
     pub fn page_count(&self) -> usize {
-        self.pages.len()
+        self.pages.as_slice().len()
+    }
+
+    fn no_page(&self, page: usize) -> Error {
+        Error::new(format!(
+            "page {} does not exist: the document has {} pages",
+            page + 1,
+            self.pages.as_slice().len()
+        ))
     }
 
     fn page(&self, page: usize) -> Result<&Page> {
-        self.pages.get(page).ok_or_else(|| {
-            Error::new(format!(
-                "page {} does not exist: the document has {} pages",
-                page + 1,
-                self.pages.len()
-            ))
-        })
+        self.pages
+            .as_slice()
+            .get(page)
+            .ok_or_else(|| self.no_page(page))
     }
 
     /// Checks one page, as [`check_page`].
@@ -684,12 +730,49 @@ impl<'a> Session<'a> {
 
     /// Checks one page in the buffers of `ws`.
     pub fn check_with(&self, ws: &mut Workspace, page: usize) -> Result<()> {
-        interpret(self.doc, self.page(page)?, self.dpi, false, &self.fonts, ws)
+        let Pages::Borrowed(pages) = self.pages else {
+            return interpret(self.doc, self.page(page)?, self.dpi, false, &self.fonts, ws);
+        };
+        let p: &'a Page = pages.get(page).ok_or_else(|| self.no_page(page))?;
+        let mut ops = Vec::new();
+        interpret_ops(
+            (self.doc, self.dpi, &self.fonts),
+            p,
+            false,
+            ws,
+            &mut ops,
+            true,
+        )
+        .map_err(|e| e.at_page(p.index + 1))?;
+        let mut slot = self.parsed[page].lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(ops);
+        }
+        Ok(())
     }
 
     /// Renders one page in the buffers of `ws`; the image stays in `ws`
     /// until the next page.
     pub fn render_with<'w>(&self, ws: &'w mut Workspace, page: usize) -> Result<&'w Canvas> {
+        if let Pages::Borrowed(pages) = self.pages {
+            let p: &'a Page = pages.get(page).ok_or_else(|| self.no_page(page))?;
+            let taken = self.parsed[page]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(mut ops) = taken {
+                interpret_ops(
+                    (self.doc, self.dpi, &self.fonts),
+                    p,
+                    true,
+                    ws,
+                    &mut ops,
+                    false,
+                )
+                .map_err(|e| e.at_page(p.index + 1))?;
+                return Ok(&ws.canvas);
+            }
+        }
         interpret(self.doc, self.page(page)?, self.dpi, true, &self.fonts, ws)?;
         Ok(&ws.canvas)
     }
