@@ -124,3 +124,39 @@ fn a_session_is_shared_by_threads() {
     assert_sync::<Session<'static>>();
     assert_send::<Canvas>();
 }
+
+#[test]
+fn a_workspace_reused_by_pages_gives_the_images_of_render() {
+    // docs/adr/0014: the buffers of a page do not change the next one, in
+    // any order of pages and of sizes, after the check and after an error.
+    ["sample", "figures", "truetype"].iter().for_each(|name| {
+        let data = fixture(name);
+        let doc = Document::parse(&data).unwrap();
+        let session = Session::new(&doc, 36).unwrap();
+        let n = session.page_count();
+        let mut ws = super::Workspace::default();
+        let order: Vec<usize> = (0..n).rev().chain(0..n).chain([n - 1, 0]).collect();
+        order.iter().for_each(|&p| {
+            session.check_with(&mut ws, p).unwrap();
+            assert_eq!(
+                session.render_with(&mut ws, p).unwrap(),
+                &session.render(p).unwrap(),
+                "{name} page {p}"
+            );
+            assert!(session.render_with(&mut ws, n).is_err());
+        });
+    });
+    // Pages of another size and resolution with the same workspace.
+    let mut ws = super::Workspace::default();
+    [("sample", 36), ("figures", 72), ("sample", 50)]
+        .iter()
+        .for_each(|&(name, dpi)| {
+            let data = fixture(name);
+            let doc = Document::parse(&data).unwrap();
+            let session = Session::new(&doc, dpi).unwrap();
+            assert_eq!(
+                session.render_with(&mut ws, 0).unwrap(),
+                &session.render(0).unwrap()
+            );
+        });
+}
