@@ -55,7 +55,7 @@ const CLASS: [u8; 256] = {
         t[ws[i] as usize] = 1;
         i += 1;
     }
-    let delims = [b'(', b')', b'<', b'>', b'[', b']', b'{', b'}', b'/', b'%'];
+    let delims = b"()<>[]{}/%";
     let mut i = 0;
     while i < delims.len() {
         t[delims[i] as usize] = 2;
