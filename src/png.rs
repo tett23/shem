@@ -29,9 +29,43 @@ const CRC_TABLE: [u32; 256] = {
     table
 };
 
-/// The CRC-32 register after `data`, from the register `c`.
+/// The tables of the CRC-32 for 8 bytes at a time: table k gives the
+/// register of a byte followed by k zero bytes (slicing-by-8).
+const CRC_TABLES: [[u32; 256]; 8] = {
+    let mut t = [[0u32; 256]; 8];
+    t[0] = CRC_TABLE;
+    let mut k = 1;
+    while k < 8 {
+        let mut n = 0;
+        while n < 256 {
+            let c = t[k - 1][n];
+            t[k][n] = (c >> 8) ^ CRC_TABLE[(c & 0xff) as usize];
+            n += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
+/// The CRC-32 register after `data`, from the register `c`: 8 bytes at a
+/// time, the same register as byte by byte (docs/adr/0015).
 fn crc32_update(c: u32, data: &[u8]) -> u32 {
-    data.iter().fold(c, |c, &b| {
+    let words = data.chunks_exact(8);
+    let rest = words.remainder();
+    let c = words.fold(c, |c, w| {
+        let lo = c ^ u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        let hi = u32::from_le_bytes([w[4], w[5], w[6], w[7]]);
+        let t = &CRC_TABLES;
+        t[7][(lo & 0xff) as usize]
+            ^ t[6][((lo >> 8) & 0xff) as usize]
+            ^ t[5][((lo >> 16) & 0xff) as usize]
+            ^ t[4][(lo >> 24) as usize]
+            ^ t[3][(hi & 0xff) as usize]
+            ^ t[2][((hi >> 8) & 0xff) as usize]
+            ^ t[1][((hi >> 16) & 0xff) as usize]
+            ^ t[0][(hi >> 24) as usize]
+    });
+    rest.iter().fold(c, |c, &b| {
         CRC_TABLE[((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8)
     })
 }
