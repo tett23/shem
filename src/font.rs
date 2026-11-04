@@ -31,13 +31,22 @@ enum Program {
 /// Metrics of CIDs: ranges of CIDs and their values (W or W2, ISO 32000-1 9.7.4.3).
 struct Metrics {
     ranges: Vec<(u32, u32, Vec<Fixed>)>,
+    /// Whether the ranges are in increasing order without overlaps, so that
+    /// a CID is searched by bisection (docs/adr/0014).
+    sorted: bool,
 }
 
 impl Metrics {
+    fn new(ranges: Vec<(u32, u32, Vec<Fixed>)>) -> Metrics {
+        let sorted =
+            ranges.iter().all(|(a, b, _)| a <= b) && ranges.windows(2).all(|w| w[0].1 < w[1].0);
+        Metrics { ranges, sorted }
+    }
+
     /// Reads W (`per` = 1) or W2 (`per` = 3).
     fn load(doc: &Document, obj: Option<Object>, per: usize) -> Result<Metrics> {
         let Some(obj) = obj else {
-            return Ok(Metrics { ranges: Vec::new() });
+            return Ok(Metrics::new(Vec::new()));
         };
         let items = match doc.resolve(&obj)? {
             Object::Array(a) => a,
@@ -92,14 +101,30 @@ impl Metrics {
                 }
             }
         }
-        Ok(Metrics { ranges })
+        Ok(Metrics::new(ranges))
     }
 
+    /// The values of the first range that holds `cid`.
     fn get(&self, cid: u32) -> Option<&[Fixed]> {
-        self.ranges
-            .iter()
-            .find(|(a, b, _)| (*a..=*b).contains(&cid))
-            .map(|(_, _, v)| v.as_slice())
+        let range = if self.sorted {
+            self.ranges
+                .binary_search_by(|(a, b, _)| {
+                    if *b < cid {
+                        std::cmp::Ordering::Less
+                    } else if *a > cid {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .ok()
+                .map(|i| &self.ranges[i])
+        } else {
+            self.ranges
+                .iter()
+                .find(|(a, b, _)| (*a..=*b).contains(&cid))
+        };
+        range.map(|(_, _, v)| v.as_slice())
     }
 }
 
@@ -240,10 +265,20 @@ impl Font {
     /// The outline of the glyph of a CID, in glyph units, interpreted once
     /// per glyph and then reused (docs/adr/0011).
     pub fn outline(&self, cid: u16) -> Result<Arc<[Segment]>> {
+        self.outline_with(cid, &mut Vec::new())
+    }
+
+    /// [`Font::outline`], interpreted in `buffer` if it is not in the cache:
+    /// the buffer of a thread is reused by the glyphs, and the outline is
+    /// copied once into the cache (docs/adr/0014).
+    pub fn outline_with(&self, cid: u16, buffer: &mut Vec<Segment>) -> Result<Arc<[Segment]>> {
         let gid = self.gid(cid)?;
         match self.outlines.get(usize::from(gid)) {
             Some(cell) => cell
-                .get_or_init(|| self.interpret_outline(cid).map(Arc::from))
+                .get_or_init(|| {
+                    self.interpret_outline_into(cid, buffer)
+                        .map(|()| Arc::from(buffer.as_slice()))
+                })
                 .clone(),
             None => Err(Error::new(format!("glyph {gid} is not in the font"))),
         }
@@ -251,10 +286,21 @@ impl Font {
 
     /// The outline of the glyph of a CID, interpreted now, without the cache.
     pub fn interpret_outline(&self, cid: u16) -> Result<Vec<Segment>> {
+        let mut out = Vec::new();
+        self.interpret_outline_into(cid, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Font::interpret_outline`] into `out`, which is cleared first.
+    fn interpret_outline_into(&self, cid: u16, out: &mut Vec<Segment>) -> Result<()> {
         self.interpretations.fetch_add(1, Ordering::Relaxed);
         match &self.program {
-            Program::Cff(c) => c.outline(c.gid(cid)?),
-            Program::TrueType(t) => t.outline(cid),
+            Program::Cff(c) => c.outline_into(c.gid(cid)?, out),
+            Program::TrueType(t) => {
+                out.clear();
+                out.extend(t.outline(cid)?);
+                Ok(())
+            }
         }
     }
 

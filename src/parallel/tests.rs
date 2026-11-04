@@ -96,3 +96,37 @@ fn a_document_is_sync() {
     fn assert_sync<T: Sync>() {}
     assert_sync::<crate::pdf::Document>();
 }
+
+#[test]
+fn each_thread_keeps_one_state() {
+    // docs/adr/0014: `init` runs once per thread, and the tasks of a thread
+    // get its state.
+    for (count, j) in [(0, 4), (1, 4), (100, 1), (100, 3), (100, 16)] {
+        let inits = AtomicUsize::new(0);
+        let seen: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+        let result: Result<(), (usize, ())> = run_with(
+            count,
+            jobs(j),
+            || {
+                (
+                    inits.fetch_add(1, Ordering::SeqCst),
+                    std::thread::current().id(),
+                )
+            },
+            |state, i| {
+                assert_eq!(state.1, std::thread::current().id());
+                seen.lock().unwrap().push((state.0, i));
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        let threads = j.min(count);
+        assert!(
+            inits.load(Ordering::SeqCst) <= threads.max(1),
+            "{count} {j}"
+        );
+        let mut indices: Vec<usize> = seen.into_inner().unwrap().iter().map(|&(_, i)| i).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..count).collect::<Vec<_>>());
+    }
+}

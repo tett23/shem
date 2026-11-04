@@ -7,7 +7,7 @@
 
 use crate::error::{Error, Result};
 use crate::fixed::{Fixed, Matrix};
-use crate::pdf::lexer::{Lexer, Token, object_from};
+use crate::pdf::lexer::{Lexer, Token, hex_bytes, object_from};
 use crate::pdf::{Dict, Document, Object};
 use std::borrow::Cow;
 
@@ -35,10 +35,43 @@ pub enum Operator<'a> {
     HScale(Fixed),
     TextMatrix(Matrix),
     RenderMode(i64),
-    ShowText(Vec<u8>),
+    ShowText(Text<'a>),
     Do(Cow<'a, [u8]>),
     BeginMarked,
     EndMarked,
+}
+
+/// The string of `Tj`: a hexadecimal string as the slice of the content,
+/// decoded as it is read, or the bytes of a literal string. Two texts are
+/// equal, and print, as their bytes (docs/adr/0014).
+#[derive(Clone)]
+pub enum Text<'a> {
+    Hex(&'a [u8]),
+    Bytes(Vec<u8>),
+}
+
+impl Text<'_> {
+    pub fn bytes(&self) -> impl Iterator<Item = u8> + Clone + '_ {
+        let (hex, bytes) = match self {
+            Text::Hex(raw) => (Some(hex_bytes(raw)), None),
+            Text::Bytes(b) => (None, Some(b.iter().copied())),
+        };
+        hex.into_iter().flatten().chain(bytes.into_iter().flatten())
+    }
+}
+
+impl PartialEq for Text<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes().eq(other.bytes())
+    }
+}
+
+impl Eq for Text<'_> {}
+
+impl std::fmt::Debug for Text<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.bytes()).finish()
+    }
 }
 
 /// An operator and the offset of its keyword in the content.
@@ -52,6 +85,7 @@ pub struct Op<'a> {
 #[derive(Debug)]
 enum Operand<'a> {
     Name(Cow<'a, [u8]>),
+    Hex(&'a [u8]),
     Object(Object),
 }
 
@@ -59,7 +93,7 @@ impl Operand<'_> {
     fn number(&self) -> Option<Fixed> {
         match self {
             Operand::Object(o) => o.as_number().and_then(|r| r.ok()),
-            Operand::Name(_) => None,
+            Operand::Name(_) | Operand::Hex(_) => None,
         }
     }
 }
@@ -101,7 +135,7 @@ fn operator<'a>(
     let none = |op: Operator<'a>, place| Ok(empty.then_some((op, place)));
     let name = |o: &mut Operand<'a>| match o {
         Operand::Name(n) => Some(std::mem::take(n)),
-        Operand::Object(_) => None,
+        Operand::Object(_) | Operand::Hex(_) => None,
     };
     Ok(match k {
         b"q" => return none(Save, Place::Page),
@@ -137,8 +171,9 @@ fn operator<'a>(
             _ => None,
         },
         b"Tj" => match operands {
+            [Operand::Hex(raw)] => Some((ShowText(Text::Hex(raw)), Place::Text)),
             [Operand::Object(Object::String(s))] => {
-                Some((ShowText(std::mem::take(s)), Place::Text))
+                Some((ShowText(Text::Bytes(std::mem::take(s))), Place::Text))
             }
             _ => None,
         },
@@ -233,10 +268,17 @@ impl State {
 
 /// Reads and checks the operators of a content stream.
 pub fn parse(content: &[u8]) -> Result<Vec<Op<'_>>> {
+    let mut ops = Vec::new();
+    parse_into(content, &mut ops)?;
+    Ok(ops)
+}
+
+/// [`parse`] into `ops`, which is cleared first.
+pub fn parse_into<'a>(content: &'a [u8], ops: &mut Vec<Op<'a>>) -> Result<()> {
+    ops.clear();
     let mut lx = Lexer::new(content, 0);
     let mut operands: Vec<Operand> = Vec::new();
     let mut state = State::default();
-    let mut ops = Vec::new();
     while let Some((at, token)) = lx.next_token()? {
         match token {
             Token::Keyword(k) if !matches!(k, b"true" | b"false" | b"null") => {
@@ -264,6 +306,7 @@ pub fn parse(content: &[u8]) -> Result<Vec<Op<'_>>> {
                 operands.clear();
             }
             Token::Name(n) => operands.push(Operand::Name(n)),
+            Token::HexString(raw) => operands.push(Operand::Hex(raw)),
             token => operands.push(Operand::Object(object_from(&mut lx, at, token, false)?)),
         }
     }
@@ -275,8 +318,7 @@ pub fn parse(content: &[u8]) -> Result<Vec<Op<'_>>> {
     }
     state
         .finish()
-        .map_err(|m| Error::new(m).at_offset(content.len()))?;
-    Ok(ops)
+        .map_err(|m| Error::new(m).at_offset(content.len()))
 }
 
 /// Checks that the names of `Tf`, `cs` and `Do` are in the page's resources.

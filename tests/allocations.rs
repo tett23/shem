@@ -139,3 +139,56 @@ fn the_allocations_do_not_grow_with_the_segments_of_a_path() {
 fn the_allocations_do_not_grow_with_the_curves_of_a_path() {
     assert_not_per_item("20 20 300 30 40 10 c\n", |s| format!("40 10 m\n{s}h f\n"));
 }
+
+/// The distinct CIDs of the `Tj` of a page, as two-byte hexadecimal strings.
+fn distinct_cids(page: &Page) -> Vec<String> {
+    let ops = shem::content::parse(&page.contents).unwrap();
+    let mut cids: Vec<u16> = ops
+        .iter()
+        .filter_map(|op| match &op.operator {
+            shem::content::Operator::ShowText(t) => Some(t.bytes().collect::<Vec<u8>>()),
+            _ => None,
+        })
+        .flat_map(|b| {
+            b.chunks(2)
+                .map(|p| u16::from_be_bytes([p[0], p[1]]))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    cids.sort_unstable();
+    cids.dedup();
+    cids.iter().map(|c| format!("{c:04X}")).collect()
+}
+
+#[test]
+fn a_glyph_interpreted_for_the_first_time_allocates_a_few_times() {
+    // docs/adr/0014: the charstring of each glyph is interpreted once per
+    // document, by the thread that meets it first. Its stack and its
+    // segments are reused, and the outline is copied once into the cache.
+    let doc = Document::parse(&std::fs::read(common::golem_fixture("kanikosen")).unwrap()).unwrap();
+    let text = &doc.pages().unwrap()[2];
+    let cids = distinct_cids(text);
+    assert!(cids.len() > 100, "{}", cids.len());
+    let content: String = cids.iter().map(|c| glyph("F1", c)).collect();
+    let page = page_of(&doc, content);
+    let cache = FontCache::new();
+    // The font is read before counting.
+    check_page_with(
+        &doc,
+        &page_of(&doc, "BT /F1 9.2126 Tf ET\n".into()),
+        72,
+        &cache,
+    )
+    .unwrap();
+    let before = count();
+    check_page_with(&doc, &page, 72, &cache).unwrap();
+    let cold = count() - before;
+    let before = count();
+    check_page_with(&doc, &page, 72, &cache).unwrap();
+    let warm = count() - before;
+    let n = cids.len() as u64;
+    assert!(
+        cold <= warm + n * 4,
+        "{n} glyphs: {cold} allocations at the first check, {warm} at the second"
+    );
+}

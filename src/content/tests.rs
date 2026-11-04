@@ -48,7 +48,7 @@ fn every_operator_of_the_table() {
             Operator::HScale(n("50")),
             Operator::TextMatrix(m(["1", "0", "0", "1", "3", "4"])),
             Operator::RenderMode(2),
-            Operator::ShowText(vec![0, 1]),
+            Operator::ShowText(Text::Bytes(vec![0, 1])),
             Operator::RenderMode(0),
             Operator::EndText,
             Operator::Do(b"Im1".as_slice().into()),

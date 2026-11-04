@@ -143,9 +143,26 @@ impl Fixed {
 }
 
 /// The units of 2^-32 of a decimal fraction `0.d1d2...`, rounded to the
-/// nearest, ties to even. The fraction is doubled digit by digit, so the
-/// result is exact for any number of digits.
+/// nearest, ties to even. Up to 19 digits, the fraction D / 10^n is exact in
+/// integers: the units are D · 2^32 / 10^n, rounded by its remainder
+/// (docs/adr/0014). Longer fractions are doubled digit by digit.
 fn fraction_units(digits: &[u8]) -> i128 {
+    if digits.len() > 19 {
+        return fraction_units_by_doubling(digits);
+    }
+    let d = digits
+        .iter()
+        .fold(0u128, |acc, c| acc * 10 + u128::from(c - b'0'));
+    let den = 10u128.pow(digits.len() as u32);
+    let num = d << FRAC_BITS;
+    let (q, r) = (num / den, num % den);
+    let round_up = 2 * r > den || (2 * r == den && q & 1 == 1);
+    (q + u128::from(round_up)) as i128
+}
+
+/// [`fraction_units`] by doubling the decimal fraction, exact for any
+/// number of digits.
+fn fraction_units_by_doubling(digits: &[u8]) -> i128 {
     // The digits of most numbers fit on the stack, so reading them allocates
     // nothing (docs/adr/0013).
     let mut stack = [0u8; 32];

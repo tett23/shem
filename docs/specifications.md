@@ -11,6 +11,7 @@ v1 では、汎用の PDF のラスタライザを目指す（[roadmap.md](roadm
 ## 状態
 
 v0.1 の範囲（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)〜[0012](adr/0012-parallel-library-api.md)）と、musl の配布物でスレッドを増やすと遅くなる問題の修正（[ADR 0013](adr/0013-fewer-allocations-for-musl-threads.md)）を実装し、v0.1.0-rc3 をプレリリースとして出した。
+その後、スレッドごとの作業用の場所と、検査と塗りの高速化（[ADR 0014](adr/0014-thread-workspaces-and-faster-check-and-fill.md)）を実装した。
 版ごとの計画は [roadmap.md](roadmap.md) にある。
 
 ## コマンド
@@ -58,7 +59,9 @@ shem --help
 `shem` のクレートは、コマンドが使う描画の API を公開する（[ADR 0012](adr/0012-parallel-library-api.md)）。v0.x の間、この API は版を上げずに変えうる。
 
 - `shem::parallel::run(count, jobs, task)` は、`task(0)` から `task(count − 1)` を最大 `jobs` 個のスレッドで実行する。番号は小さい順に一度ずつ配り、エラーの後は新しい番号を配らず、実行中の仕事は最後まで実行する。返すのは、エラーになった番号のうち最も小さいものとそのエラーで、スレッドの数と終わる順によらない。`jobs` が 1 なら、呼び出したスレッドで順に実行する。仕事のパニックは呼び出し元に伝わる。`shem::parallel::available_jobs()` は使えるコアの数（取れなければ 1）を返す。
-- `shem::render::Session` は、一つの文書を一つの解像度で描く入り口で、フォントのキャッシュ（[ADR 0011](adr/0011-speed-up-without-changing-bytes.md)）をページ、検査と描画、スレッドの間で共有する。ページは 0 から数える。`check` と `render` は一つのページを、`check_pages` と `render_pages` は複数のページを並列に扱い、`pages` の並びで最も前のページのエラーを返す。`render_pages` は、描いた画像を、描いたスレッドで `consume` に一度ずつ渡す。`consume` のエラーは `PageError::Consume`、描画のエラーは `PageError::Render` になる。
+- `shem::parallel::run_with(count, jobs, init, task)` は、`run` と同じ順と規則で、スレッドごとの状態を渡す。スレッドが始まるときに `init()` で状態を作り、`task(&mut state, i)` に渡す。`run` は、状態のない `run_with` である（[ADR 0014](adr/0014-thread-workspaces-and-faster-check-and-fill.md)）。
+- `shem::render::Session` は、一つの文書を一つの解像度で描く入り口で、フォントのキャッシュ（[ADR 0011](adr/0011-speed-up-without-changing-bytes.md)）をページ、検査と描画、スレッドの間で共有する。ページは 0 から数える。`check` と `render` は一つのページを、`check_pages` と `render_pages` は複数のページを並列に扱い、`pages` の並びで最も前のページのエラーを返す。`render_pages` は、描いた画像の参照（`&Canvas`）を、描いたスレッドで `consume` に一度ずつ渡す。画像の領域は、そのスレッドの次のページで使い回すので、残したい画像は `consume` の中で写す（[ADR 0014](adr/0014-thread-workspaces-and-faster-check-and-fill.md)）。`consume` のエラーは `PageError::Consume`、描画のエラーは `PageError::Render` になる。
+- `shem::render::Workspace` は、スレッドが検査と描画のページの間で使い回すバッファ（演算子、グラフィックス状態のスタック、パス、塗りの作業用の場所、アウトラインのバッファ、画像）である。`Session::check_with(&mut ws, page)` と `Session::render_with(&mut ws, page)` は、その中で一つのページを扱い、`render_with` の画像は次のページまで `ws` の中に残る。同じ `Workspace` で続けて扱っても、結果は `check` と `render` と同じである。`check_pages` と `render_pages` は、スレッドごとに一つの `Workspace` を使う。
 - `render_page` と `check_page` は、一つのページのための `Session` で描く。
 - `Session` はスレッドの間で共有でき（`Sync`）、画像（`Canvas`）はスレッドの間で受け渡せる（`Send`）。
 
@@ -138,7 +141,7 @@ v0.1 は、今の Golem の Writer が書く PDF の部分集合を読む（[ADR
 - 掛け算、割り算、行列の積と点の変換は、128 ビットの整数で計算してから一度だけ丸める（最近接の偶数への丸め）。平方根は切り捨てる。
 - 桁あふれはエラーにする。黙って折り返さない。
 
-速さの記録は `docs/benchmarks/` に置く（[2026-10-27-parallel-render.md](benchmarks/2026-10-27-parallel-render.md)、[2026-10-27-speed-up.md](benchmarks/2026-10-27-speed-up.md)、[2026-10-27-musl-threads.md](benchmarks/2026-10-27-musl-threads.md)）。フォントとグリフのアウトラインの使い回しなど、出力のバイト列を変えない高速化は、仕様の振る舞いを変えない（[ADR 0011](adr/0011-speed-up-without-changing-bytes.md)）。
+速さの記録は `docs/benchmarks/` に置く（[2026-10-27-parallel-render.md](benchmarks/2026-10-27-parallel-render.md)、[2026-10-27-speed-up.md](benchmarks/2026-10-27-speed-up.md)、[2026-10-27-musl-threads.md](benchmarks/2026-10-27-musl-threads.md)、[2026-11-05-thread-workspaces.md](benchmarks/2026-11-05-thread-workspaces.md)）。フォントとグリフのアウトラインの使い回しなど、出力のバイト列を変えない高速化は、仕様の振る舞いを変えない（[ADR 0011](adr/0011-speed-up-without-changing-bytes.md)）。
 
 musl のメモリ割り当ては一つの錠で守られ、割り当てのたびにスレッドが待ち合う。
 そこで、ページの検査と描画の割り当ての回数は、グリフ、線分、曲線の数に比例させない（[ADR 0013](adr/0013-fewer-allocations-for-musl-threads.md)）。
@@ -149,6 +152,16 @@ musl のメモリ割り当ては一つの錠で守られ、割り当てのたび
 - 結合テスト `tests/allocations.rs` が、同じグリフの 101 個と 1 個の割り当ての差がグリフあたり 4 回以下であることと、長方形、線分、曲線の数に比例しないことを確かめる。
 - 結合テスト `tests/kanikosen.rs` が、Golem の kanikosen の fixture のすべてのページを 72 dpi と 150 dpi で描き、PNG と PPM のバイト列が v0.1.0-rc2 と同じであることを確かめる。
 - 速さは、手動で起動するワークフロー Benchmark（`.github/workflows/benchmark.yml`）で、x86-64 の musl のビルドを ubuntu-24.04 で測る。
+
+その後、残った割り当てと、スレッドの数によらない CPU の時間を減らした（[ADR 0014](adr/0014-thread-workspaces-and-faster-check-and-fill.md)）。どれも出力のバイト列とエラーを変えない。
+
+- 字句は、16 進の文字列をスライスのまま返し、`Tj` の文字列は描くときに解きながら読む。
+- CFF の charstring の引数のスタックは長さ 48 の固定の配列で、グリフのアウトラインはスレッドのバッファに解釈してから、キャッシュへ一度だけ写す。結合テスト `tests/allocations.rs` が、初めて解釈するグリフの割り当てがグリフあたり 4 回以下であることを確かめる。
+- スレッドは、検査と描画のすべてのページで一つの `Workspace` を使い回す。
+- 十進の数は、小数部が 19 桁以下なら一度の割り算と余りで丸める。20 桁以上は、小数部を 2 倍しては繰り上げて読む。どちらも、最も近い Q32.32 の値（同じ近さなら偶数）になる。
+- W と W2 は、範囲が昇順で重ならなければ二分探索で引き、そうでなければ先頭からたどる。どちらも、CID を含む最初の範囲を使う。
+- 画素を描かない検査では、グリフの点をデバイス空間に写して桁あふれを確かめるだけで、パスと線の多角形は作らない。
+- 塗りでは、パスの点の外接矩形から、画素を変えうるセル（画像の中の行と、列 −1 から画像の右端までの列）を求める。その数が 2^16 以下なら、セルを密な格子に足し込み、超えれば並べ替えて同じセルを足す。画像の左のセルは列 −1 にまとめ、右と上下のセルは捨てる。
 
 ## 配布
 
