@@ -11,7 +11,7 @@ v1 では、汎用の PDF のラスタライザを目指す（[roadmap.md](roadm
 ## 状態
 
 v0.1 の範囲（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)〜[0012](adr/0012-parallel-library-api.md)）と、musl の配布物でスレッドを増やすと遅くなる問題の修正（[ADR 0013](adr/0013-fewer-allocations-for-musl-threads.md)）を実装し、v0.1.0-rc3 をプレリリースとして出した。
-その後、スレッドごとの作業用の場所と、検査と塗りの高速化（[ADR 0014](adr/0014-thread-workspaces-and-faster-check-and-fill.md)）を実装した。
+その後、スレッドごとの作業用の場所と、検査と塗りの高速化（[ADR 0014](adr/0014-thread-workspaces-and-faster-check-and-fill.md)）と、PNG の書き出し、描画、Flate の展開の高速化（[ADR 0015](adr/0015-faster-png-render-and-decoding.md)）を実装した。
 版ごとの計画は [roadmap.md](roadmap.md) にある。
 
 ## コマンド
@@ -62,6 +62,9 @@ shem --help
 - `shem::parallel::run_with(count, jobs, init, task)` は、`run` と同じ順と規則で、スレッドごとの状態を渡す。スレッドが始まるときに `init()` で状態を作り、`task(&mut state, i)` に渡す。`run` は、状態のない `run_with` である（[ADR 0014](adr/0014-thread-workspaces-and-faster-check-and-fill.md)）。
 - `shem::render::Session` は、一つの文書を一つの解像度で描く入り口で、フォントのキャッシュ（[ADR 0011](adr/0011-speed-up-without-changing-bytes.md)）をページ、検査と描画、スレッドの間で共有する。ページは 0 から数える。`check` と `render` は一つのページを、`check_pages` と `render_pages` は複数のページを並列に扱い、`pages` の並びで最も前のページのエラーを返す。`render_pages` は、描いた画像の参照（`&Canvas`）を、描いたスレッドで `consume` に一度ずつ渡す。画像の領域は、そのスレッドの次のページで使い回すので、残したい画像は `consume` の中で写す（[ADR 0014](adr/0014-thread-workspaces-and-faster-check-and-fill.md)）。`consume` のエラーは `PageError::Consume`、描画のエラーは `PageError::Render` になる。
 - `shem::render::Workspace` は、スレッドが検査と描画のページの間で使い回すバッファ（演算子、グラフィックス状態のスタック、パス、塗りの作業用の場所、アウトラインのバッファ、画像）である。`Session::check_with(&mut ws, page)` と `Session::render_with(&mut ws, page)` は、その中で一つのページを扱い、`render_with` の画像は次のページまで `ws` の中に残る。同じ `Workspace` で続けて扱っても、結果は `check` と `render` と同じである。`check_pages` と `render_pages` は、スレッドごとに一つの `Workspace` を使う。
+- `Session::with_jobs(doc, dpi, jobs)` は、ページの内容の Flate の展開を最大 `jobs` 個のスレッドで行う `Session::new` である。ページの木は一つのスレッドでたどり、エラーは番号の最も小さいページのもので、一つのスレッドと同じである。`shem::pdf::Document::pages_with(jobs)` も同じで、`shem render` は `--jobs` の値で使う（[ADR 0015](adr/0015-faster-png-render-and-decoding.md)）。
+- `Session::from_pages(doc, pages, dpi)` は、先に読んだページ（`Document::pages_with`）を借りる `Session` である。検査が通ったページの演算子を持ち、そのページの描画は内容を解析しなおさずにそれを使う。検査していないページは描画で解析する。結果は `Session::new` と同じである。`shem render` はこれを使う（[ADR 0015](adr/0015-faster-png-render-and-decoding.md)）。
+- `shem::raster::Canvas::fill` は、パスの覆いを `Vec` に集めずに、掃きながら画像に重ねる。結果は、`coverage` を `Canvas::paint` したものと同じである（[ADR 0015](adr/0015-faster-png-render-and-decoding.md)）。
 - `render_page` と `check_page` は、一つのページのための `Session` で描く。
 - `Session` はスレッドの間で共有でき（`Sync`）、画像（`Canvas`）はスレッドの間で受け渡せる（`Send`）。
 
@@ -141,7 +144,7 @@ v0.1 は、今の Golem の Writer が書く PDF の部分集合を読む（[ADR
 - 掛け算、割り算、行列の積と点の変換は、128 ビットの整数で計算してから一度だけ丸める（最近接の偶数への丸め）。平方根は切り捨てる。
 - 桁あふれはエラーにする。黙って折り返さない。
 
-速さの記録は `docs/benchmarks/` に置く（[2026-10-27-parallel-render.md](benchmarks/2026-10-27-parallel-render.md)、[2026-10-27-speed-up.md](benchmarks/2026-10-27-speed-up.md)、[2026-10-27-musl-threads.md](benchmarks/2026-10-27-musl-threads.md)、[2026-11-05-thread-workspaces.md](benchmarks/2026-11-05-thread-workspaces.md)）。フォントとグリフのアウトラインの使い回しなど、出力のバイト列を変えない高速化は、仕様の振る舞いを変えない（[ADR 0011](adr/0011-speed-up-without-changing-bytes.md)）。
+速さの記録は `docs/benchmarks/` に置く（[2026-10-27-parallel-render.md](benchmarks/2026-10-27-parallel-render.md)、[2026-10-27-speed-up.md](benchmarks/2026-10-27-speed-up.md)、[2026-10-27-musl-threads.md](benchmarks/2026-10-27-musl-threads.md)、[2026-11-05-thread-workspaces.md](benchmarks/2026-11-05-thread-workspaces.md)、[2026-11-05-faster-png-render-and-decoding.md](benchmarks/2026-11-05-faster-png-render-and-decoding.md)）。フォントとグリフのアウトラインの使い回しなど、出力のバイト列を変えない高速化は、仕様の振る舞いを変えない（[ADR 0011](adr/0011-speed-up-without-changing-bytes.md)）。
 
 musl のメモリ割り当ては一つの錠で守られ、割り当てのたびにスレッドが待ち合う。
 そこで、ページの検査と描画の割り当ての回数は、グリフ、線分、曲線の数に比例させない（[ADR 0013](adr/0013-fewer-allocations-for-musl-threads.md)）。
@@ -162,6 +165,17 @@ musl のメモリ割り当ては一つの錠で守られ、割り当てのたび
 - W と W2 は、範囲が昇順で重ならなければ二分探索で引き、そうでなければ先頭からたどる。どちらも、CID を含む最初の範囲を使う。
 - 画素を描かない検査では、グリフの点をデバイス空間に写して桁あふれを確かめるだけで、パスと線の多角形は作らない。
 - 塗りでは、パスの点の外接矩形から、画素を変えうるセル（画像の中の行と、列 −1 から画像の右端までの列）を求める。その数が 2^16 以下なら、セルを密な格子に足し込み、超えれば並べ替えて同じセルを足す。画像の左のセルは列 −1 にまとめ、右と上下のセルは捨てる。
+
+さらに、PNG の書き出し、描画、Flate の展開を速くした（[ADR 0015](adr/0015-faster-png-render-and-decoding.md)）。これも出力のバイト列とエラーを変えない。
+
+- PNG の行のフィルタは、5 種類を番号の順に試し、費用が 0 の種類が出たら打ち切る。どの種類も、最初の画素とそれ以降を別々のループで計算する。
+- Deflate は、固定の Huffman の符号と、長さと距離の符号を表から引く。候補の、今の最長の一致の長さの位置のバイトが違えば、その候補の長さは数えない。同じバイトの連続の中の候補は、連続の長さから一致の長さが決まるので、まとめて式で処理する。どちらも、候補を試した回数（128 まで）には数える。一致の後に連鎖に足す位置も、同じバイトの連続はまとめて足す。
+- Adler-32 は 16 本の列で、CRC-32 は 8 バイトずつの表で計算する。
+- 十進の数は、小数部が 9 桁以下なら u64 で割って丸める。整数で割る `Fixed::checked_div` は i64 で割る。どちらも値は同じである。
+- 字句は、バイトの種類を表で引き、語の終わりと数の形を 1 回の走査で調べる。整数は文字列に直さずに読む。
+- 検査では、グリフの座標の絶対値の最大と行列から、写した点が桁あふれしないことを上限で示せれば、点を写さない。描画では、示せたグリフの点を、同じ二度の丸めで、桁あふれの検査なしで写す。示せなければ、一つずつ検査して写す。
+- 線分と行や列との交点は、積が i64 に収まれば i64 で割る。密な格子は、行ごとに左から足しながら、画素を直接画像に重ねる。曲線は再帰で分割する。
+- Flate の Huffman の符号は、11 ビットまでを表で引き、それより長い符号とデータの終わりの近くでは 1 ビットずつ読む。
 
 ## 配布
 

@@ -79,7 +79,16 @@ impl Path {
 
     pub fn curve_to(&mut self, c1: Point, c2: Point, p: Point) {
         let start = self.current_point().unwrap_or(c1);
-        flatten_curve_into(start, c1, c2, p, |q| self.line_to(q));
+        // After the first point, the subpath is open: the others are pushed.
+        let mut first = true;
+        flatten_curve_into(start, c1, c2, p, |q| {
+            if first {
+                self.line_to(q);
+                first = false;
+            } else {
+                self.points.push(q);
+            }
+        });
     }
 
     pub fn close(&mut self) {
@@ -150,20 +159,16 @@ pub fn flatten_curve(p0: Point, p1: Point, p2: Point, p3: Point) -> Vec<Point> {
     out
 }
 
-/// The points of [`flatten_curve`], given to `emit` in order. The curves
-/// still to split are on a stack of fixed size, the first curve on top: a
-/// split takes one curve and puts two of the next level, so the stack holds
-/// at most one curve of each level and the curve of the top level, MAX_DEPTH
-/// + 1 in all.
+/// The points of [`flatten_curve`], given to `emit` in order: a curve that
+/// is flat enough, or at the deepest level, gives its end point; another is
+/// split at its midpoint, first half first. The recursion is at most
+/// MAX_DEPTH deep, and keeps only the curves of the levels it is in
+/// (docs/adr/0015).
 fn flatten_curve_into(p0: Point, p1: Point, p2: Point, p3: Point, mut emit: impl FnMut(Point)) {
-    let mut stack = [([p0, p1, p2, p3], 0u32); MAX_DEPTH as usize + 1];
-    let mut len = 1;
-    while len > 0 {
-        len -= 1;
-        let ([a, b, c, d], depth) = stack[len];
+    fn split(a: Point, b: Point, c: Point, d: Point, depth: u32, emit: &mut impl FnMut(Point)) {
         if depth >= MAX_DEPTH || flatness(a, b, c, d) <= FLATNESS {
             emit(d);
-            continue;
+            return;
         }
         let ab = mid(a, b);
         let bc = mid(b, c);
@@ -171,10 +176,10 @@ fn flatten_curve_into(p0: Point, p1: Point, p2: Point, p3: Point, mut emit: impl
         let abc = mid(ab, bc);
         let bcd = mid(bc, cd);
         let m = mid(abc, bcd);
-        stack[len] = ([m, bcd, cd, d], depth + 1);
-        stack[len + 1] = ([a, ab, abc, m], depth + 1);
-        len += 2;
+        split(a, ab, abc, m, depth + 1, emit);
+        split(m, bcd, cd, d, depth + 1, emit);
     }
+    split(p0, p1, p2, p3, 0, &mut emit);
 }
 
 /// A cell: (row, column, cover, area).
@@ -206,12 +211,28 @@ fn crossings(a: i64, b: i64) -> impl Iterator<Item = i64> {
     (0..count).map(move |i| if a <= b { first + i } else { last - i } * ONE64)
 }
 
+/// b at the point where a is `at`, on the line from (a0, b0) to (a1, b1).
+/// The product fits in i64 for most segments, whose division is faster
+/// and gives the same quotient (docs/adr/0015).
 fn interpolate(a0: i64, a1: i64, b0: i64, b1: i64, at: i64) -> i64 {
-    // b at the point where a is `at`, on the line from (a0, b0) to (a1, b1).
-    b0 + div_round(
-        i128::from(b1 - b0) * i128::from(at - a0),
-        i128::from(a1 - a0),
-    ) as i64
+    // With a negative divisor, both are negated; a product that does not
+    // fit, or whose negation does not, goes through i128.
+    let d = a1 - a0;
+    let n = (b1 - b0).checked_mul(at - a0);
+    let (n, d) = if d < 0 {
+        (n.and_then(i64::checked_neg), -d)
+    } else {
+        (n, d)
+    };
+    match n {
+        Some(n) => b0 + crate::fixed::div_round_i64(n, d),
+        None => {
+            b0 + div_round(
+                i128::from(b1 - b0) * i128::from(at - a0),
+                i128::from(a1 - a0),
+            ) as i64
+        }
+    }
 }
 
 /// Adds a line segment to the cells through `add(row, column, cover, area)`.
@@ -340,14 +361,32 @@ pub fn coverage_with<'s>(
     height: usize,
     scratch: &'s mut Scratch,
 ) -> &'s [(usize, usize, u8)] {
+    let mut pixels = std::mem::take(&mut scratch.pixels);
+    pixels.clear();
+    visit_coverage(path, rule, width, height, scratch, |x, y, a| {
+        pixels.push((x, y, a))
+    });
+    scratch.pixels = pixels;
+    &scratch.pixels
+}
+
+/// Calls `visit(x, y, opacity)` with the pixels of [`coverage`], in the same
+/// order, without collecting them (docs/adr/0015).
+pub fn visit_coverage(
+    path: &Path,
+    rule: FillRule,
+    width: usize,
+    height: usize,
+    scratch: &mut Scratch,
+    mut visit: impl FnMut(usize, usize, u8),
+) {
     let Scratch {
         cells,
         grid,
         pixels,
     } = scratch;
-    pixels.clear();
     let Some((row0, row1, col0, col1)) = grid_bounds(path, width, height) else {
-        return pixels;
+        return;
     };
     let cols = col1 - col0 + 1;
     if (row1 - row0 + 1) * cols <= MAX_GRID {
@@ -362,28 +401,36 @@ pub fn coverage_with<'s>(
             }
         };
         for_each_edge(path, |a, b| render_line(&mut add, a, b));
-        cells.clear();
+        // Each row is swept from the left over every slot: a slot of 0 gives
+        // the pixel of the span it is in (docs/adr/0015).
+        let w = width as i64;
         grid.chunks(cols as usize)
             .zip(row0..)
             .for_each(|(slots, row)| {
-                cells.clear();
-                cells.extend(
-                    slots
-                        .iter()
-                        .zip(col0..)
-                        .filter(|(slot, _)| **slot != (0, 0))
-                        .map(|(&(cover, area), col)| (row as i32, col as i32, cover, area)),
-                );
-                sweep_into(cells, rule, width, height, pixels);
+                let mut cover = 0i64;
+                slots.iter().zip(col0..).for_each(|(&(c, area), col)| {
+                    cover += c;
+                    if col >= 0 {
+                        let a = alpha(cover * 2 * ONE64 - area, rule);
+                        if a > 0 {
+                            visit(col as usize, row as usize, a);
+                        }
+                    }
+                });
+                let a = alpha(cover * 2 * ONE64, rule);
+                if a > 0 {
+                    ((col1 + 1).max(0)..w).for_each(|x| visit(x as usize, row as usize, a));
+                }
             });
     } else {
         cells.clear();
         let mut add = |row, col, cover, area| cells.push((row, col, cover, area));
         for_each_edge(path, |a, b| render_line(&mut add, a, b));
         merge(cells);
+        pixels.clear();
         sweep_into(cells, rule, width, height, pixels);
+        pixels.iter().for_each(|&(x, y, a)| visit(x, y, a));
     }
-    pixels
 }
 
 /// The pixels of the cells, sorted by row and column with one cell each.
@@ -582,9 +629,32 @@ impl Canvas {
 
     /// Composites a color over the pixels of a coverage.
     pub fn paint(&mut self, coverage: &[(usize, usize, u8)], rgb: [u8; 3]) {
-        coverage.iter().for_each(|&(x, y, a)| {
-            let i = (y * self.width + x) * 3;
-            (0..3).for_each(|c| self.pixels[i + c] = composite(rgb[c], a, self.pixels[i + c]));
+        coverage
+            .iter()
+            .for_each(|&(x, y, a)| self.paint_pixel(x, y, a, rgb));
+    }
+
+    /// Composites a color over one pixel with opacity `a`.
+    pub fn paint_pixel(&mut self, x: usize, y: usize, a: u8, rgb: [u8; 3]) {
+        let i = (y * self.width + x) * 3;
+        let p = &mut self.pixels[i..i + 3];
+        // An opaque pixel is the color: (c · 255 + 127) / 255 = c.
+        if a == 255 {
+            p.copy_from_slice(&rgb);
+            return;
+        }
+        p[0] = composite(rgb[0], a, p[0]);
+        p[1] = composite(rgb[1], a, p[1]);
+        p[2] = composite(rgb[2], a, p[2]);
+    }
+
+    /// Fills a path with a color, compositing each pixel as it is swept
+    /// ([`visit_coverage`]); the same pixels as [`Canvas::paint`] of the
+    /// coverage.
+    pub fn fill(&mut self, path: &Path, rule: FillRule, rgb: [u8; 3], scratch: &mut Scratch) {
+        let (width, height) = (self.width, self.height);
+        visit_coverage(path, rule, width, height, scratch, |x, y, a| {
+            self.paint_pixel(x, y, a, rgb)
         });
     }
 }

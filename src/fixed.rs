@@ -113,6 +113,11 @@ impl Fixed {
         if o.0 == 0 {
             return Err(Error::new("division by zero"));
         }
+        // By an integer k, (a · 2^32) / (k · 2^32) is a / k, whose division in
+        // i64 is faster and rounds the same (docs/adr/0015).
+        if o.0 & 0xffff_ffff == 0 && o.0 > 0 {
+            return Ok(Fixed(div_round_i64(self.0, o.0 >> FRAC_BITS)));
+        }
         Fixed::from_wide(div_round(i128::from(self.0) << FRAC_BITS, i128::from(o.0)))
     }
 
@@ -149,6 +154,18 @@ impl Fixed {
 fn fraction_units(digits: &[u8]) -> i128 {
     if digits.len() > 19 {
         return fraction_units_by_doubling(digits);
+    }
+    if digits.len() <= 9 {
+        // D < 10^9 < 2^30, so D · 2^32 fits in u64, whose division is faster
+        // (docs/adr/0015).
+        let d = digits
+            .iter()
+            .fold(0u64, |acc, c| acc * 10 + u64::from(c - b'0'));
+        let den = 10u64.pow(digits.len() as u32);
+        let num = d << FRAC_BITS;
+        let (q, r) = (num / den, num % den);
+        let round_up = 2 * r > den || (2 * r == den && q & 1 == 1);
+        return i128::from(q + u64::from(round_up));
     }
     let d = digits
         .iter()
@@ -216,6 +233,20 @@ pub fn div_round(n: i128, d: i128) -> i128 {
     let q = n.div_euclid(d);
     let r = n.rem_euclid(d);
     match (2 * r).cmp(&d) {
+        std::cmp::Ordering::Greater => q + 1,
+        std::cmp::Ordering::Equal if q & 1 == 1 => q + 1,
+        _ => q,
+    }
+}
+
+/// [`div_round`] in i64 for a positive divisor: `n / d` rounded to the
+/// nearest, ties to even. The quotient is at most |n|, so it fits.
+pub fn div_round_i64(n: i64, d: i64) -> i64 {
+    debug_assert!(d > 0);
+    let q = n.div_euclid(d);
+    let r = n.rem_euclid(d);
+    // 2 r is compared as r against d − r, which does not overflow.
+    match r.cmp(&(d - r)) {
         std::cmp::Ordering::Greater => q + 1,
         std::cmp::Ordering::Equal if q & 1 == 1 => q + 1,
         _ => q,
@@ -297,6 +328,14 @@ impl Matrix {
     /// `self × o`: the transformation that applies `self` first, then `o`.
     /// Each element is a sum of products computed exactly and rounded once.
     pub fn concat(&self, o: &Matrix) -> Result<Matrix> {
+        // The products by the identity are exact, so they are the other
+        // matrix (docs/adr/0015).
+        if *o == Matrix::IDENTITY {
+            return Ok(*self);
+        }
+        if *self == Matrix::IDENTITY {
+            return Ok(*o);
+        }
         Ok(Matrix {
             a: narrow(wide(self.a, o.a) + wide(self.b, o.c))?,
             b: narrow(wide(self.a, o.b) + wide(self.b, o.d))?,

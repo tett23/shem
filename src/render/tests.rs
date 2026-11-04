@@ -107,3 +107,79 @@ fn stroke_widths() {
             .contains("unsupported stroke")
     );
 }
+
+#[test]
+fn the_bounds_of_a_glyph_imply_that_its_points_fit() {
+    // docs/adr/0015: when `fits_in_device` says yes, every point maps
+    // without an error; near the limit, it may say no while they fit.
+    use crate::font::Segment;
+    let mut state = 0x0015_0005u64;
+    let mut next = || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    };
+    let mut yes = 0;
+    let mut no = 0;
+    (0..20000).for_each(|k| {
+        // Scales from tiny to huge, so that some glyphs overflow.
+        let shift = (next() % 60) as u32;
+        let mut value = || Fixed::from_raw(((next() as i64) >> 1) >> shift);
+        let m = Matrix::new(std::array::from_fn(|_| value()));
+        let segments: Vec<Segment> = (0..1 + k % 6)
+            .map(|i| match i % 3 {
+                0 => Segment::Move(value(), value()),
+                1 => Segment::Line(value(), value()),
+                _ => Segment::Curve(std::array::from_fn(|_| value())),
+            })
+            .collect();
+        let all_fit = segments.iter().all(|s| match *s {
+            Segment::Move(x, y) | Segment::Line(x, y) => to_device(&m, x, y).is_ok(),
+            Segment::Curve(c) => c.chunks(2).all(|p| to_device(&m, p[0], p[1]).is_ok()),
+            Segment::Close => true,
+        });
+        if fits_in_device(&m, &segments) {
+            yes += 1;
+            assert!(all_fit, "{m:?} {segments:?}");
+            // The mapping without the checks gives the same points.
+            segments.iter().for_each(|s| {
+                let points: Vec<(Fixed, Fixed)> = match *s {
+                    Segment::Move(x, y) | Segment::Line(x, y) => vec![(x, y)],
+                    Segment::Curve(c) => c.chunks(2).map(|p| (p[0], p[1])).collect(),
+                    Segment::Close => vec![],
+                };
+                points.iter().for_each(|&(x, y)| {
+                    assert_eq!(
+                        Ok(to_device_fitting(&m, x, y)),
+                        to_device(&m, x, y).map_err(|_| ())
+                    );
+                });
+            });
+        } else {
+            no += 1;
+        }
+    });
+    assert!(yes > 1000 && no > 1000, "{yes} {no}");
+}
+
+#[test]
+fn the_bounds_hold_at_the_limit_of_the_device() {
+    // Points around 2^23 pixels, the largest that 1/256 pixel in i32 holds.
+    use crate::font::Segment;
+    let one = Fixed::ONE;
+    let m = Matrix::new([one, Fixed::ZERO, Fixed::ZERO, one, Fixed::ZERO, Fixed::ZERO]);
+    let edge = (1i64 << 23) << 32;
+    (-(1i64 << 26)..(1 << 26)).step_by(1 << 18).for_each(|d| {
+        [edge + d, -(edge + d)].iter().for_each(|&raw| {
+            let x = Fixed::from_raw(raw);
+            let segments = [Segment::Move(x, Fixed::ZERO)];
+            if fits_in_device(&m, &segments) {
+                assert!(to_device(&m, x, Fixed::ZERO).is_ok(), "{raw}");
+            }
+        });
+    });
+    // Well inside, the bounds show it.
+    let x = Fixed::from_raw((1i64 << 22) << 32);
+    assert!(fits_in_device(&m, &[Segment::Move(x, x)]));
+}

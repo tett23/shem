@@ -12,8 +12,31 @@ const MAX_BITS: usize = 15;
 pub fn adler32(data: &[u8]) -> u32 {
     const MOD: u32 = 65521;
     // 5552 is the largest n for which the sums cannot overflow u32 (zlib's NMAX).
+    // The bytes of a chunk are taken 16 at a time, into 16 lanes: lane l
+    // sums its bytes (A_l) and, after each block, A_l again (B_l). Over n
+    // bytes, a grows by Σ A_l and b by n a + Σ (16 B_l − l A_l), the sums of
+    // the bytes one by one (docs/adr/0015). The rest goes byte by byte.
     let (a, b) = data.chunks(5552).fold((1u32, 0u32), |(a, b), chunk| {
-        let (a, b) = chunk.iter().fold((a, b), |(a, b), &c| {
+        let (blocks, rest) = chunk.as_chunks::<16>();
+        let n = (chunk.len() - rest.len()) as u64;
+        let (lanes_a, lanes_b) =
+            blocks
+                .iter()
+                .fold(([0u32; 16], [0u32; 16]), |(mut la, mut lb), block| {
+                    (0..16).for_each(|l| {
+                        la[l] += u32::from(block[l]);
+                        lb[l] += la[l];
+                    });
+                    (la, lb)
+                });
+        let sum_a: u64 = lanes_a.iter().map(|&v| u64::from(v)).sum();
+        let sum_b: u64 = (0..16)
+            .map(|l| 16 * u64::from(lanes_b[l]) - l as u64 * u64::from(lanes_a[l]))
+            .sum();
+        let a64 = u64::from(a) + sum_a;
+        let b64 = u64::from(b) + n * u64::from(a) + sum_b;
+        let (a, b) = ((a64 % u64::from(MOD)) as u32, (b64 % u64::from(MOD)) as u32);
+        let (a, b) = rest.iter().fold((a, b), |(a, b), &c| {
             let a = a + u32::from(c);
             (a, b + a)
         });
@@ -84,9 +107,41 @@ impl<'a> BitReader<'a> {
         Ok(v)
     }
 
-    /// `count` bits, least significant first.
+    /// `count` bits, least significant first. With enough data, they are
+    /// read at once; near the end, bit by bit, which fails where the data
+    /// ends (docs/adr/0015).
     fn bits(&mut self, count: u32) -> Result<u32> {
+        let (v, available) = self.peek(count);
+        if available >= count {
+            self.skip(count);
+            return Ok(v);
+        }
         (0..count).try_fold(0, |acc, i| Ok(acc | (self.bit()? << i)))
+    }
+
+    /// The next `count` bits (at most 24) without reading them, the bits
+    /// past the end as 0, and how many of them are in the data.
+    fn peek(&self, count: u32) -> (u32, u32) {
+        let mask = (1u32 << count) - 1;
+        if let Some(four) = self.data.get(self.pos..self.pos + 4) {
+            let word = u32::from_le_bytes([four[0], four[1], four[2], four[3]]);
+            return ((word >> self.bit) & mask, count);
+        }
+        let bytes = self.data.get(self.pos..).unwrap_or_default();
+        let word = bytes
+            .iter()
+            .take(4)
+            .enumerate()
+            .fold(0u32, |w, (i, &b)| w | u32::from(b) << (8 * i));
+        let total = (bytes.len().min(4) * 8) as u32;
+        let available = total.saturating_sub(self.bit).min(count);
+        ((word >> self.bit) & ((1u32 << count) - 1), available)
+    }
+
+    fn skip(&mut self, count: u32) {
+        let bits = self.bit + count;
+        self.pos += (bits / 8) as usize;
+        self.bit = bits % 8;
     }
 
     fn align(&mut self) {
@@ -111,10 +166,17 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// The codes of at most this many bits are decoded by a table.
+const FAST_BITS: u32 = 11;
+
 /// A canonical Huffman code.
 struct Huffman {
     counts: [u16; MAX_BITS + 1],
     symbols: Vec<u16>,
+    /// For the next FAST_BITS bits, the symbol and the length of its code
+    /// as `symbol | length << 12`, or 0 when the code is longer or absent
+    /// (docs/adr/0015).
+    fast: Vec<u16>,
 }
 
 impl Huffman {
@@ -135,7 +197,7 @@ impl Huffman {
         if left > 0 && used > 1 {
             return Err(corrupt("incomplete Huffman code"));
         }
-        let symbols = (1..=MAX_BITS)
+        let symbols: Vec<u16> = (1..=MAX_BITS)
             .flat_map(|len| {
                 lengths
                     .iter()
@@ -144,10 +206,48 @@ impl Huffman {
                     .map(|(s, _)| s as u16)
             })
             .collect();
-        Ok(Huffman { counts, symbols })
+        // The canonical codes in the order of `symbols`: each length starts
+        // at the first code after the shorter ones, doubled (RFC 1951 3.2.2).
+        let mut fast = vec![0u16; 1 << FAST_BITS];
+        let mut code = 0u32;
+        let mut k = 0;
+        for len in 1..=MAX_BITS as u32 {
+            for _ in 0..counts[len as usize] {
+                if len <= FAST_BITS {
+                    // The first bit read is the most significant bit of the code.
+                    let reversed = (0..len).fold(0, |r, i| r << 1 | ((code >> i) & 1));
+                    let entry = symbols[k] | (len as u16) << 12;
+                    (reversed..1 << FAST_BITS)
+                        .step_by(1 << len)
+                        .for_each(|i| fast[i as usize] = entry);
+                }
+                code += 1;
+                k += 1;
+            }
+            code <<= 1;
+        }
+        Ok(Huffman {
+            counts,
+            symbols,
+            fast,
+        })
     }
 
+    /// The next symbol: from the table when its code is in it and in the
+    /// data, or else bit by bit as puff.c does.
+    #[inline]
     fn decode(&self, input: &mut BitReader) -> Result<u16> {
+        let (bits, available) = input.peek(FAST_BITS);
+        let entry = self.fast[bits as usize];
+        let len = u32::from(entry >> 12);
+        if len > 0 && len <= available {
+            input.skip(len);
+            return Ok(entry & 0x0fff);
+        }
+        self.decode_slowly(input)
+    }
+
+    fn decode_slowly(&self, input: &mut BitReader) -> Result<u16> {
         let mut code: i32 = 0;
         let mut first: i32 = 0;
         let mut index: i32 = 0;
@@ -293,8 +393,12 @@ fn codes(input: &mut BitReader, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman
                     return Err(corrupt("distance beyond the output"));
                 }
                 let start = out.len() - distance;
-                // The copy may overlap its own output, so it goes byte by byte.
-                (0..len).for_each(|k| out.push(out[start + k]));
+                if distance >= len {
+                    out.extend_from_within(start..start + len);
+                } else {
+                    // The copy overlaps its own output, so it goes byte by byte.
+                    (0..len).for_each(|k| out.push(out[start + k]));
+                }
             }
             _ => return Err(corrupt("invalid literal/length code")),
         }
@@ -303,3 +407,9 @@ fn codes(input: &mut BitReader, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod reference;
+
+#[cfg(test)]
+mod reference_tests;

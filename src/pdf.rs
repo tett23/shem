@@ -313,6 +313,14 @@ impl Document {
 
     /// The pages in order (ISO 32000-1 7.7.3).
     pub fn pages(&self) -> Result<Vec<Page>> {
+        self.pages_with(std::num::NonZeroUsize::MIN)
+    }
+
+    /// [`Document::pages`], with the contents of the pages decoded on at
+    /// most `jobs` threads. The page tree is read first; the error of a page
+    /// is the one of the first page that fails, as [`crate::parallel::run`]
+    /// returns it, the same as on one thread (docs/adr/0015).
+    pub fn pages_with(&self, jobs: std::num::NonZeroUsize) -> Result<Vec<Page>> {
         let catalog = self
             .get(&self.trailer, "Root")?
             .and_then(|o| o.as_dict().cloned())
@@ -327,14 +335,21 @@ impl Document {
             &mut BTreeSet::new(),
             &mut leaves,
         )?;
-        leaves
+        let pages: Vec<std::sync::Mutex<Option<Page>>> =
+            leaves.iter().map(|_| std::sync::Mutex::new(None)).collect();
+        crate::parallel::run(leaves.len(), jobs, |index| {
+            let (object, dict, inherited) = &leaves[index];
+            let page = self
+                .page(index, *object, dict, inherited.clone())
+                .map_err(|e| e.at_page(index + 1))?;
+            *pages[index].lock().unwrap_or_else(|p| p.into_inner()) = Some(page);
+            Ok(())
+        })
+        .map_err(|(_, e)| e)?;
+        Ok(pages
             .into_iter()
-            .enumerate()
-            .map(|(index, (object, dict, inherited))| {
-                self.page(index, object, &dict, inherited)
-                    .map_err(|e| e.at_page(index + 1))
-            })
-            .collect()
+            .filter_map(|p| p.into_inner().unwrap_or_else(|p| p.into_inner()))
+            .collect())
     }
 
     fn walk(

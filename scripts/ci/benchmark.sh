@@ -4,8 +4,9 @@
 #
 #   benchmark.sh <input.pdf> <label>=<shem executable>...
 #
-# Each executable renders the PDF at 72 dpi to PPM files, with each value of
-# JOBS (default "1 2 4"), RUNS times (default 3). The runs of the
+# Each executable renders the PDF at DPI (default 72) to FORMAT files
+# (default ppm), with each value of JOBS (default "1 2 4"), RUNS times
+# (default 3). The runs of the
 # executables and of the values alternate, so that a change of the machine
 # during the measurement falls on all of them. The output is a Markdown
 # table of the wall-clock times in milliseconds, with their medians, and
@@ -19,6 +20,8 @@ pdf=$1
 shift
 jobs=${JOBS:-1 2 4}
 runs=${RUNS:-3}
+dpi=${DPI:-72}
+format=${FORMAT:-ppm}
 case $(date +%s%N) in
   *N) echo "benchmark.sh: date +%s%N is not supported" >&2; exit 69 ;;
 esac
@@ -37,7 +40,7 @@ while [ "$run" -le "$runs" ]; do
     for j in $jobs; do
       out="$work/out-$run-$label-$j"
       start=$(now)
-      "$exe" render --dpi 72 --format ppm --jobs "$j" "$pdf" "$out"
+      "$exe" render --dpi "$dpi" --format "$format" --jobs "$j" "$pdf" "$out"
       end=$(now)
       echo "$label $j $run $(( (end - start) / 1000000 ))" >> "$work/times"
       if [ -z "$reference" ]; then

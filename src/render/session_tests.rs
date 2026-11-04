@@ -160,3 +160,57 @@ fn a_workspace_reused_by_pages_gives_the_images_of_render() {
             );
         });
 }
+
+#[test]
+fn a_session_of_borrowed_pages_renders_as_a_session_of_its_own() {
+    // docs/adr/0015: the operators of the check are used by the rendering;
+    // pages rendered without a check, checked twice, or rendered twice give
+    // the same images, and errors are the same.
+    ["sample", "figures", "truetype", "kanikosen"]
+        .iter()
+        .for_each(|name| {
+            let data = fixture(name);
+            let doc = Document::parse(&data).unwrap();
+            let own = Session::new(&doc, 36).unwrap();
+            let pages = doc.pages().unwrap();
+            let borrowed = Session::from_pages(&doc, &pages, 36);
+            let n = own.page_count().min(12);
+            let all: Vec<usize> = (0..n).collect();
+            borrowed.check_pages(&all, jobs(3)).unwrap();
+            let got: Mutex<Vec<(usize, Canvas)>> = Mutex::new(Vec::new());
+            borrowed
+                .render_pages(&all, jobs(3), |page, canvas| {
+                    got.lock().unwrap().push((page, canvas.clone()));
+                    Ok::<(), ()>(())
+                })
+                .unwrap();
+            got.into_inner().unwrap().iter().for_each(|(page, canvas)| {
+                assert_eq!(canvas, &own.render(*page).unwrap(), "{name} page {page}");
+            });
+            // Again, now without the operators of a check, and checked twice.
+            let mut ws = super::Workspace::default();
+            (0..n).for_each(|p| {
+                assert_eq!(
+                    borrowed.render_with(&mut ws, p).unwrap(),
+                    &own.render(p).unwrap()
+                );
+                borrowed.check_with(&mut ws, p).unwrap();
+                borrowed.check_with(&mut ws, p).unwrap();
+                assert_eq!(
+                    borrowed.render_with(&mut ws, p).unwrap(),
+                    &own.render(p).unwrap()
+                );
+            });
+            assert_eq!(
+                borrowed.check_with(&mut ws, 999).map_err(|e| e.to_string()),
+                own.check(999).map_err(|e| e.to_string())
+            );
+            assert_eq!(
+                borrowed
+                    .render_with(&mut ws, 999)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+                own.render(999).map(|_| ()).map_err(|e| e.to_string())
+            );
+        });
+}

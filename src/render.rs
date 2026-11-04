@@ -3,20 +3,18 @@
 use crate::color::{self, Device, FillSpace, Separation};
 use crate::content::{self, Op, Operator, Text};
 use crate::error::{Error, Result};
-use crate::fixed::{Fixed, Matrix};
+use crate::fixed::{Fixed, Matrix, round_shift};
 use crate::font::{Font, FontCache, Segment};
 use crate::pdf::Object;
 use crate::pdf::{Dict, Document, Page};
-use crate::raster::{
-    Canvas, FillRule, Path, Point, Scratch, coverage_with, signed_area, stroke_into,
-};
+use crate::raster::{Canvas, FillRule, Path, Point, Scratch, signed_area, stroke_into};
 
 /// The fill and the lines of the box of an image or a form (docs/adr/0006).
 const BOX_FILL: [u8; 3] = [192, 192, 192];
 const BOX_LINE: [u8; 3] = [96, 96, 96];
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The largest number of pixels of a page (docs/adr/0007).
 const MAX_PIXELS: u128 = 1 << 28;
@@ -61,6 +59,56 @@ pub fn to_device(ctm: &Matrix, x: Fixed, y: Fixed) -> Result<Point> {
     let (dx, dy) = ctm.apply(x, y)?;
     let unit = |v: Fixed| i32::try_from(v.to_units(8)).map_err(|_| Error::overflow());
     Ok((unit(dx)?, unit(dy)?))
+}
+
+/// [`to_device`] of a point that [`fits_in_device`] has shown to fit: the
+/// same sum and the same two roundings, without the checks.
+pub fn to_device_fitting(m: &Matrix, x: Fixed, y: Fixed) -> Point {
+    let (x, y) = (i128::from(x.raw()), i128::from(y.raw()));
+    let map = |p: Fixed, q: Fixed, t: Fixed| {
+        let sum = i128::from(p.raw()) * x + i128::from(q.raw()) * y + (i128::from(t.raw()) << 32);
+        let raw = round_shift(sum, 32) as i64;
+        round_shift_i64(raw, 24) as i32
+    };
+    (map(m.a, m.c, m.e), map(m.b, m.d, m.f))
+}
+
+/// [`round_shift`] of an i64.
+fn round_shift_i64(v: i64, s: u32) -> i64 {
+    let q = v >> s;
+    let r = v - (q << s);
+    let half = 1i64 << (s - 1);
+    if r > half || (r == half && q & 1 == 1) {
+        q + 1
+    } else {
+        q
+    }
+}
+
+/// Whether [`to_device`] maps every point of `segments` through `m`
+/// without an overflow, shown by bounds: with X and Y the largest absolute
+/// values of the coordinates, `|a x + c y + e|` is at most `|a| X + |c| Y +
+/// |e|`, the rounding to 2^-32 adds at most one unit, and the rounding to
+/// 1/256 pixel one more, which must stay below 2^31 (docs/adr/0015). If the
+/// bounds do not show it, the points may still fit.
+pub fn fits_in_device(m: &Matrix, segments: &[Segment]) -> bool {
+    fits_with_extent(m, crate::font::extent(segments))
+}
+
+/// [`fits_in_device`] from the largest absolute values of the coordinates.
+fn fits_with_extent(m: &Matrix, (mx, my): (u64, u64)) -> bool {
+    // The bound of |p x + q y + t| in units of 2^-64.
+    let bound = |p: Fixed, q: Fixed, t: Fixed| -> Option<u128> {
+        let px = u128::from(p.raw().unsigned_abs()).checked_mul(u128::from(mx))?;
+        let qy = u128::from(q.raw().unsigned_abs()).checked_mul(u128::from(my))?;
+        px.checked_add(qy)?
+            .checked_add(u128::from(t.raw().unsigned_abs()) << 32)
+    };
+    // raw ≤ S / 2^32 + 1 and units ≤ raw / 2^24 + 1 ≤ 2^31 − 1.
+    let limit: u128 = ((((1u128 << 31) - 2) << 24) - 1) << 32;
+    [bound(m.a, m.c, m.e), bound(m.b, m.d, m.f)]
+        .iter()
+        .all(|b| b.is_some_and(|b| b <= limit))
 }
 
 /// Half the width of a stroke in device space, in units of 1/256 pixel. The
@@ -129,14 +177,8 @@ impl Renderer<'_> {
         if !self.paint {
             return;
         }
-        let cov = coverage_with(
-            path,
-            FillRule::NonZero,
-            self.canvas.width,
-            self.canvas.height,
-            &mut self.scratch,
-        );
-        self.canvas.paint(cov, rgb);
+        self.canvas
+            .fill(path, FillRule::NonZero, rgb, &mut self.scratch);
     }
 
     /// Fills the stroke of a path, `half` units on each side.
@@ -219,28 +261,35 @@ impl Renderer<'_> {
         // Without painting, the points are only checked: making the path,
         // which cannot fail, is left to the rendering (docs/adr/0014).
         let paint = self.paint;
-        font.outline_with(cid, &mut self.segments)?
-            .iter()
-            .try_for_each(|s| {
+        let (outline, extent) = font.outline_and_extent(cid, &mut self.segments)?;
+        // When the bounds show that every point fits, the check need not
+        // map them, and the rendering maps them without the checks
+        // (docs/adr/0015).
+        let fits = fits_with_extent(&m, extent);
+        if paint || !fits {
+            let point = |x: Fixed, y: Fixed| {
+                if fits {
+                    Ok(to_device_fitting(&m, x, y))
+                } else {
+                    to_device(&m, x, y)
+                }
+            };
+            outline.iter().try_for_each(|s| {
                 match *s {
                     Segment::Move(x, y) => {
-                        let p = to_device(&m, x, y)?;
+                        let p = point(x, y)?;
                         if paint {
                             path.move_to(p);
                         }
                     }
                     Segment::Line(x, y) => {
-                        let p = to_device(&m, x, y)?;
+                        let p = point(x, y)?;
                         if paint {
                             path.line_to(p);
                         }
                     }
                     Segment::Curve([x1, y1, x2, y2, x3, y3]) => {
-                        let (c1, c2, p) = (
-                            to_device(&m, x1, y1)?,
-                            to_device(&m, x2, y2)?,
-                            to_device(&m, x3, y3)?,
-                        );
+                        let (c1, c2, p) = (point(x1, y1)?, point(x2, y2)?, point(x3, y3)?);
                         if paint {
                             path.curve_to(c1, c2, p);
                         }
@@ -249,6 +298,7 @@ impl Renderer<'_> {
                 }
                 Ok::<_, Error>(())
             })?;
+        }
         // Each glyph is filled, then stroked in mode 2 (9.3.6).
         let fill = self.state.fill;
         self.fill(&path, fill);
@@ -495,21 +545,27 @@ fn interpret(
 ) -> Result<()> {
     let at_page = |e: Error| e.at_page(page.index + 1);
     let mut ops: Vec<Op> = recycle(std::mem::take(&mut ws.ops));
-    let result = interpret_ops(doc, page, dpi, paint, cache, ws, &mut ops).map_err(at_page);
+    let result = interpret_ops((doc, dpi, cache), page, paint, ws, &mut ops, true).map_err(at_page);
     ws.ops = recycle(ops);
     result
 }
 
+/// What every page of a rendering shares: the document, the resolution and
+/// the cache of the fonts.
+type Context<'d> = (&'d Document, u32, &'d FontCache);
+
 fn interpret_ops<'c>(
-    doc: &Document,
+    (doc, dpi, cache): Context,
     page: &'c Page,
-    dpi: u32,
     paint: bool,
-    cache: &FontCache,
     ws: &mut Workspace,
     ops: &mut Vec<Op<'c>>,
+    parse: bool,
 ) -> Result<()> {
-    content::parse_into(&page.contents, ops)?;
+    // Operators parsed by the check of the page are given as they are.
+    if parse {
+        content::parse_into(&page.contents, ops)?;
+    }
     content::check_resources(doc, &page.resources, ops)?;
     let (width, height) = page_size(&page.media_box, dpi)?;
     let mut canvas = std::mem::take(&mut ws.canvas);
@@ -568,9 +624,28 @@ fn interpret_ops<'c>(
 /// [`Page::index`].
 pub struct Session<'a> {
     doc: &'a Document,
-    pages: Vec<Page>,
+    pages: Pages<'a>,
     dpi: u32,
     fonts: FontCache,
+    /// The operators of each page that the check parsed, until the page is
+    /// rendered; only for pages borrowed by [`Session::from_pages`], whose
+    /// contents outlive the session (docs/adr/0015).
+    parsed: Vec<Mutex<Option<Vec<Op<'a>>>>>,
+}
+
+/// The pages of a session: its own, or borrowed.
+enum Pages<'a> {
+    Owned(Vec<Page>),
+    Borrowed(&'a [Page]),
+}
+
+impl Pages<'_> {
+    fn as_slice(&self) -> &[Page] {
+        match self {
+            Pages::Owned(v) => v,
+            Pages::Borrowed(s) => s,
+        }
+    }
 }
 
 /// An error of [`Session::render_pages`].
@@ -584,36 +659,63 @@ pub enum PageError<E> {
 
 impl<'a> Session<'a> {
     pub fn new(doc: &'a Document, dpi: u32) -> Result<Session<'a>> {
+        Session::with_jobs(doc, dpi, NonZeroUsize::MIN)
+    }
+
+    /// [`Session::new`], with the contents of the pages decoded on at most
+    /// `jobs` threads ([`Document::pages_with`]).
+    pub fn with_jobs(doc: &'a Document, dpi: u32, jobs: NonZeroUsize) -> Result<Session<'a>> {
         Ok(Session {
             doc,
-            pages: doc.pages()?,
+            pages: Pages::Owned(doc.pages_with(jobs)?),
             dpi,
             fonts: FontCache::new(),
+            parsed: Vec::new(),
         })
+    }
+
+    /// A session of pages read before ([`Document::pages_with`]), which it
+    /// borrows. The check of a page keeps the operators it parsed, and the
+    /// rendering of the page uses them instead of parsing the content again
+    /// (docs/adr/0015). The results are those of [`Session::new`].
+    pub fn from_pages(doc: &'a Document, pages: &'a [Page], dpi: u32) -> Session<'a> {
+        Session {
+            doc,
+            pages: Pages::Borrowed(pages),
+            dpi,
+            fonts: FontCache::new(),
+            parsed: pages.iter().map(|_| Mutex::new(None)).collect(),
+        }
     }
 
     /// A session of one page, which is its page 0.
     fn single(doc: &'a Document, page: &Page, dpi: u32) -> Session<'a> {
         Session {
             doc,
-            pages: vec![page.clone()],
+            pages: Pages::Owned(vec![page.clone()]),
             dpi,
             fonts: FontCache::new(),
+            parsed: Vec::new(),
         }
     }
 
     pub fn page_count(&self) -> usize {
-        self.pages.len()
+        self.pages.as_slice().len()
+    }
+
+    fn no_page(&self, page: usize) -> Error {
+        Error::new(format!(
+            "page {} does not exist: the document has {} pages",
+            page + 1,
+            self.pages.as_slice().len()
+        ))
     }
 
     fn page(&self, page: usize) -> Result<&Page> {
-        self.pages.get(page).ok_or_else(|| {
-            Error::new(format!(
-                "page {} does not exist: the document has {} pages",
-                page + 1,
-                self.pages.len()
-            ))
-        })
+        self.pages
+            .as_slice()
+            .get(page)
+            .ok_or_else(|| self.no_page(page))
     }
 
     /// Checks one page, as [`check_page`].
@@ -628,12 +730,49 @@ impl<'a> Session<'a> {
 
     /// Checks one page in the buffers of `ws`.
     pub fn check_with(&self, ws: &mut Workspace, page: usize) -> Result<()> {
-        interpret(self.doc, self.page(page)?, self.dpi, false, &self.fonts, ws)
+        let Pages::Borrowed(pages) = self.pages else {
+            return interpret(self.doc, self.page(page)?, self.dpi, false, &self.fonts, ws);
+        };
+        let p: &'a Page = pages.get(page).ok_or_else(|| self.no_page(page))?;
+        let mut ops = Vec::new();
+        interpret_ops(
+            (self.doc, self.dpi, &self.fonts),
+            p,
+            false,
+            ws,
+            &mut ops,
+            true,
+        )
+        .map_err(|e| e.at_page(p.index + 1))?;
+        let mut slot = self.parsed[page].lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(ops);
+        }
+        Ok(())
     }
 
     /// Renders one page in the buffers of `ws`; the image stays in `ws`
     /// until the next page.
     pub fn render_with<'w>(&self, ws: &'w mut Workspace, page: usize) -> Result<&'w Canvas> {
+        if let Pages::Borrowed(pages) = self.pages {
+            let p: &'a Page = pages.get(page).ok_or_else(|| self.no_page(page))?;
+            let taken = self.parsed[page]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(mut ops) = taken {
+                interpret_ops(
+                    (self.doc, self.dpi, &self.fonts),
+                    p,
+                    true,
+                    ws,
+                    &mut ops,
+                    false,
+                )
+                .map_err(|e| e.at_page(p.index + 1))?;
+                return Ok(&ws.canvas);
+            }
+        }
         interpret(self.doc, self.page(page)?, self.dpi, true, &self.fonts, ws)?;
         Ok(&ws.canvas)
     }
