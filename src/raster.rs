@@ -235,6 +235,70 @@ fn interpolate(a0: i64, a1: i64, b0: i64, b1: i64, at: i64) -> i64 {
     }
 }
 
+/// What [`interpolations`] carries from one crossing to the next: the last
+/// `at`, the Euclidean quotient and remainder of its product, and those of
+/// the step between two crossings, once known.
+#[derive(Clone, Copy)]
+struct Carried {
+    at: i64,
+    q: i64,
+    r: i64,
+    step: Option<(i64, i64)>,
+}
+
+/// `(at, b)` for each `at` of `ats`, with b as [`interpolate`] gives it. The
+/// `ats` differ by the same step, as [`crossings`] does, so when the products
+/// fit in i64, the quotient and the remainder are carried from one to the
+/// next with one division for the first and one for the step: the Euclidean
+/// quotient and remainder of n + Δ are those of n, plus those of Δ, with one
+/// carry; they are the same values, so the rounding is the same.
+fn interpolations(
+    a0: i64,
+    a1: i64,
+    b0: i64,
+    b1: i64,
+    ats: impl Iterator<Item = i64>,
+) -> impl Iterator<Item = (i64, i64)> {
+    // The products are normalized to a positive divisor, as interpolate does.
+    let (db, d) = if a1 < a0 {
+        (b0 - b1, a0 - a1)
+    } else {
+        (b1 - b0, a1 - a0)
+    };
+    // Every |at − a0| is less than d, so the products fit if db · d does.
+    let fits = db.checked_mul(d).is_some();
+    let mut carried: Option<Carried> = None;
+    ats.map(move |at| {
+        if !fits {
+            return (at, interpolate(a0, a1, b0, b1, at));
+        }
+        let (q, r, step) = match carried {
+            None => {
+                let n = db * (at - a0);
+                (n.div_euclid(d), n.rem_euclid(d), None)
+            }
+            Some(Carried {
+                at: last,
+                q,
+                r,
+                step,
+            }) => {
+                let (dq, dr) = step.unwrap_or_else(|| {
+                    let delta = db * (at - last);
+                    (delta.div_euclid(d), delta.rem_euclid(d))
+                });
+                let (q, r) = (q + dq, r + dr);
+                let (q, r) = if r >= d { (q + 1, r - d) } else { (q, r) };
+                (q, r, Some((dq, dr)))
+            }
+        };
+        carried = Some(Carried { at, q, r, step });
+        // Rounded to the nearest, ties to even, as div_round_i64.
+        let up = r > d - r || (r == d - r && q & 1 == 1);
+        (at, b0 + q + i64::from(up))
+    })
+}
+
 /// Adds a line segment to the cells through `add(row, column, cover, area)`.
 /// The segment is split at the rows, with y exact and x interpolated, and
 /// each piece at the columns, with x exact and y interpolated within the
@@ -251,8 +315,8 @@ pub(crate) fn render_line(add: &mut impl FnMut(i32, i32, i64, i64), p0: Point, p
         return;
     }
     let mut last = (x0, y0);
-    for y in crossings(y0, y1) {
-        let p = (interpolate(y0, y1, x0, x1, y), y);
+    for (y, x) in interpolations(y0, y1, x0, x1, crossings(y0, y1)) {
+        let p = (x, y);
         render_row_piece(add, last, p);
         last = p;
     }
@@ -272,8 +336,8 @@ fn render_row_piece(add: &mut impl FnMut(i32, i32, i64, i64), a: (i64, i64), b: 
     };
     let mut last = (ax, ay);
     if ax != bx {
-        for x in crossings(ax, bx) {
-            let p = (x, interpolate(ax, bx, ay, by, x).clamp(ylo, yhi));
+        for (x, y) in interpolations(ax, bx, ay, by, crossings(ax, bx)) {
+            let p = (x, y.clamp(ylo, yhi));
             cell(last, p);
             last = p;
         }
@@ -294,13 +358,17 @@ fn alpha(value: i64, rule: FillRule) -> u8 {
     ((v * 255 + FULL / 2) / FULL) as u8
 }
 
-/// The buffers of filling: the cells, the dense grid of a small path, and
-/// the pixels, kept between the fills of a page (docs/adr/0013, 0014).
+/// The buffers of filling: the cells, the dense grid of a small path (zero
+/// between fills) and the touched span of each of its rows, the pixels, and
+/// the opacities of one row, kept between the fills of a page (docs/adr/0013,
+/// 0014).
 #[derive(Clone, Debug, Default)]
 pub struct Scratch {
     cells: Vec<Cell>,
     grid: Vec<(i64, i64)>,
+    spans: Vec<(i64, i64)>,
     pixels: Vec<(usize, usize, u8)>,
+    alphas: Vec<u8>,
 }
 
 /// The largest number of cells of a dense grid (docs/adr/0014).
@@ -380,46 +448,96 @@ pub fn visit_coverage(
     scratch: &mut Scratch,
     mut visit: impl FnMut(usize, usize, u8),
 ) {
+    visit_rows(path, rule, width, height, scratch, |y, x0, alphas| {
+        alphas
+            .iter()
+            .zip(x0..)
+            .filter(|&(&a, _)| a > 0)
+            .for_each(|(&a, x)| visit(x, y, a));
+    });
+}
+
+/// Calls `visit(y, x, opacities)` with the pixels of [`coverage`] by runs of
+/// a row: the pixels from `x` have the opacities, 0 included, in order. The
+/// runs come in the order of the pixels, and no run is empty.
+fn visit_rows(
+    path: &Path,
+    rule: FillRule,
+    width: usize,
+    height: usize,
+    scratch: &mut Scratch,
+    mut visit: impl FnMut(usize, usize, &[u8]),
+) {
     let Scratch {
         cells,
         grid,
+        spans,
         pixels,
+        alphas,
     } = scratch;
     let Some((row0, row1, col0, col1)) = grid_bounds(path, width, height) else {
         return;
     };
     let cols = col1 - col0 + 1;
-    if (row1 - row0 + 1) * cols <= MAX_GRID {
-        grid.clear();
-        grid.resize(((row1 - row0 + 1) * cols) as usize, (0, 0));
+    let rows = row1 - row0 + 1;
+    if rows * cols <= MAX_GRID {
+        // The grid is zero between fills: it only grows, and the slots a
+        // fill touches are zeroed after its sweep.
+        if grid.len() < (rows * cols) as usize {
+            grid.resize((rows * cols) as usize, (0, 0));
+        }
+        // The first and the last slot of each row that a cell was added to.
+        spans.clear();
+        spans.resize(rows as usize, (i64::MAX, i64::MIN));
         let mut add = |row: i32, col: i32, cover: i64, area: i64| {
             let (row, col) = (i64::from(row), i64::from(col).max(-1));
             if (row0..=row1).contains(&row) && col <= col1 {
-                let slot = &mut grid[((row - row0) * cols + col - col0) as usize];
+                let (i, j) = ((row - row0) as usize, col - col0);
+                let slot = &mut grid[i * cols as usize + j as usize];
                 slot.0 += cover;
                 slot.1 += area;
+                let span = &mut spans[i];
+                *span = (span.0.min(j), span.1.max(j));
             }
         };
         for_each_edge(path, |a, b| render_line(&mut add, a, b));
-        // Each row is swept from the left over every slot: a slot of 0 gives
-        // the pixel of the span it is in (docs/adr/0015).
+        // Each row is swept from the left over the slots between the first
+        // and the last added to: a slot of 0 gives the pixel of the span it
+        // is in (docs/adr/0015), so the slots before the first give no
+        // pixel, and those after the last the pixel of the cover of the row,
+        // as the columns right of the grid do. The slot of column −1, if
+        // any, only adds its cover.
         let w = width as i64;
-        grid.chunks(cols as usize)
+        let left = i64::from(col0 < 0);
+        grid.chunks_mut(cols as usize)
+            .zip(spans.iter())
             .zip(row0..)
-            .for_each(|(slots, row)| {
-                let mut cover = 0i64;
-                slots.iter().zip(col0..).for_each(|(&(c, area), col)| {
-                    cover += c;
-                    if col >= 0 {
-                        let a = alpha(cover * 2 * ONE64 - area, rule);
-                        if a > 0 {
-                            visit(col as usize, row as usize, a);
-                        }
-                    }
-                });
+            .filter(|((_, span), _)| span.0 <= span.1)
+            .for_each(|((slots, &(lo, hi)), row)| {
+                let first = lo.max(left);
+                let mut cover = slots[lo as usize..first as usize]
+                    .iter()
+                    .map(|&(c, _)| c)
+                    .sum::<i64>();
+                alphas.clear();
+                if first <= hi {
+                    alphas.extend(
+                        slots[first as usize..=hi as usize]
+                            .iter()
+                            .map(|&(c, area)| {
+                                cover += c;
+                                alpha(cover * 2 * ONE64 - area, rule)
+                            }),
+                    );
+                    visit(row as usize, (col0 + first) as usize, alphas);
+                }
+                slots[lo as usize..=hi as usize].fill((0, 0));
                 let a = alpha(cover * 2 * ONE64, rule);
-                if a > 0 {
-                    ((col1 + 1).max(0)..w).for_each(|x| visit(x as usize, row as usize, a));
+                let tail = col0 + hi + 1;
+                if a > 0 && tail < w {
+                    alphas.clear();
+                    alphas.resize((w - tail) as usize, a);
+                    visit(row as usize, tail as usize, alphas);
                 }
             });
     } else {
@@ -429,7 +547,14 @@ pub fn visit_coverage(
         merge(cells);
         pixels.clear();
         sweep_into(cells, rule, width, height, pixels);
-        pixels.iter().for_each(|&(x, y, a)| visit(x, y, a));
+        pixels.chunk_by(|a, b| a.1 == b.1).for_each(|row| {
+            let (x0, y) = (row[0].0, row[0].1);
+            let x1 = row[row.len() - 1].0;
+            alphas.clear();
+            alphas.resize(x1 - x0 + 1, 0);
+            row.iter().for_each(|&(x, _, a)| alphas[x - x0] = a);
+            visit(y, x0, alphas);
+        });
     }
 }
 
@@ -637,25 +762,59 @@ impl Canvas {
     /// Composites a color over one pixel with opacity `a`.
     pub fn paint_pixel(&mut self, x: usize, y: usize, a: u8, rgb: [u8; 3]) {
         let i = (y * self.width + x) * 3;
-        let p = &mut self.pixels[i..i + 3];
-        // An opaque pixel is the color: (c · 255 + 127) / 255 = c.
-        if a == 255 {
-            p.copy_from_slice(&rgb);
-            return;
-        }
-        p[0] = composite(rgb[0], a, p[0]);
-        p[1] = composite(rgb[1], a, p[1]);
-        p[2] = composite(rgb[2], a, p[2]);
+        paint_bytes(&mut self.pixels[i..i + 3], a, rgb);
     }
 
-    /// Fills a path with a color, compositing each pixel as it is swept
-    /// ([`visit_coverage`]); the same pixels as [`Canvas::paint`] of the
-    /// coverage.
+    /// Fills a path with a color, compositing the pixels of each run of a
+    /// row as it is swept ([`visit_rows`]); the same pixels as
+    /// [`Canvas::paint`] of the coverage.
     pub fn fill(&mut self, path: &Path, rule: FillRule, rgb: [u8; 3], scratch: &mut Scratch) {
         let (width, height) = (self.width, self.height);
-        visit_coverage(path, rule, width, height, scratch, |x, y, a| {
-            self.paint_pixel(x, y, a, rgb)
+        // Black, the color of most fills, has no term of its own: the
+        // products c · a are 0.
+        let black = rgb == [0, 0, 0];
+        visit_rows(path, rule, width, height, scratch, |y, x0, alphas| {
+            let run = &mut self.pixels[(y * width + x0) * 3..][..alphas.len() * 3];
+            if black {
+                paint_run(run, alphas, paint_black);
+            } else {
+                paint_run(run, alphas, |p, a| paint_bytes(p, a, rgb));
+            }
         });
+    }
+}
+
+/// Paints the pixels of `run`, three bytes each, with the opacities.
+fn paint_run(run: &mut [u8], alphas: &[u8], paint: impl Fn(&mut [u8], u8)) {
+    run.chunks_exact_mut(3)
+        .zip(alphas)
+        .for_each(|(p, &a)| paint(p, a));
+}
+
+/// Composites a color over the three bytes of a pixel with opacity `a`. An
+/// opacity of 0 leaves the pixel: (p · 255 + 127) / 255 = p.
+fn paint_bytes(p: &mut [u8], a: u8, rgb: [u8; 3]) {
+    let [r, g, b] = p else { return };
+    // An opaque pixel is the color: (c · 255 + 127) / 255 = c.
+    match a {
+        0 => {}
+        255 => (*r, *g, *b) = (rgb[0], rgb[1], rgb[2]),
+        a => {
+            *r = composite(rgb[0], a, *r);
+            *g = composite(rgb[1], a, *g);
+            *b = composite(rgb[2], a, *b);
+        }
+    }
+}
+
+/// [`paint_bytes`] with black: `composite(0, a, p)` is `(p (255 − a) + 127) / 255`.
+fn paint_black(p: &mut [u8], a: u8) {
+    let [r, g, b] = p else { return };
+    let over = |p: u8| ((u32::from(p) * (255 - u32::from(a)) + 127) / 255) as u8;
+    match a {
+        0 => {}
+        255 => (*r, *g, *b) = (0, 0, 0),
+        _ => (*r, *g, *b) = (over(*r), over(*g), over(*b)),
     }
 }
 

@@ -256,9 +256,12 @@ const MIN_MATCH: usize = 3;
 /// No position: the entries of the chains are positions as u32 (docs/adr/0015).
 const NONE: u32 = u32::MAX;
 
+fn hash3(b0: u8, b1: u8, b2: u8) -> usize {
+    ((usize::from(b0) << 10) ^ (usize::from(b1) << 5) ^ usize::from(b2)) & ((1 << HASH_BITS) - 1)
+}
+
 fn hash(d: &[u8], i: usize) -> usize {
-    ((usize::from(d[i]) << 10) ^ (usize::from(d[i + 1]) << 5) ^ usize::from(d[i + 2]))
-        & ((1 << HASH_BITS) - 1)
+    hash3(d[i], d[i + 1], d[i + 2])
 }
 
 /// The length of the match of `data[i..i + max]` at `candidate`: 8 bytes at
@@ -273,9 +276,22 @@ fn match_length(data: &[u8], candidate: usize, i: usize, max: usize) -> usize {
         }
         len += 8;
     }
-    len + data[candidate + len..]
+    if len == max {
+        return max;
+    }
+    if max >= 8 {
+        // The last 8 bytes, over bytes already found equal.
+        let at = max - 8;
+        let diff = word(candidate + at) ^ word(i + at);
+        return if diff == 0 {
+            max
+        } else {
+            at + (diff.trailing_zeros() / 8) as usize
+        };
+    }
+    data[candidate..]
         .iter()
-        .zip(&data[i + len..i + max])
+        .zip(&data[i..i + max])
         .take_while(|(a, b)| a == b)
         .count()
 }
@@ -313,7 +329,13 @@ fn run_group(
     run_at_i: &mut Option<(u8, usize)>,
 ) -> Option<Group> {
     let b = data[c];
-    if c == 0 || data[c - 1] != b || data[c + 1] != b || data[c + 2] != b {
+    // The four bytes c − 1 ..= c + 2 are b, compared as one word (c + 2 is
+    // in the data, since c starts three bytes).
+    if c == 0 {
+        return None;
+    }
+    let four = u32::from_ne_bytes(data[c - 1..c + 3].try_into().unwrap_or([0; 4]));
+    if four != u32::from_ne_bytes([b; 4]) {
         return None;
     }
     let r = match *run_at_i {
@@ -337,8 +359,14 @@ fn run_group(
     if count < 2 {
         return None;
     }
-    // The run from c matters up to max, and when r < max, up to r + 1.
-    let a0 = run_length(&data[c..c + max.min(r + 1)], b);
+    // The run from c matters up to max, and when r < max, up to r + 1. The
+    // candidate just before i continues into the run at i: its run is r + 1
+    // (r < max here).
+    let a0 = if c + 1 == i {
+        r + 1
+    } else {
+        run_length(&data[c..c + max.min(r + 1)], b)
+    };
     let at = |k: usize| (a0 + k, i - (c - k));
     let better = |len: usize, dist: usize| (len > best_len).then_some((len, dist));
     if r == max {
@@ -394,7 +422,19 @@ fn run_length(s: &[u8], b: u8) -> usize {
         }
         n += 8;
     }
-    n + s[n..].iter().take_while(|&&v| v == b).count()
+    if n == s.len() {
+        return n;
+    }
+    if let Some(w) = s.len().checked_sub(8).and_then(|at| s.get(at..)) {
+        // The last 8 bytes, over bytes already found to be b.
+        let diff = u64::from_le_bytes(w.try_into().unwrap_or([0; 8])) ^ word;
+        return if diff == 0 {
+            s.len()
+        } else {
+            s.len() - 8 + (diff.trailing_zeros() / 8) as usize
+        };
+    }
+    s.iter().take_while(|&&v| v == b).count()
 }
 
 /// The number of bytes before `end`, down to `low`, that are `b`, 8 at a
@@ -410,11 +450,20 @@ fn run_back(data: &[u8], low: usize, end: usize, b: u8) -> usize {
         }
         n += 8;
     }
-    n + data[low..end - n]
-        .iter()
-        .rev()
-        .take_while(|&&v| v == b)
-        .count()
+    if end - n == low {
+        return n;
+    }
+    if end - low >= 8 {
+        // The 8 bytes from low, over bytes already found to be b: the
+        // equal bytes at their top, from low + 7 down.
+        let diff = u64::from_le_bytes(data[low..low + 8].try_into().unwrap_or([0; 8])) ^ word;
+        return if diff == 0 {
+            end - low
+        } else {
+            end - low - 8 + (diff.leading_zeros() / 8) as usize
+        };
+    }
+    data[low..end].iter().rev().take_while(|&&v| v == b).count()
 }
 
 /// Raw Deflate: one block with the fixed Huffman code, greedy LZ77 over a
@@ -435,23 +484,32 @@ fn deflate_with(data: &[u8], match_len: impl Fn(&[u8], usize, usize, usize) -> u
     };
     w.put(1, 1); // BFINAL
     w.put(1, 2); // fixed Huffman
-    let mut head = vec![NONE; 1 << HASH_BITS];
-    let mut prev = vec![NONE; WINDOW];
+    // Arrays of known sizes: the indices are masked to them, so they are
+    // not checked.
+    let mut head: Box<[u32; 1 << HASH_BITS]> = vec![NONE; 1 << HASH_BITS]
+        .into_boxed_slice()
+        .try_into()
+        .expect("the table has its size");
+    let mut prev: Box<[u32; WINDOW]> = vec![NONE; WINDOW]
+        .into_boxed_slice()
+        .try_into()
+        .expect("the window has its size");
     // The last position that starts three bytes, plus one.
     let last = data.len().saturating_sub(MIN_MATCH - 1);
-    let insert = |head: &mut [u32], prev: &mut [u32], i: usize| {
-        let h = hash(data, i);
-        prev[i % WINDOW] = head[h];
-        head[h] = i as u32;
-    };
     let mut i = 0;
     while i < data.len() {
         let (mut best_len, mut best_dist) = (0, 0);
+        // The hash of i, and the run of one byte at i that the search found,
+        // are used again when the positions of the match are added.
+        let h0 = if i < last { hash(data, i) } else { 0 };
+        let max = MAX_MATCH.min(data.len() - i);
+        let mut run_at_i = None;
         if i < last {
-            let max = MAX_MATCH.min(data.len() - i);
-            let mut candidate = head[hash(data, i)];
+            let mut candidate = head[h0];
             let mut tries = 0;
-            let mut run_at_i = None;
+            // The byte of i at the end of the best match, which a longer
+            // match must have at its end (docs/adr/0015).
+            let mut scan_end = 0u8;
             while candidate != NONE && i - candidate as usize <= WINDOW && tries < MAX_CHAIN {
                 let c = candidate as usize;
                 // The candidates in a run of one byte come in the chain one
@@ -468,6 +526,7 @@ fn deflate_with(data: &[u8], match_len: impl Fn(&[u8], usize, usize, usize) -> u
                             if let Some((len, dist)) = best {
                                 best_len = len;
                                 best_dist = dist;
+                                scan_end = data[(i + len).min(data.len() - 1)];
                             }
                             tries += count;
                             if tries >= MAX_CHAIN {
@@ -485,7 +544,7 @@ fn deflate_with(data: &[u8], match_len: impl Fn(&[u8], usize, usize, usize) -> u
                 // A candidate whose byte at the end of the best match differs
                 // cannot be longer, so its length is not counted
                 // (docs/adr/0015); it still counts as a try.
-                let len = if best_len > 0 && data[c + best_len] != data[i + best_len] {
+                let len = if best_len > 0 && data[c + best_len] != scan_end {
                     0
                 } else {
                     match_len(data, c, i, max)
@@ -493,6 +552,7 @@ fn deflate_with(data: &[u8], match_len: impl Fn(&[u8], usize, usize, usize) -> u
                 if len > best_len {
                     best_len = len;
                     best_dist = i - c;
+                    scan_end = data[(i + len).min(data.len() - 1)];
                     if len == max {
                         break;
                     }
@@ -508,46 +568,62 @@ fn deflate_with(data: &[u8], match_len: impl Fn(&[u8], usize, usize, usize) -> u
         }
         if best_len >= MIN_MATCH {
             length_and_distance(&mut w, best_len, best_dist);
-            // In a run of one byte b, the positions that start `b b b` share
-            // their hash, and each is chained to the one before it; the run
-            // is found 8 bytes at a time (docs/adr/0015). Elsewhere, the hash
-            // of the next position is the last one shifted by 5 bits with the
-            // new byte: the mask drops the byte that leaves.
+            // The positions of the match are added: those outside a run of
+            // one byte one by one, over the windows of three bytes, and a
+            // run at once. In a run of one byte b, the positions that start
+            // `b b b` share their hash, and each is chained to the one before
+            // it; the run is found 8 bytes at a time (docs/adr/0015).
             let end = (i + best_len).min(last);
-            let mask = (1 << HASH_BITS) - 1;
             let mut k = i;
-            let mut h = if k < end { hash(data, k) } else { 0 };
             while k < end {
+                let tail = &data[k..end + 2];
+                let mut run_at = None;
+                for (j, three) in tail.windows(3).enumerate() {
+                    let (b0, b1, b2) = (three[0], three[1], three[2]);
+                    if b0 == b1 && b1 == b2 {
+                        run_at = Some(k + j);
+                        break;
+                    }
+                    let h = hash3(b0, b1, b2);
+                    prev[(k + j) % WINDOW] = head[h];
+                    head[h] = (k + j) as u32;
+                }
+                let Some(start) = run_at else { break };
+                k = start;
                 let b = data[k];
-                let g = if data[k + 1] == b && data[k + 2] == b {
-                    // Positions k.. whose three bytes are in the run.
-                    let run = run_length(&data[k..end + 2], b);
-                    k + run - 2
-                } else {
-                    k + 1
+                // Positions k.. whose three bytes are in the run. At i, the
+                // search found the run up to max: it ends there if it is
+                // shorter, and otherwise only the bytes past max are read.
+                let n = end + 2 - k;
+                let run = match run_at_i {
+                    Some((v, r)) if k == i && v == b => {
+                        if r < max {
+                            r.min(n)
+                        } else {
+                            let m = max.min(n);
+                            m + run_length(&data[k + m..end + 2], b)
+                        }
+                    }
+                    _ => run_length(&data[k..end + 2], b),
                 };
+                let g = k + run - 2;
                 // The positions inside a run (after k) are chained to the one
                 // before them, which the search knows without reading `prev`:
                 // it takes the run at once, and reads `prev` only at the start
                 // of a run, or where the tries or the window end the search,
                 // and an entry left from 32 KiB before points outside the
                 // window. So their entries are not written (docs/adr/0015).
+                let h = hash3(b, b, b);
                 prev[k % WINDOW] = head[h];
                 head[h] = (g - 1) as u32;
-                if g < end {
-                    h = if g == k + 1 {
-                        ((h << 5) ^ usize::from(data[g + 2])) & mask
-                    } else {
-                        hash(data, g)
-                    };
-                }
                 k = g;
             }
             i += best_len;
         } else {
             literal(&mut w, u32::from(data[i]));
             if i < last {
-                insert(&mut head, &mut prev, i);
+                prev[i % WINDOW] = head[h0];
+                head[h0] = i as u32;
             }
             i += 1;
         }
@@ -660,9 +736,18 @@ macro_rules! with_filtered {
 
 /// The sum of the bytes of the row filtered by `kind`, as signed values.
 fn filter_cost(kind: u8, row: &[u8], prev: Option<&[u8]>) -> u64 {
-    let cost = |b: u8| u64::from((b as i8).unsigned_abs());
-    with_filtered!(kind, row, prev, |first, rest| first.map(cost).sum::<u64>()
-        + rest.map(cost).sum::<u64>())
+    // A row of at most 2^24 bytes sums to at most 2^31, so its sum is kept
+    // in u32, which the compiler adds up in fewer steps than u64.
+    if row.len() <= 1 << 24 {
+        let cost = |b: u8| u32::from((b as i8).unsigned_abs());
+        with_filtered!(kind, row, prev, |first, rest| u64::from(
+            first.map(cost).sum::<u32>() + rest.map(cost).sum::<u32>()
+        ))
+    } else {
+        let cost = |b: u8| u64::from((b as i8).unsigned_abs());
+        with_filtered!(kind, row, prev, |first, rest| first.map(cost).sum::<u64>()
+            + rest.map(cost).sum::<u64>())
+    }
 }
 
 /// Writes the row filtered by `kind` into `out`, of the length of the row.
@@ -746,7 +831,9 @@ pub fn encode_ppm(canvas: &Canvas) -> Vec<u8> {
 /// Writes the bytes of [`encode_ppm`] without making them in memory first
 /// (docs/adr/0013).
 pub fn write_ppm(canvas: &Canvas, out: &mut impl std::io::Write) -> std::io::Result<()> {
-    write!(out, "P6\n{} {}\n255\n", canvas.width, canvas.height)?;
+    // The header goes in one write: `write!` on an unbuffered file would
+    // make one system call per piece.
+    out.write_all(format!("P6\n{} {}\n255\n", canvas.width, canvas.height).as_bytes())?;
     out.write_all(&canvas.pixels)
 }
 

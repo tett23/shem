@@ -81,9 +81,13 @@ pub struct Op<'a> {
     pub operator: Operator<'a>,
 }
 
-/// An operand: a name as its token, or another object.
+/// An operand: a number, a name or a hexadecimal string as its token, or
+/// another object. Numbers are kept as their tokens, so that the operands
+/// of most operators are made and dropped without an [`Object`].
 #[derive(Debug)]
 enum Operand<'a> {
+    Int(i64),
+    Real(Fixed),
     Name(Cow<'a, [u8]>),
     Hex(&'a [u8]),
     Object(Object),
@@ -92,6 +96,8 @@ enum Operand<'a> {
 impl Operand<'_> {
     fn number(&self) -> Option<Fixed> {
         match self {
+            Operand::Int(i) => Fixed::from_int(*i).ok(),
+            Operand::Real(v) => Some(*v),
             Operand::Object(o) => o.as_number().and_then(|r| r.ok()),
             Operand::Name(_) | Operand::Hex(_) => None,
         }
@@ -135,7 +141,7 @@ fn operator<'a>(
     let none = |op: Operator<'a>, place| Ok(empty.then_some((op, place)));
     let name = |o: &mut Operand<'a>| match o {
         Operand::Name(n) => Some(std::mem::take(n)),
-        Operand::Object(_) | Operand::Hex(_) => None,
+        Operand::Int(_) | Operand::Real(_) | Operand::Object(_) | Operand::Hex(_) => None,
     };
     Ok(match k {
         b"q" => return none(Save, Place::Page),
@@ -167,7 +173,7 @@ fn operator<'a>(
         b"Tz" => numbers::<1>(operands).map(|[v]| (HScale(v), Place::Anywhere)),
         b"Tm" => numbers::<6>(operands).map(|v| (TextMatrix(Matrix::new(v)), Place::Text)),
         b"Tr" => match operands {
-            [Operand::Object(Object::Int(mode))] => Some((RenderMode(*mode), Place::Anywhere)),
+            [Operand::Int(mode)] => Some((RenderMode(*mode), Place::Anywhere)),
             _ => None,
         },
         b"Tj" => match operands {
@@ -305,6 +311,8 @@ pub fn parse_into<'a>(content: &'a [u8], ops: &mut Vec<Op<'a>>) -> Result<()> {
                 });
                 operands.clear();
             }
+            Token::Int(i) => operands.push(Operand::Int(i)),
+            Token::Real(v) => operands.push(Operand::Real(v)),
             Token::Name(n) => operands.push(Operand::Name(n)),
             Token::HexString(raw) => operands.push(Operand::Hex(raw)),
             token => operands.push(Operand::Object(object_from(&mut lx, at, token, false)?)),
