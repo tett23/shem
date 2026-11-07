@@ -11,6 +11,7 @@ v1 では、汎用の PDF のラスタライザを目指す（[roadmap.md](roadm
 ## 状態
 
 v0.1 の範囲（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)〜[0012](adr/0012-parallel-library-api.md)）、musl の配布物でスレッドを増やすと遅くなる問題の修正（[ADR 0013](adr/0013-fewer-allocations-for-musl-threads.md)）、スレッドごとの作業用の場所と、検査と塗りの高速化（[ADR 0014](adr/0014-thread-workspaces-and-faster-check-and-fill.md)）、PNG の書き出し、描画、Flate の展開の高速化（[ADR 0015](adr/0015-faster-png-render-and-decoding.md)）を実装し、v0.1.0-rc4 をプレリリースとして出した。
+その後、ブラウザと Deno で動かす wasm のモジュール（[ADR 0018](adr/0018-wasm-module-for-the-browser.md)）を実装した。
 版ごとの計画は [roadmap.md](roadmap.md) にある。
 
 ## コマンド
@@ -66,6 +67,31 @@ shem --help
 - `shem::raster::Canvas::fill` は、パスの覆いを `Vec` に集めずに、掃きながら画像に重ねる。結果は、`coverage` を `Canvas::paint` したものと同じである（[ADR 0015](adr/0015-faster-png-render-and-decoding.md)）。
 - `render_page` と `check_page` は、一つのページのための `Session` で描く。
 - `Session` はスレッドの間で共有でき（`Sync`）、画像（`Canvas`）はスレッドの間で受け渡せる（`Send`）。
+
+## wasm のモジュール
+
+ブラウザ（Web Worker）と Deno で動かすために、ライブラリを `wasm32-unknown-unknown` で `shem.wasm` にビルドする（[ADR 0018](adr/0018-wasm-module-for-the-browser.md)）。
+
+- import はない。`WebAssembly.instantiate(module, {})` で読み込める。エクスポートは下の関数と `memory` で、ほかに rustc のリンカーが入れる二つのグローバル（`__data_end` と `__heap_base`）がある。グローバルは受け渡しに使わない。
+- 関数は C の ABI で、引数と戻り値は 32 ビットの整数（線形メモリの中のポインタ、長さ、番号）である。
+
+| 関数 | 引数 | 戻り値 | 意味 |
+|---|---|---|---|
+| `shem_alloc` | `len` | ポインタ | `len` バイトの入力の場所を確保して、0 で埋める |
+| `shem_free` | `ptr` | なし | `shem_alloc` の場所を解放する |
+| `shem_open` | `ptr`、`len`、`dpi` | 文書の番号（1 以上）、失敗なら 0 | 入力の最初の `len` バイトを PDF として読み、ページの木と内容を読む |
+| `shem_page_count` | `doc` | ページの数、文書がなければ 0 | |
+| `shem_render` | `doc`、`page` | 成功なら 1、失敗なら 0 | 0 から数えたページを描き、文書の画像にする |
+| `shem_image_ptr`、`shem_image_width`、`shem_image_height` | `doc` | 最後に描いた画像の RGBA の先頭のポインタ、幅、高さ | 文書がなければ 0 |
+| `shem_close` | `doc` | なし | 文書と画像を解放する |
+| `shem_error_ptr`、`shem_error_len` | なし | 最後のエラーの文の先頭のポインタと、バイト数 | UTF-8 |
+
+- 入力は、`shem_alloc` の返したポインタで探す。確保していないポインタか、確保した長さを超える長さなら、`shem_open` は失敗する。`shem_open` は入力を写して持つので、開いた後に `shem_free` してよい。
+- 画像の RGBA は、描いた RGB に不透明度 255 を足したもので、行は上から、画素は左からの順に並ぶ。画像は、同じ文書の次の `shem_render` か `shem_close` まで有効である。
+- `shem_render` は、描くページだけを検査して描く。`shem render` のように、すべてのページを先に検査することはしない。フォントは、文書ごとにページの間で使い回す。
+- 失敗した関数は 0 を返し、エラーの文は次の失敗まで読める。文は、`shem render` が標準エラーに書く文の `shem: <パス>: ` の後と同じである。番号の違う文書（`no such document: N`）、範囲の外のページ（`page N does not exist: the document has M pages`）、1 以上 1200 以下でない DPI（`dpi must be an integer from 1 to 1200: N`）、確保していない入力（`no such input: P`）、長すぎる長さ（`length L is more than the input of N bytes`）も同じく失敗にする。
+- パニックはトラップ（`WebAssembly.RuntimeError`）になり、エラーとしては返せない。トラップしたインスタンスは捨てて、読み込みなおす。壊れた PDF 5,000 個でパニックしないことを、ネイティブのテストで確かめる。
+- 描く画素は、ネイティブの shem と同じである。CI の `wasm` のジョブは、Deno で `shem.wasm` を読み込み、kanikosen を 144 DPI で描いた 129 ページ（どれも 726 × 1032）の RGB が、ネイティブの PPM の画素とバイト単位で一致することを確かめる。
 
 ## 読む PDF の部分集合
 
@@ -179,6 +205,7 @@ musl のメモリ割り当ては一つの錠で守られ、割り当てのたび
 ## 配布
 
 `v` で始まるタグを push すると、Linux の x86-64 と aarch64（musl で静的にリンク）と macOS の aarch64 のアーカイブ `shem-<タグ>-<ターゲット>.tar.gz` と `SHA256SUMS` を、GitHub の Releases に置く（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)）。
+同じリリースに、wasm のモジュール `shem.wasm` も置く。名前は版によらず同じで、`SHA256SUMS` にも入る（[ADR 0018](adr/0018-wasm-module-for-the-browser.md)）。
 タグと `Cargo.toml` の版が合わなければ、リリースは失敗する。
 
 ## 文書の翻訳

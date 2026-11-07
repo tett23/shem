@@ -50,6 +50,7 @@ v0.1 の範囲を実装した。
 | `shem-<タグ>-x86_64-unknown-linux-musl.tar.gz` | Linux の x86-64（静的にリンク） |
 | `shem-<タグ>-aarch64-unknown-linux-musl.tar.gz` | Linux の aarch64（静的にリンク） |
 | `shem-<タグ>-aarch64-apple-darwin.tar.gz` | Apple Silicon の macOS |
+| `shem.wasm` | WebAssembly。ブラウザと Deno 用（どのリリースでも同じ名前） |
 
 ```sh
 tag=v0.1.0-rc4
@@ -97,6 +98,45 @@ shem diff before after diffs
 
 クレートのライブラリ（`shem::render::Session`、`shem::parallel::run`）は、shem が v0.x の間、版を上げずに変わりうる。
 
+### ブラウザで使う
+
+`shem.wasm` は、ブラウザ（Web Worker）か Deno の中で、ページを RGBA に描く。
+import はなく、`WebAssembly.instantiate(module, {})` で読み込める。
+関数は 32 ビットの整数（メモリの中のポインタ、長さ、番号）を受け取って返す。
+
+| 関数 | 引数 | 戻り値 |
+|---|---|---|
+| `shem_alloc` | `len` | PDF を書き込む、0 で埋めた `len` バイトへのポインタ |
+| `shem_free` | `ptr` | なし。`shem_alloc` で得たものを解放する |
+| `shem_open` | `ptr`、`len`、`dpi` | 文書の番号（1 から）、または 0 |
+| `shem_page_count` | `doc` | ページの数。その文書がなければ 0 |
+| `shem_render` | `doc`、`page` | 1 または 0。文書のページ `page`（0 から）を描く |
+| `shem_image_ptr`、`shem_image_width`、`shem_image_height` | `doc` | 最後に描いたページの RGBA と、その大きさ |
+| `shem_close` | `doc` | なし。文書とその画像を解放する |
+| `shem_error_ptr`、`shem_error_len` | なし | 最後のエラーの UTF-8 の文 |
+
+```js
+const { exports: shem } = await WebAssembly.instantiate(module, {});
+const ptr = shem.shem_alloc(pdf.length);
+new Uint8Array(shem.memory.buffer, ptr, pdf.length).set(pdf);
+const doc = shem.shem_open(ptr, pdf.length, 144);
+shem.shem_free(ptr);
+if (doc === 0) throw new Error(message(shem));
+for (let page = 0; page < shem.shem_page_count(doc); page++) {
+  if (shem.shem_render(doc, page) === 0) throw new Error(message(shem));
+  const width = shem.shem_image_width(doc), height = shem.shem_image_height(doc);
+  const rgba = new Uint8ClampedArray(shem.memory.buffer, shem.shem_image_ptr(doc), width * height * 4);
+  show(new ImageData(rgba.slice(), width, height));
+}
+shem.shem_close(doc);
+```
+
+ここで `message` は、`shem_error_ptr()` から `shem_error_len()` バイトを読む。
+`shem_render` は描くページだけを検査するので、ほかのページを読む前に 1 枚目を表示できる。
+エラーの文は、`shem render` が書く文と同じである。
+画像は、その文書の次の `shem_render` か `shem_close` まで有効である。
+パニックはトラップ（`WebAssembly.RuntimeError`）になる。そのときは新しいインスタンスを読み込む。
+
 ## 開発
 
 [adr-guard](https://github.com/tett23/adr-guard) の v0.10.0 以降をインストールし、クローンごとに git の hook を有効にする。
@@ -107,6 +147,14 @@ git config core.hooksPath .githooks
 ```
 
 テストは `cargo test` で実行する。
+`shem.wasm` を確かめるには、ビルドして Deno のテストを実行する。
+
+```sh
+rustup target add wasm32-unknown-unknown
+sh scripts/ci/build-wasm.sh target/shem.wasm
+SHEM_WASM=target/shem.wasm deno test --allow-read --allow-env wasm/test.ts
+```
+
 変更の進め方は [CONTRIBUTING.ja.md](CONTRIBUTING.ja.md) を参照。
 
 ## ライセンス
