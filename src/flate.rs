@@ -19,13 +19,26 @@ pub fn adler32(data: &[u8]) -> u32 {
     let (a, b) = data.chunks(5552).fold((1u32, 0u32), |(a, b), chunk| {
         let (blocks, rest) = chunk.as_chunks::<16>();
         let n = (chunk.len() - rest.len()) as u64;
+        // The blocks go in parts of at most 256, whose lane sums fit in u16
+        // (256 · 255): over a part of m blocks, A_l grows by its sum P_l,
+        // and B_l by m A_l + Q_l, with Q_l the sum of the running P_l.
         let (lanes_a, lanes_b) =
             blocks
-                .iter()
-                .fold(([0u32; 16], [0u32; 16]), |(mut la, mut lb), block| {
+                .chunks(256)
+                .fold(([0u32; 16], [0u32; 16]), |(mut la, mut lb), part| {
+                    let (pa, pb) =
+                        part.iter()
+                            .fold(([0u16; 16], [0u32; 16]), |(mut pa, mut pb), block| {
+                                (0..16).for_each(|l| {
+                                    pa[l] += u16::from(block[l]);
+                                    pb[l] += u32::from(pa[l]);
+                                });
+                                (pa, pb)
+                            });
+                    let m = part.len() as u32;
                     (0..16).for_each(|l| {
-                        la[l] += u32::from(block[l]);
-                        lb[l] += la[l];
+                        lb[l] += m * la[l] + pb[l];
+                        la[l] += u32::from(pa[l]);
                     });
                     (la, lb)
                 });

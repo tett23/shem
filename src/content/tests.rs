@@ -178,3 +178,22 @@ fn comments_and_line_ends() {
 fn operands_left_at_the_end_are_errors() {
     assert!(err("q Q 1 2").contains("operands without an operator"));
 }
+
+#[test]
+fn numbers_as_operands() {
+    // docs/adr/0019: numbers stay as tokens on the stack of operands; the
+    // values and the errors are those of objects.
+    assert_eq!(
+        ops("-0 2147483647 m -2147483647 .5 -.25 +3 re f"),
+        vec![
+            Operator::MoveTo(n("0"), n("2147483647")),
+            Operator::Rect(["-2147483647", "0.5", "-0.25", "3"].map(n)),
+            Operator::Fill,
+        ]
+    );
+    assert_eq!(err("2147483648 0 m f"), "offset 13: wrong operands of m");
+    assert_eq!(err("-2147483648 0 m f"), "offset 14: wrong operands of m");
+    assert_eq!(err("2.0 Tr"), "offset 4: wrong operands of Tr");
+    assert_eq!(err("/N Tr"), "offset 3: wrong operands of Tr");
+    assert!(parse(b"2 Tr").is_ok());
+}

@@ -103,3 +103,28 @@ fn adler32_is_the_reference() {
         assert_eq!(adler32(&data), old::adler32(&data), "{len}");
     });
 }
+
+#[test]
+fn adler32_around_its_parts_is_the_reference() {
+    // docs/adr/0019: the lanes are summed in u16 over parts of 256 blocks.
+    let mut rng = Rng(0x0019_0004);
+    let edges = [
+        0, 1, 15, 16, 17, 255, 256, 257, 4095, 4096, 4097, 5551, 5552, 5553,
+    ];
+    (0..300).for_each(|k| {
+        let len = match k % 3 {
+            0 => edges[k / 3 % edges.len()] + 16 * (k / 3 / edges.len()) * 256,
+            _ => rng.below(20_000) as usize,
+        };
+        let data: Vec<u8> = (0..len)
+            .map(|_| {
+                if k % 2 == 0 {
+                    255
+                } else {
+                    rng.below(256) as u8
+                }
+            })
+            .collect();
+        assert_eq!(adler32(&data), old::adler32(&data), "{len}");
+    });
+}

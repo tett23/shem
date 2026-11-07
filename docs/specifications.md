@@ -11,6 +11,7 @@ v1 では、汎用の PDF のラスタライザを目指す（[roadmap.md](roadm
 ## 状態
 
 v0.1 の範囲（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)〜[0012](adr/0012-parallel-library-api.md)）、musl の配布物でスレッドを増やすと遅くなる問題の修正（[ADR 0013](adr/0013-fewer-allocations-for-musl-threads.md)）、スレッドごとの作業用の場所と、検査と塗りの高速化（[ADR 0014](adr/0014-thread-workspaces-and-faster-check-and-fill.md)）、PNG の書き出し、描画、Flate の展開の高速化（[ADR 0015](adr/0015-faster-png-render-and-decoding.md)）、ブラウザと Deno で動かす wasm のモジュール（[ADR 0018](adr/0018-wasm-module-for-the-browser.md)）を実装し、v0.1.0-rc5 をプレリリースとして出した。
+その後、Deflate の探索、密な格子の掃き出し、演算子の数の高速化（[ADR 0019](adr/0019-faster-deflate-sweep-and-operands.md)）を実装した。
 版ごとの計画は [roadmap.md](roadmap.md) にある。
 
 ## コマンド
@@ -64,6 +65,7 @@ shem --help
 - `Session::with_jobs(doc, dpi, jobs)` は、ページの内容の Flate の展開を最大 `jobs` 個のスレッドで行う `Session::new` である。ページの木は一つのスレッドでたどり、エラーは番号の最も小さいページのもので、一つのスレッドと同じである。`shem::pdf::Document::pages_with(jobs)` も同じで、`shem render` は `--jobs` の値で使う（[ADR 0015](adr/0015-faster-png-render-and-decoding.md)）。
 - `Session::from_pages(doc, pages, dpi)` は、先に読んだページ（`Document::pages_with`）を借りる `Session` である。検査が通ったページの演算子を持ち、そのページの描画は内容を解析しなおさずにそれを使う。検査していないページは描画で解析する。結果は `Session::new` と同じである。`shem render` はこれを使う（[ADR 0015](adr/0015-faster-png-render-and-decoding.md)）。
 - `shem::raster::Canvas::fill` は、パスの覆いを `Vec` に集めずに、掃きながら画像に重ねる。結果は、`coverage` を `Canvas::paint` したものと同じである（[ADR 0015](adr/0015-faster-png-render-and-decoding.md)）。
+- `shem::error::Error` は、場所（ページ、オブジェクト、位置）と文を `Box` の中に持ち、`page()`、`object()`、`offset()`、`message()` で読む（[ADR 0019](adr/0019-faster-deflate-sweep-and-operands.md)）。
 - `render_page` と `check_page` は、一つのページのための `Session` で描く。
 - `Session` はスレッドの間で共有でき（`Sync`）、画像（`Canvas`）はスレッドの間で受け渡せる（`Send`）。
 
@@ -200,6 +202,14 @@ musl のメモリ割り当ては一つの錠で守られ、割り当てのたび
 - 検査では、グリフの座標の絶対値の最大と行列から、写した点が桁あふれしないことを上限で示せれば、点を写さない。描画では、示せたグリフの点を、同じ二度の丸めで、桁あふれの検査なしで写す。示せなければ、一つずつ検査して写す。
 - 線分と行や列との交点は、積が i64 に収まれば i64 で割る。密な格子は、行ごとに左から足しながら、画素を直接画像に重ねる。曲線は再帰で分割する。
 - Flate の Huffman の符号は、11 ビットまでを表で引き、それより長い符号とデータの終わりの近くでは 1 ビットずつ読む。
+
+さらに、Deflate の探索、密な格子の掃き出し、演算子の数を速くした（[ADR 0019](adr/0019-faster-deflate-sweep-and-operands.md)）。これも出力のバイト列とエラーを変えない。
+
+- Deflate は、探索で数えた今の位置の同じバイトの連続とハッシュを、探索の後の位置の追加に使う。連続と一致の長さの 8 バイトに満たない残りは、等しいとわかっているバイトに重ねた 8 バイトの語一つで比べる。
+- PNG の行のフィルタの費用は、2^24 バイト以下の行では u32 で足す。Adler-32 の 16 本の列は、256 個の塊ごとに u16 で足してから畳む。
+- 線分と行や列との交点は、積が i64 に収まれば、最初の交点だけを割り、次からは商と余りを持ち越す。値と丸めは、交点ごとに割るものと同じである。
+- 密な格子は、行ごとに、最初と最後に足された場所の間だけを掃く。その右の画素は、行の覆いの累積から一つの範囲として出す。掃いた場所は塗りの後で 0 に戻すので、格子は塗りの間で 0 である。黒の塗りは、色の項を省いた同じ式で重ねる。
+- 内容の字句の数は、オブジェクトに包まずにオペランドのスタックに置く。
 
 ## 配布
 
