@@ -375,16 +375,46 @@ fn join(v: Point, d1: (i64, i64), d2: (i64, i64), half: i64) -> Option<Subpath> 
     // where cos phi = −dot / lens.
     let within_limit = 100 * dot + 98 * lens >= 0;
     let det = i128::from(n1.0) * i128::from(n2.1) - i128::from(n1.1) * i128::from(n2.0);
-    if within_limit && det != 0 {
-        let h2 = i128::from(half) * i128::from(half);
-        let m = (
-            div_round(h2 * i128::from(n2.1 - n1.1), det) as i64,
-            div_round(h2 * i128::from(n1.0 - n2.0), det) as i64,
-        );
-        Some(positive(vec![v, a, add(v, m), b]))
-    } else {
-        Some(positive(vec![v, a, b]))
+    match (within_limit && det != 0)
+        .then(|| miter_from_directions(d1, d2, half, sign))
+        .flatten()
+    {
+        Some(m) => Some(positive(vec![v, a, add(v, m), b])),
+        None => Some(positive(vec![v, a, b])),
     }
+}
+
+/// The offset of the miter point, `half (N1 + N2) / (1 + cos θ)`, from the
+/// directions shifted under 2^28 and their lengths to 2^−32
+/// (docs/adr/0023); `None` where it does not fit, for a bevel.
+fn miter_from_directions(
+    d1: (i64, i64),
+    d2: (i64, i64),
+    half: i64,
+    sign: i64,
+) -> Option<(i64, i64)> {
+    let shifted = |d: (i64, i64)| {
+        let mut e = d;
+        while e.0.unsigned_abs().max(e.1.unsigned_abs()) >= 1 << 28 {
+            e = (e.0 >> 1, e.1 >> 1);
+        }
+        (i128::from(e.0), i128::from(e.1))
+    };
+    let (e1, e2) = (shifted(d1), shifted(d2));
+    let length = |e: (i128, i128)| isqrt(((e.0 * e.0 + e.1 * e.1) as u128) << 64) as i128;
+    let (l1, l2) = (length(e1), length(e2));
+    let sign = i128::from(sign);
+    let (p1, p2) = ((-sign * e1.1, sign * e1.0), (-sign * e2.1, sign * e2.0));
+    let den = l1 * l2 + ((e1.0 * e2.0 + e1.1 * e2.1) << 64);
+    if den <= 0 {
+        return None;
+    }
+    let den = div_round(den, 1 << 32);
+    let part = |a: i128, b: i128| {
+        let num = i128::from(half).checked_mul(a * l2 + b * l1)?;
+        i64::try_from(div_round(num, den)).ok()
+    };
+    Some((part(p1.0, p2.0)?, part(p1.1, p2.1)?))
 }
 
 /// The outline of the stroke of a path, `half` units on each side, with
