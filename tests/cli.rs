@@ -238,6 +238,52 @@ fn nothing_is_written_when_a_later_page_is_out_of_the_subset() {
 }
 
 #[test]
+fn the_messages_of_broken_contents_are_unchanged() {
+    // docs/adr/0019: the operands and the Error changed inside; the text on
+    // stderr, with the page and the offset, is what it was before. Each
+    // content is the only page of its own PDF.
+    let dir = scratch("messages");
+    [
+        ("q /A w Q", "page 1: offset 5: wrong operands of w"),
+        (
+            "q 2147483648 0 m f Q",
+            "page 1: offset 15: wrong operands of m",
+        ),
+        (
+            "q 9223372036854775808 w Q",
+            "page 1: offset 2: integer out of range: 9223372036854775808",
+        ),
+        (
+            "q 2147483647.9999999999 w Q",
+            "page 1: offset 2: number out of range: 2147483647.9999999999",
+        ),
+        ("BT 2.0 Tr ET", "page 1: offset 7: wrong operands of Tr"),
+        ("BT 1 Tr ET", "page 1: offset 5: unsupported Tr 1"),
+        ("q 1 2 Q", "page 1: offset 6: wrong operands of Q"),
+        (
+            "1 2",
+            "page 1: offset 3: operands without an operator at the end of the content",
+        ),
+        ("q (x) TJ Q", "page 1: offset 6: unsupported operator TJ"),
+        (
+            "q /F1 1 Tf Q",
+            "page 1: offset 8: no font F1 in the resources",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    .for_each(|(i, (content, message))| {
+        let input = write_pdf(&dir, &format!("bad-{i}.pdf"), &pdf(&[content], "0 0 10 10"));
+        let out = dir.join(format!("out-{i}"));
+        let (code, stdout, stderr) = shem(&["render", &input, out.to_str().unwrap()]);
+        assert_eq!(code, 1, "{content}");
+        assert_eq!(stdout, "");
+        assert_eq!(stderr, format!("shem: {input}: {message}\n"));
+        assert!(files(&out).is_empty());
+    });
+}
+
+#[test]
 fn errors_of_the_input() {
     let dir = scratch("input");
     let o = dir.join("out");

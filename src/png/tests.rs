@@ -186,6 +186,66 @@ fn ppm_files_hold_the_pixels() {
     );
 }
 
+/// A writer that keeps each write as its own chunk.
+struct Chunks(Vec<Vec<u8>>);
+
+impl std::io::Write for Chunks {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.push(buf.to_vec());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn ppm_headers_of_every_size() {
+    // docs/adr/0019: the header is the same text as before, written at
+    // once; the pixels follow it as they are.
+    [
+        (1, 1),
+        (1, 10),
+        (10, 1),
+        (10, 10),
+        (1, 1000),
+        (1000, 1),
+        (1234, 5),
+        (10000, 2),
+        (65536, 1),
+        (300, 400),
+    ]
+    .iter()
+    .for_each(|&(w, h)| {
+        let mut c = Canvas::new(w, h);
+        c.pixels = lcg(w * h * 3, 7);
+        let header = format!("P6\n{w} {h}\n255\n");
+        let bytes = encode_ppm(&c);
+        assert_eq!(bytes.len(), header.len() + w * h * 3, "{w}x{h}");
+        assert_eq!(&bytes[..header.len()], header.as_bytes(), "{w}x{h}");
+        assert_eq!(&bytes[header.len()..], &c.pixels[..], "{w}x{h}");
+        let mut chunks = Chunks(Vec::new());
+        write_ppm(&c, &mut chunks).unwrap();
+        assert_eq!(chunks.0, vec![header.into_bytes(), c.pixels.clone()]);
+    });
+}
+
+#[test]
+fn ppm_writing_reports_the_error_of_the_writer() {
+    struct Refusing;
+    impl std::io::Write for Refusing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("full"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let e = write_ppm(&Canvas::new(2, 2), &mut Refusing).unwrap_err();
+    assert_eq!(e.to_string(), "full");
+}
+
 // --- the speed-ups that keep the bytes (docs/adr/0011)
 
 /// The choice of filters before docs/adr/0011: every filtered row is made.
