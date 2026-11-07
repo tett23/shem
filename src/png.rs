@@ -736,9 +736,18 @@ macro_rules! with_filtered {
 
 /// The sum of the bytes of the row filtered by `kind`, as signed values.
 fn filter_cost(kind: u8, row: &[u8], prev: Option<&[u8]>) -> u64 {
-    let cost = |b: u8| u64::from((b as i8).unsigned_abs());
-    with_filtered!(kind, row, prev, |first, rest| first.map(cost).sum::<u64>()
-        + rest.map(cost).sum::<u64>())
+    // A row of at most 2^24 bytes sums to at most 2^31, so its sum is kept
+    // in u32, which the compiler adds up in fewer steps than u64.
+    if row.len() <= 1 << 24 {
+        let cost = |b: u8| u32::from((b as i8).unsigned_abs());
+        with_filtered!(kind, row, prev, |first, rest| u64::from(
+            first.map(cost).sum::<u32>() + rest.map(cost).sum::<u32>()
+        ))
+    } else {
+        let cost = |b: u8| u64::from((b as i8).unsigned_abs());
+        with_filtered!(kind, row, prev, |first, rest| first.map(cost).sum::<u64>()
+            + rest.map(cost).sum::<u64>())
+    }
 }
 
 /// Writes the row filtered by `kind` into `out`, of the length of the row.
