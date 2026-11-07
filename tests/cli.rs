@@ -297,6 +297,83 @@ fn errors_of_the_input() {
     assert!(stderr.contains("too large"), "{stderr}");
 }
 
+/// A PDF from object bodies, numbered from 1, with object 1 as the Root.
+fn pdf_of_objects(objects: &[String]) -> Vec<u8> {
+    let mut out = b"%PDF-1.6\n".to_vec();
+    let offsets: Vec<usize> = objects
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let at = out.len();
+            out.extend(format!("{} 0 obj\n{o}\nendobj\n", i + 1).into_bytes());
+            at
+        })
+        .collect();
+    let xref = out.len();
+    out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).into_bytes());
+    offsets
+        .iter()
+        .for_each(|o| out.extend(format!("{o:010} 00000 n \n").into_bytes()));
+    out.extend(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .into_bytes(),
+    );
+    out
+}
+
+#[test]
+fn deep_nesting_is_an_error_and_not_a_crash() {
+    // docs/adr/0021: 100,000 [ in the trailer, and in a content stream.
+    let dir = scratch("nesting");
+    let brackets = "[".repeat(100_000);
+    let mut trailer = pdf_of_objects(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [] /Count 0 >>".to_string(),
+    ]);
+    let at = trailer.windows(7).position(|w| w == b"/Root 1").unwrap();
+    trailer.splice(at..at, format!("/Deep {brackets} ").into_bytes());
+    let content = pdf(&[&brackets], "0 0 10 10");
+    for (name, data) in [("trailer.pdf", trailer), ("content.pdf", content)] {
+        let input = write_pdf(&dir, name, &data);
+        let out = dir.join("out");
+        let (code, stdout, stderr) = shem(&["render", &input, out.to_str().unwrap()]);
+        assert_eq!(code, 1, "{name}: {stderr}");
+        assert_eq!(stdout, "");
+        assert!(stderr.starts_with(&format!("shem: {input}: ")), "{stderr}");
+        assert!(
+            stderr.contains("arrays and dictionaries nested deeper than 64"),
+            "{stderr}"
+        );
+        assert!(files(&out).is_empty());
+    }
+}
+
+#[test]
+fn a_deep_page_tree_is_an_error_and_not_a_crash() {
+    // docs/adr/0021: a chain of 100,000 Pages.
+    let dir = scratch("page-tree");
+    let depth = 100_000;
+    let objects: Vec<String> = std::iter::once("<< /Type /Catalog /Pages 2 0 R >>".to_string())
+        .chain((0..depth).map(|k| format!("<< /Type /Pages /Kids [{} 0 R] /Count 1 >>", k + 3)))
+        .chain(std::iter::once(
+            "<< /Type /Page /MediaBox [0 0 10 10] >>".to_string(),
+        ))
+        .collect();
+    let input = write_pdf(&dir, "chain.pdf", &pdf_of_objects(&objects));
+    let out = dir.join("out");
+    let (code, stdout, stderr) = shem(&["render", &input, out.to_str().unwrap()]);
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        format!("shem: {input}: object 66: page tree nested deeper than 64\n")
+    );
+    assert!(files(&out).is_empty());
+}
+
 #[test]
 fn version_and_help() {
     let (code, stdout, _) = shem(&["--version"]);

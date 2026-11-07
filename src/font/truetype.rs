@@ -26,6 +26,9 @@ fn u32_at(d: &[u8], i: usize) -> Result<u32> {
 }
 
 const MAX_DEPTH: usize = 8;
+/// An outline reads at most this many glyphs, itself and the components of
+/// its composites (docs/adr/0021).
+const MAX_GLYPHS: usize = 256;
 
 pub struct TrueType {
     units_per_em: u16,
@@ -220,12 +223,20 @@ impl TrueType {
 
     /// The outline of a glyph, in font units.
     pub fn outline(&self, gid: u16) -> Result<Vec<Segment>> {
-        self.glyph(gid, 0)
+        self.glyph(gid, 0, &mut 0)
     }
 
-    fn glyph(&self, gid: u16, depth: usize) -> Result<Vec<Segment>> {
+    /// The outline of a glyph `depth` composites down, counting it in
+    /// `read`, the glyphs read for the outline so far.
+    fn glyph(&self, gid: u16, depth: usize, read: &mut usize) -> Result<Vec<Segment>> {
         if depth > MAX_DEPTH {
             return Err(Error::new("composite glyphs nested too deep"));
+        }
+        *read += 1;
+        if *read > MAX_GLYPHS {
+            return Err(Error::new(format!(
+                "composite glyph of more than {MAX_GLYPHS} glyphs"
+            )));
         }
         let g = usize::from(gid);
         if g >= self.glyph_count() {
@@ -239,11 +250,11 @@ impl TrueType {
         if contours >= 0 {
             simple(data, contours as usize)
         } else {
-            self.composite(data, depth)
+            self.composite(data, depth, read)
         }
     }
 
-    fn composite(&self, data: &[u8], depth: usize) -> Result<Vec<Segment>> {
+    fn composite(&self, data: &[u8], depth: usize, read: &mut usize) -> Result<Vec<Segment>> {
         let mut out = Vec::new();
         let mut i = 10;
         loop {
@@ -288,7 +299,7 @@ impl TrueType {
             };
             // x' = xscale x + scale10 y + dx, y' = scale01 x + yscale y + dy
             let m = Matrix::new([a, b, c, d, Fixed::from_int(dx)?, Fixed::from_int(dy)?]);
-            out.extend(transform(self.glyph(component, depth + 1)?, &m)?);
+            out.extend(transform(self.glyph(component, depth + 1, read)?, &m)?);
             if flags & 0x0020 == 0 {
                 return Ok(out);
             }

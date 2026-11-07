@@ -236,6 +236,43 @@ fn the_first_broken_pair_is_reported() {
 }
 
 #[test]
+fn a_diff_image_too_large_is_an_error_of_the_after_image() {
+    // docs/adr/0021: 17000 × 1 and 1 × 17000 would make 17000 × 17000.
+    let dir = scratch("too-large");
+    let (a, b, out) = (dir.join("a.png"), dir.join("b.png"), dir.join("out.png"));
+    write(&a, &white(17000, 1));
+    write(&b, &white(1, 17000));
+    let start = std::time::Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shem"))
+        .args(["diff", s(&a), s(&b), s(&out)])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A watchdog, so that a diff that makes the pixels does not run on.
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > std::time::Duration::from_secs(3) {
+            child.kill().unwrap();
+            panic!("shem diff did not finish in 3 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let elapsed = start.elapsed();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "shem: {}: the diff image is too large: 17000 × 17000 pixels\n",
+            s(&b)
+        )
+    );
+    assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+    assert_eq!(files(&dir), vec!["a.png", "b.png"]);
+}
+
+#[test]
 fn usage_errors() {
     let dir = scratch("usage");
     let f = dir.join("a.png");

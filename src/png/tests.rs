@@ -31,9 +31,14 @@ fn deflate_round_trips() {
         // a match of length 3 at distance 1
         b"xxxx".to_vec(),
     ];
-    cases
-        .iter()
-        .for_each(|data| assert_eq!(&inflate_zlib(&zlib(data)).unwrap(), data, "{}", data.len()));
+    cases.iter().for_each(|data| {
+        assert_eq!(
+            &inflate_zlib(&zlib(data), 1 << 26).unwrap(),
+            data,
+            "{}",
+            data.len()
+        )
+    });
 }
 
 #[test]
@@ -171,7 +176,7 @@ fn png_files_hold_the_pixels() {
             c.height
         );
         assert_eq!(&ihdr[8..], &[8, 2, 0, 0, 0]);
-        let raw = inflate_zlib(&parts[1].1).unwrap();
+        let raw = inflate_zlib(&parts[1].1, 1 << 26).unwrap();
         assert_eq!(unfilter(&raw, c.width, c.height), c.pixels);
         assert!(parts[2].1.is_empty());
     });

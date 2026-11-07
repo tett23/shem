@@ -62,8 +62,15 @@ fn corrupt(what: &str) -> Error {
     Error::new(format!("corrupt Flate data: {what}"))
 }
 
-/// Inflates a zlib stream and checks its Adler-32.
-pub fn inflate_zlib(data: &[u8]) -> Result<Vec<u8>> {
+/// The error of data that would inflate past `limit` bytes (docs/adr/0021).
+pub fn too_large(limit: usize) -> Error {
+    Error::new(format!("decoded data larger than {limit} bytes"))
+}
+
+/// Inflates a zlib stream and checks its Adler-32. The data stops with
+/// [`too_large`] where a byte would go past `limit` bytes, before that byte
+/// is written (docs/adr/0021).
+pub fn inflate_zlib(data: &[u8], limit: usize) -> Result<Vec<u8>> {
     let (cmf, flg) = match data {
         [cmf, flg, ..] => (*cmf, *flg),
         _ => return Err(corrupt("no zlib header")),
@@ -80,7 +87,7 @@ pub fn inflate_zlib(data: &[u8]) -> Result<Vec<u8>> {
         ));
     }
     let mut input = BitReader::new(&data[2..]);
-    let out = inflate(&mut input)?;
+    let out = inflate(&mut input, limit)?;
     let end = 2 + input.byte_position();
     let check = data
         .get(end..end + 4)
@@ -299,8 +306,28 @@ const CLEN_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
-fn inflate(input: &mut BitReader) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
+/// The output of at most `limit` bytes.
+struct Output {
+    data: Vec<u8>,
+    limit: usize,
+}
+
+impl Output {
+    /// Checks that `n` more bytes fit under the limit.
+    #[inline]
+    fn room_for(&self, n: usize) -> Result<()> {
+        if self.data.len() + n > self.limit {
+            return Err(too_large(self.limit));
+        }
+        Ok(())
+    }
+}
+
+fn inflate(input: &mut BitReader, limit: usize) -> Result<Vec<u8>> {
+    let mut out = Output {
+        data: Vec::new(),
+        limit,
+    };
     loop {
         let last = input.bit()? == 1;
         match input.bits(2)? {
@@ -316,12 +343,12 @@ fn inflate(input: &mut BitReader) -> Result<Vec<u8>> {
             _ => return Err(corrupt("invalid block type")),
         }
         if last {
-            return Ok(out);
+            return Ok(out.data);
         }
     }
 }
 
-fn stored(input: &mut BitReader, out: &mut Vec<u8>) -> Result<()> {
+fn stored(input: &mut BitReader, out: &mut Output) -> Result<()> {
     input.align();
     let header = input.bytes(4)?;
     let len = u16::from_le_bytes([header[0], header[1]]);
@@ -329,7 +356,8 @@ fn stored(input: &mut BitReader, out: &mut Vec<u8>) -> Result<()> {
     if len != !nlen {
         return Err(corrupt("stored block length does not match its complement"));
     }
-    out.extend_from_slice(input.bytes(usize::from(len))?);
+    out.room_for(usize::from(len))?;
+    out.data.extend_from_slice(input.bytes(usize::from(len))?);
     Ok(())
 }
 
@@ -386,11 +414,14 @@ fn dynamic_codes(input: &mut BitReader) -> Result<(Huffman, Huffman)> {
     ))
 }
 
-fn codes(input: &mut BitReader, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman) -> Result<()> {
+fn codes(input: &mut BitReader, out: &mut Output, lit: &Huffman, dist: &Huffman) -> Result<()> {
     loop {
         let sym = lit.decode(input)?;
         match sym {
-            0..=255 => out.push(sym as u8),
+            0..=255 => {
+                out.room_for(1)?;
+                out.data.push(sym as u8);
+            }
             256 => return Ok(()),
             257..=285 => {
                 let i = usize::from(sym - 257);
@@ -402,9 +433,11 @@ fn codes(input: &mut BitReader, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman
                 }
                 let distance =
                     usize::from(DIST_BASE[d]) + input.bits(u32::from(DIST_EXTRA[d]))? as usize;
-                if distance > out.len() {
+                if distance > out.data.len() {
                     return Err(corrupt("distance beyond the output"));
                 }
+                out.room_for(len)?;
+                let out = &mut out.data;
                 let start = out.len() - distance;
                 if distance >= len {
                     out.extend_from_within(start..start + len);

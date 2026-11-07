@@ -64,6 +64,8 @@ fn diff_golden() {
     let read = |name: &str| {
         decode(&std::fs::read(format!("{}/tests/golden/{name}.png", root())).unwrap()).unwrap()
     };
-    let d = shem::diff::diff(&read("sample-1"), &read("sample-marks-1")).unwrap();
+    let d = shem::diff::diff(&read("sample-1"), &read("sample-marks-1"))
+        .unwrap()
+        .unwrap();
     assert_eq!(check("diff-sample-1", &encode_png(&d.image)), None);
 }

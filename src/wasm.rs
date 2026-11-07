@@ -49,9 +49,15 @@ impl Module {
         0
     }
 
-    /// A new input of `len` bytes of 0, and its pointer.
+    /// A new input of `len` bytes of 0, and its pointer; 0 if the bytes
+    /// cannot be allocated (docs/adr/0021). The pointer of an input is
+    /// never 0.
     pub fn alloc(&mut self, len: usize) -> usize {
-        let mut buffer = vec![0u8; len];
+        let mut buffer = Vec::new();
+        if buffer.try_reserve_exact(len).is_err() {
+            return self.fail(format!("cannot allocate {len} bytes")) as usize;
+        }
+        buffer.resize(len, 0);
         let mut ptr = buffer.as_mut_ptr() as usize;
         // Inputs of no bytes share the dangling pointer of an empty Vec;
         // they get one byte each, so that every input has its own pointer.

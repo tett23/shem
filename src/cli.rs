@@ -344,7 +344,7 @@ fn diff_pair(
     ppm: bool,
 ) -> std::result::Result<Option<Difference>, DiffError> {
     let (a, b) = (read_image(before)?, read_image(after)?);
-    match crate::diff::diff(&a, &b) {
+    match crate::diff::diff(&a, &b).map_err(|e| diff_error(after, e))? {
         None => Ok(None),
         Some(d) => {
             let bytes = if ppm {

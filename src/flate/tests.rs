@@ -101,7 +101,7 @@ fn inflates_the_vectors_of_zlib() {
     ];
     cases
         .iter()
-        .for_each(|(z, raw)| assert_eq!(inflate_zlib(z).unwrap(), *raw));
+        .for_each(|(z, raw)| assert_eq!(inflate_zlib(z, 1 << 26).unwrap(), *raw));
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn length_3_and_distance_1() {
     bits.code(0, 5); // distance 1
     fixed_lit(&mut bits, 256);
     let z = zlib_wrap(bits, b"xxxx");
-    assert_eq!(inflate_zlib(&z).unwrap(), b"xxxx");
+    assert_eq!(inflate_zlib(&z, 1 << 26).unwrap(), b"xxxx");
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn length_258_and_distance_32768() {
     let mut want = first.clone();
     want.extend_from_slice(&first[..258]);
     let z = zlib_wrap(bits, &want);
-    assert_eq!(inflate_zlib(&z).unwrap(), want);
+    assert_eq!(inflate_zlib(&z, 1 << 26).unwrap(), want);
 }
 
 #[test]
@@ -150,14 +150,19 @@ fn a_copy_may_overlap_its_own_output() {
     bits.code(1, 5); // distance 2
     fixed_lit(&mut bits, 256);
     let z = zlib_wrap(bits, b"ababab");
-    assert_eq!(inflate_zlib(&z).unwrap(), b"ababab");
+    assert_eq!(inflate_zlib(&z, 1 << 26).unwrap(), b"ababab");
 }
 
 #[test]
 fn rejects_a_wrong_adler32() {
     let mut z = include_bytes!("../../tests/fixtures/flate/dynamic.zz").to_vec();
     *z.last_mut().unwrap() ^= 1;
-    assert!(inflate_zlib(&z).unwrap_err().message().contains("Adler-32"));
+    assert!(
+        inflate_zlib(&z, 1 << 26)
+            .unwrap_err()
+            .message()
+            .contains("Adler-32")
+    );
 }
 
 #[test]
@@ -165,7 +170,7 @@ fn rejects_truncated_data() {
     let z = include_bytes!("../../tests/fixtures/flate/dynamic.zz");
     [z.len() - 2, z.len() / 2, 5, 2, 1, 0]
         .iter()
-        .for_each(|&n| assert!(inflate_zlib(&z[..n]).is_err(), "{n}"));
+        .for_each(|&n| assert!(inflate_zlib(&z[..n], 1 << 26).is_err(), "{n}"));
 }
 
 #[test]
@@ -178,7 +183,7 @@ fn rejects_a_distance_beyond_the_output() {
     bits.code(1, 5); // distance 2, but only 1 byte is out
     fixed_lit(&mut bits, 256);
     let z = zlib_wrap(bits, b"");
-    assert!(inflate_zlib(&z).is_err());
+    assert!(inflate_zlib(&z, 1 << 26).is_err());
 }
 
 #[test]
@@ -188,7 +193,7 @@ fn rejects_invalid_symbols_and_block_types() {
     bits.put(1, 1);
     bits.put(1, 2);
     fixed_lit(&mut bits, 286);
-    assert!(inflate_zlib(&zlib_wrap(bits, b"")).is_err());
+    assert!(inflate_zlib(&zlib_wrap(bits, b""), 1 << 26).is_err());
     // distance code 30
     let mut bits = Bits::default();
     bits.put(1, 1);
@@ -196,12 +201,12 @@ fn rejects_invalid_symbols_and_block_types() {
     fixed_lit(&mut bits, u32::from(b'x'));
     fixed_lit(&mut bits, 257);
     bits.code(30, 5);
-    assert!(inflate_zlib(&zlib_wrap(bits, b"")).is_err());
+    assert!(inflate_zlib(&zlib_wrap(bits, b""), 1 << 26).is_err());
     // block type 3
     let mut bits = Bits::default();
     bits.put(1, 1);
     bits.put(3, 2);
-    assert!(inflate_zlib(&zlib_wrap(bits, b"")).is_err());
+    assert!(inflate_zlib(&zlib_wrap(bits, b""), 1 << 26).is_err());
 }
 
 #[test]
@@ -210,7 +215,7 @@ fn rejects_a_stored_block_with_a_wrong_nlen() {
     bits.put(1, 1);
     bits.put(0, 2);
     bits.raw(&[1, 0, 0, 0, b'x']);
-    assert!(inflate_zlib(&zlib_wrap(bits, b"x")).is_err());
+    assert!(inflate_zlib(&zlib_wrap(bits, b"x"), 1 << 26).is_err());
 }
 
 #[test]
@@ -223,7 +228,41 @@ fn rejects_an_over_subscribed_code() {
     bits.put(0, 5); // HDIST 1
     bits.put(15, 4); // HCLEN 19
     (0..19).for_each(|_| bits.put(1, 3));
-    assert!(inflate_zlib(&zlib_wrap(bits, b"")).is_err());
+    assert!(inflate_zlib(&zlib_wrap(bits, b""), 1 << 26).is_err());
+}
+
+#[test]
+fn the_output_is_bounded_by_the_limit() {
+    // docs/adr/0021: the data stops where a byte would go past the limit.
+    let raw = lcg(1000, 21);
+    let z = crate::png::zlib(&raw);
+    assert_eq!(inflate_zlib(&z, 1000).unwrap(), raw);
+    assert_eq!(
+        inflate_zlib(&z, 999).unwrap_err().message(),
+        "decoded data larger than 999 bytes"
+    );
+    // A copy that crosses the limit: x, then 3 more at distance 1.
+    let mut bits = Bits::default();
+    bits.put(1, 1);
+    bits.put(1, 2);
+    fixed_lit(&mut bits, u32::from(b'x'));
+    fixed_lit(&mut bits, 257);
+    bits.code(0, 5);
+    fixed_lit(&mut bits, 256);
+    let z = zlib_wrap(bits, b"xxxx");
+    assert_eq!(inflate_zlib(&z, 4).unwrap(), b"xxxx");
+    assert_eq!(
+        inflate_zlib(&z, 3).unwrap_err().message(),
+        "decoded data larger than 3 bytes"
+    );
+    // A stored block.
+    let stored = include_bytes!("../../tests/fixtures/flate/stored.zz");
+    let len = include_bytes!("../../tests/fixtures/flate/stored.raw").len();
+    assert_eq!(inflate_zlib(stored, len).unwrap().len(), len);
+    assert_eq!(
+        inflate_zlib(stored, len - 1).unwrap_err().message(),
+        format!("decoded data larger than {} bytes", len - 1)
+    );
 }
 
 #[test]
@@ -231,11 +270,11 @@ fn rejects_bad_zlib_headers() {
     let z = include_bytes!("../../tests/fixtures/flate/fixed.zz");
     let mut bad_check = z.to_vec();
     bad_check[1] ^= 1;
-    assert!(inflate_zlib(&bad_check).is_err());
+    assert!(inflate_zlib(&bad_check, 1 << 26).is_err());
     // a preset dictionary (FDICT)
     let fdict = [0x78, 0xBB, 0, 0, 0, 1];
-    assert!(inflate_zlib(&fdict).is_err());
+    assert!(inflate_zlib(&fdict, 1 << 26).is_err());
     // a method other than 8
     let method = [0x77, 0x85];
-    assert!(inflate_zlib(&method).is_err());
+    assert!(inflate_zlib(&method, 1 << 26).is_err());
 }

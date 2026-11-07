@@ -202,6 +202,47 @@ fn the_errors_of_a_content_are_those_of_the_command() {
 }
 
 #[test]
+fn an_input_that_cannot_be_allocated_is_an_error() {
+    // docs/adr/0021: the failure is a message, not a trap.
+    let mut m = Module::new();
+    assert_eq!(m.alloc(usize::MAX), 0);
+    assert_eq!(m.error(), format!("cannot allocate {} bytes", usize::MAX));
+    // The module still takes inputs.
+    let ptr = put(&mut m, b"%PDF-1.6\n");
+    assert_ne!(ptr, 0);
+    assert_eq!(m.open(ptr, 9, 36), 0);
+}
+
+#[test]
+fn deep_nesting_fails_with_a_message() {
+    // docs/adr/0021: 100,000 [ in the trailer, and in a content stream.
+    let brackets = "[".repeat(100_000);
+    let trailer = crate::pdf::tests::build_pdf(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [] /Count 0 >>",
+        ],
+        &format!("/Deep {brackets}"),
+    );
+    let content = one_page(&brackets);
+    [trailer, content].iter().for_each(|data| {
+        let mut m = Module::new();
+        let ptr = put(&mut m, data);
+        let doc = m.open(ptr, data.len(), 36);
+        let message = if doc == 0 {
+            m.error().to_string()
+        } else {
+            assert_eq!(m.render(doc, 0), 0);
+            m.error().to_string()
+        };
+        assert!(
+            message.contains("arrays and dictionaries nested deeper than 64"),
+            "{message}"
+        );
+    });
+}
+
+#[test]
 fn broken_pdfs_fail_without_a_panic() {
     // docs/adr/0018: in wasm a panic is a trap, so every input must give a
     // result or an error.

@@ -106,7 +106,7 @@ import はなく、`WebAssembly.instantiate(module, {})` で読み込める。
 
 | 関数 | 引数 | 戻り値 |
 |---|---|---|
-| `shem_alloc` | `len` | PDF を書き込む、0 で埋めた `len` バイトへのポインタ |
+| `shem_alloc` | `len` | PDF を書き込む、0 で埋めた `len` バイトへのポインタ、または 0 |
 | `shem_free` | `ptr` | なし。`shem_alloc` で得たものを解放する |
 | `shem_open` | `ptr`、`len`、`dpi` | 文書の番号（1 から）、または 0 |
 | `shem_page_count` | `doc` | ページの数。その文書がなければ 0 |
@@ -132,6 +132,7 @@ shem.shem_close(doc);
 ```
 
 ここで `message` は、`shem_error_ptr()` から `shem_error_len()` バイトを読む。
+`shem_alloc` は、そのバイト数を確保できなければ 0 を返す。そのときの文は `cannot allocate <len> bytes` である。
 `shem_render` は描くページだけを検査するので、ほかのページを読む前に 1 枚目を表示できる。
 エラーの文は、`shem render` が書く文と同じである。
 画像は、その文書の次の `shem_render` か `shem_close` まで有効である。

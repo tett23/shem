@@ -318,6 +318,53 @@ fn errors() {
     assert!(e(&cs(&[0, 0, RMOVETO])).contains("endchar"));
 }
 
+// --- the limit on the steps of a charstring (docs/adr/0021)
+
+#[test]
+fn subroutines_that_multiply_their_calls_are_an_error() {
+    // Local subroutine j calls j + 1 four times, and 9 is empty: 4^9 calls.
+    let call = |j: i32| {
+        let mut c = neg(j - 107);
+        c.extend(cs(&[CALLSUBR]));
+        c
+    };
+    let local: Vec<Vec<u8>> = (0..10)
+        .map(|j| {
+            if j == 9 {
+                return Vec::new();
+            }
+            let mut c: Vec<u8> = (0..4).flat_map(|_| call(j + 1)).collect();
+            c.extend(cs(&[RETURN]));
+            c
+        })
+        .collect();
+    let mut charstring = call(0);
+    charstring.extend(cs(&[ENDCHAR]));
+    let e = charstring_outline(&charstring, &[], &local).unwrap_err();
+    assert_eq!(e.message(), "charstring longer than 65536 steps");
+}
+
+#[test]
+fn a_charstring_of_65536_steps_passes_and_one_more_fails() {
+    // rmoveto and its two numbers, k dotsections (12 0) and endchar: k + 4 steps.
+    let with = |k: usize| {
+        let mut c = cs(&[0, 0, RMOVETO]);
+        (0..k).for_each(|_| c.extend(cs(&[-1200])));
+        c.extend(cs(&[ENDCHAR]));
+        c
+    };
+    assert_eq!(
+        charstring_outline(&with(65_532), &[], &[]).unwrap(),
+        vec![mv(0, 0), Segment::Close]
+    );
+    assert_eq!(
+        charstring_outline(&with(65_533), &[], &[])
+            .unwrap_err()
+            .message(),
+        "charstring longer than 65536 steps"
+    );
+}
+
 #[test]
 fn fixed_numbers_and_short_integers() {
     // 255 introduces a 16.16 number: 1.5 is 0x00018000

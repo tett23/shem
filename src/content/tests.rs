@@ -17,6 +17,17 @@ fn err(s: &str) -> String {
     parse(s.as_bytes()).unwrap_err().to_string()
 }
 
+#[test]
+fn operands_nest_to_64() {
+    // docs/adr/0021: the dictionary of BDC is the first level.
+    let content = |n: usize| format!("/Tag << /A {}1{} >> BDC EMC", "[".repeat(n), "]".repeat(n));
+    assert_eq!(ops(&content(63)).len(), 2);
+    let src = content(64);
+    let e = parse(src.as_bytes()).unwrap_err();
+    assert_eq!(e.message(), "arrays and dictionaries nested deeper than 64");
+    assert_eq!(e.offset(), Some(src.find("[[").unwrap() + 63));
+}
+
 fn m(v: [&str; 6]) -> Matrix {
     Matrix::new(v.map(n))
 }

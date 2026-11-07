@@ -166,3 +166,13 @@ Deno.test("broken PDFs fail with a message, without a trap", async () => {
   assert(ex.shem_render(9999, 0) === 0, "no such document");
   assert(error(ex) === "no such document: 9999", error(ex));
 });
+
+Deno.test("an input that cannot be allocated is 0 with a message", async () => {
+  // docs/adr/0021: the failure is a message, not a trap.
+  const ex = await instance();
+  assert(ex.shem_alloc(0xffffffff) === 0, "not 0");
+  assert(error(ex) === "cannot allocate 4294967295 bytes", error(ex));
+  const ptr = ex.shem_alloc(16);
+  assert(ptr !== 0, "a small input");
+  ex.shem_free(ptr);
+});
