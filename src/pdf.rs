@@ -108,6 +108,13 @@ pub fn parse_object_bytes(s: &[u8]) -> Result<Object> {
     parse_object(&mut Lexer::new(s, 0), true)
 }
 
+/// A stream inflates to at most this many bytes (docs/adr/0021).
+const MAX_STREAM_BYTES: usize = 1 << 26;
+
+/// The page tree has at most this many levels, the root being the first
+/// (docs/adr/0021).
+const MAX_PAGE_TREE_DEPTH: usize = 64;
+
 /// A page, with the inherited attributes applied.
 #[derive(Clone, Debug)]
 pub struct Page {
@@ -305,7 +312,9 @@ impl Document {
         };
         match filters.as_slice() {
             [] => Ok(stream.data.clone()),
-            [f] if f.as_name() == Some(b"FlateDecode") => flate::inflate_zlib(&stream.data),
+            [f] if f.as_name() == Some(b"FlateDecode") => {
+                flate::inflate_zlib(&stream.data, MAX_STREAM_BYTES)
+            }
             [f] => Err(unsupported("Filter", f)),
             many => Err(unsupported("Filter", &Object::Array(many.to_vec()))),
         }
@@ -331,6 +340,7 @@ impl Document {
         let mut leaves = Vec::new();
         self.walk(
             root,
+            1,
             Inherited::default(),
             &mut BTreeSet::new(),
             &mut leaves,
@@ -352,9 +362,11 @@ impl Document {
             .collect())
     }
 
+    /// Collects the pages under `node`, a node at level `depth` of the tree.
     fn walk(
         &self,
         node: &Object,
+        depth: usize,
         inherited: Inherited,
         visited: &mut BTreeSet<u32>,
         leaves: &mut Vec<(u32, Dict, Inherited)>,
@@ -362,6 +374,12 @@ impl Document {
         let Object::Ref(r) = node else {
             return Err(Error::new("a page tree node is not an indirect reference"));
         };
+        if depth > MAX_PAGE_TREE_DEPTH {
+            return Err(Error::new(format!(
+                "page tree nested deeper than {MAX_PAGE_TREE_DEPTH}"
+            ))
+            .at_object(r.num));
+        }
         if !visited.insert(r.num) {
             return Err(Error::new("cycle in the page tree").at_object(r.num));
         }
@@ -376,8 +394,9 @@ impl Document {
                     .get(&dict, "Kids")?
                     .and_then(|k| k.as_array().map(<[Object]>::to_vec))
                     .ok_or_else(|| Error::new("Pages without Kids").at_object(r.num))?;
-                kids.iter()
-                    .try_for_each(|kid| self.walk(kid, inherited.clone(), visited, leaves))
+                kids.iter().try_for_each(|kid| {
+                    self.walk(kid, depth + 1, inherited.clone(), visited, leaves)
+                })
             }
             Some(b"Page") => {
                 leaves.push((r.num, dict, inherited));

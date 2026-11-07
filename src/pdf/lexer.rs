@@ -379,6 +379,9 @@ fn number(word: &[u8]) -> Result<Token<'static>> {
     }
 }
 
+/// Arrays and dictionaries nest at most this deep (docs/adr/0021).
+const MAX_NESTING: usize = 64;
+
 /// Parses one object. With `refs`, `a b R` is an indirect reference.
 pub fn parse_object(lx: &mut Lexer, refs: bool) -> Result<Object> {
     let (at, token) = lx
@@ -389,6 +392,24 @@ pub fn parse_object(lx: &mut Lexer, refs: bool) -> Result<Object> {
 
 /// The object that begins with `token`, read at offset `at`.
 pub fn object_from(lx: &mut Lexer, at: usize, token: Token, refs: bool) -> Result<Object> {
+    object_nested(lx, at, token, refs, 0)
+}
+
+/// [`object_from`] inside `depth` arrays and dictionaries: one more than
+/// MAX_NESTING is an error at the `[` or `<<` that opens it.
+fn object_nested(
+    lx: &mut Lexer,
+    at: usize,
+    token: Token,
+    refs: bool,
+    depth: usize,
+) -> Result<Object> {
+    if depth >= MAX_NESTING && matches!(token, Token::ArrayOpen | Token::DictOpen) {
+        return Err(Error::new(format!(
+            "arrays and dictionaries nested deeper than {MAX_NESTING}"
+        ))
+        .at_offset(at));
+    }
     match token {
         Token::Int(i) => Ok(if refs { reference(lx, i)? } else { None }.unwrap_or(Object::Int(i))),
         Token::Real(v) => Ok(Object::Real(v)),
@@ -401,7 +422,7 @@ pub fn object_from(lx: &mut Lexer, at: usize, token: Token, refs: bool) -> Resul
                 match lx.next_token()? {
                     None => return Err(Error::new("unterminated array").at_offset(at)),
                     Some((_, Token::ArrayClose)) => return Ok(Object::Array(items)),
-                    Some((a, t)) => items.push(object_from(lx, a, t, refs)?),
+                    Some((a, t)) => items.push(object_nested(lx, a, t, refs, depth + 1)?),
                 }
             }
         }
@@ -418,7 +439,7 @@ pub fn object_from(lx: &mut Lexer, at: usize, token: Token, refs: bool) -> Resul
                         if t == Token::DictClose {
                             return Err(Error::new("dictionary key without a value").at_offset(a));
                         }
-                        dict.insert(key.into_owned(), object_from(lx, a, t, refs)?);
+                        dict.insert(key.into_owned(), object_nested(lx, a, t, refs, depth + 1)?);
                     }
                     Some((a, _)) => {
                         return Err(Error::new("dictionary key is not a name").at_offset(a));

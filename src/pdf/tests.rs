@@ -482,3 +482,143 @@ fn pages_on_threads_are_the_pages_on_one_thread() {
         );
     });
 }
+
+// --- the limits on hostile input (docs/adr/0021)
+
+/// `n` arrays nested around `1`, such as `[[1]]`.
+fn nested(n: usize) -> String {
+    format!("{}1{}", "[".repeat(n), "]".repeat(n))
+}
+
+/// The offset of the `n`th `[` after `key` in `data`.
+fn nth_bracket_after(data: &[u8], key: &str, n: usize) -> usize {
+    let at = data
+        .windows(key.len())
+        .position(|w| w == key.as_bytes())
+        .unwrap();
+    data[at..]
+        .iter()
+        .enumerate()
+        .filter(|&(_, &c)| c == b'[')
+        .nth(n - 1)
+        .map(|(i, _)| at + i)
+        .unwrap()
+}
+
+#[test]
+fn arrays_and_dictionaries_nest_to_64_in_the_trailer() {
+    let pdf = |n: usize| {
+        build_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [] /Count 0 >>",
+            ],
+            &format!("/Deep {}", nested(n)),
+        )
+    };
+    // The trailer dictionary is the first level.
+    assert!(Document::parse(&pdf(63)).unwrap().pages().is_ok());
+    let data = pdf(64);
+    let e = Document::parse(&data).err().unwrap();
+    assert_eq!(e.message(), "arrays and dictionaries nested deeper than 64");
+    // The 64th [ is the 65th opening.
+    assert_eq!(e.offset(), Some(nth_bracket_after(&data, "/Deep", 64)));
+    assert_eq!(e.page(), None);
+}
+
+#[test]
+fn arrays_and_dictionaries_nest_to_64_in_an_object() {
+    let pdf = |n: usize| {
+        build_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                &format!(
+                    "<< /Type /Pages /Kids [3 0 R] /Count 1 /Deep {} >>",
+                    nested(n)
+                ),
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>",
+            ],
+            "",
+        )
+    };
+    assert_eq!(Document::parse(&pdf(63)).unwrap().pages().unwrap().len(), 1);
+    let data = pdf(64);
+    let e = Document::parse(&data).unwrap().pages().unwrap_err();
+    assert_eq!(e.message(), "arrays and dictionaries nested deeper than 64");
+    assert_eq!(e.object(), Some(2));
+    assert_eq!(e.offset(), Some(nth_bracket_after(&data, "/Deep", 64)));
+    // A dictionary nests as an array does.
+    let dicts = |n: usize| format!("{}1{}", "<< /K ".repeat(n), " >>".repeat(n));
+    let objects = |n: usize| {
+        build_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                &format!(
+                    "<< /Type /Pages /Kids [3 0 R] /Count 1 /Deep {} >>",
+                    dicts(n)
+                ),
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>",
+            ],
+            "",
+        )
+    };
+    assert!(Document::parse(&objects(63)).unwrap().pages().is_ok());
+    let e = Document::parse(&objects(64)).unwrap().pages().unwrap_err();
+    assert_eq!(e.message(), "arrays and dictionaries nested deeper than 64");
+}
+
+/// A page tree of `depth` levels: `depth - 1` Pages in a chain, then a Page.
+pub(crate) fn chain_pdf(depth: usize) -> Vec<u8> {
+    let objects: Vec<String> = std::iter::once("<< /Type /Catalog /Pages 2 0 R >>".to_string())
+        .chain((0..depth - 1).map(|k| {
+            let media_box = if k == 0 { " /MediaBox [0 0 10 10]" } else { "" };
+            format!(
+                "<< /Type /Pages /Kids [{} 0 R] /Count 1{media_box} >>",
+                k + 3
+            )
+        }))
+        .chain(std::iter::once("<< /Type /Page >>".to_string()))
+        .collect();
+    let bodies: Vec<&str> = objects.iter().map(String::as_str).collect();
+    build_pdf(&bodies, "")
+}
+
+#[test]
+fn the_page_tree_nests_to_64() {
+    let pages = Document::parse(&chain_pdf(64)).unwrap().pages().unwrap();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].object, 65);
+    let e = Document::parse(&chain_pdf(65))
+        .unwrap()
+        .pages()
+        .unwrap_err();
+    assert_eq!(e.message(), "page tree nested deeper than 64");
+    // The root is the first level; the 65th node is object 66.
+    assert_eq!(e.object(), Some(66));
+}
+
+/// A PDF of one page whose content is `z`, Flate-compressed.
+pub(crate) fn flate_page_pdf(z: &[u8]) -> Vec<u8> {
+    let mut stream =
+        format!("<< /Length {} /Filter /FlateDecode >>\nstream\n", z.len()).into_bytes();
+    stream.extend_from_slice(z);
+    stream.extend(b"\nendstream");
+    build_pdf_bytes(
+        &[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Resources << >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream,
+        ],
+        "",
+    )
+}
+
+#[test]
+fn a_stream_that_inflates_past_64_mib_is_an_error() {
+    let data = flate_page_pdf(&crate::png::zlib(&vec![0u8; (1 << 26) + 1]));
+    let e = Document::parse(&data).unwrap().pages().unwrap_err();
+    assert_eq!(e.message(), "decoded data larger than 67108864 bytes");
+    assert_eq!(e.page(), Some(1));
+}

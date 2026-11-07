@@ -238,6 +238,10 @@ pub fn bias(count: usize) -> i64 {
 
 const MAX_STACK: usize = 48;
 const MAX_DEPTH: usize = 10;
+/// A glyph is interpreted in at most this many steps, a number or an
+/// operator each, in its charstring and the subroutines it calls
+/// (docs/adr/0021).
+const MAX_STEPS: usize = 65_536;
 
 /// The argument stack of a charstring, of at most MAX_STACK numbers, on the
 /// stack of the thread: an operator takes the arguments without
@@ -298,6 +302,8 @@ struct Interpreter<'a, 'o> {
     stems: usize,
     width_seen: bool,
     ended: bool,
+    /// The numbers and operators interpreted so far for this glyph.
+    steps: usize,
 }
 
 fn fixed16(v: i64) -> Result<Fixed> {
@@ -375,12 +381,24 @@ impl Interpreter<'_, '_> {
         ))
     }
 
+    /// Counts a number or an operator; one past MAX_STEPS is an error.
+    fn step(&mut self) -> Result<()> {
+        self.steps += 1;
+        if self.steps > MAX_STEPS {
+            return Err(Error::new(format!(
+                "charstring longer than {MAX_STEPS} steps"
+            )));
+        }
+        Ok(())
+    }
+
     fn run(&mut self, code: &[u8], depth: usize) -> Result<()> {
         if depth > MAX_DEPTH {
             return Err(Error::new("charstring subroutine calls too deep"));
         }
         let mut i = 0;
         while i < code.len() {
+            self.step()?;
             let b0 = code[i];
             let push = |v: i64, stack: &mut Stack| stack.push(v);
             match b0 {
@@ -656,6 +674,7 @@ pub fn charstring_outline_into(
         stems: 0,
         width_seen: false,
         ended: false,
+        steps: 0,
     };
     it.run(code, 0)?;
     if !it.ended {

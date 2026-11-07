@@ -1,6 +1,7 @@
 //! Diff images: the pixels that differ between two images, in colors
 //! (docs/adr/0010). Integer arithmetic only.
 
+use crate::error::{Error, Result};
 use crate::raster::Canvas;
 
 /// After is darker: ink was added.
@@ -32,10 +33,22 @@ fn pixel_of(c: &Canvas, x: usize, y: usize) -> Option<[u8; 3]> {
     (x < c.width && y < c.height).then(|| c.pixel(x, y))
 }
 
-/// The diff of two images, or `None` if they are the same.
-pub fn diff(before: &Canvas, after: &Canvas) -> Option<Diff> {
+/// The size of the diff image of two images: the larger width and the
+/// larger height, of at most 2^28 pixels together (docs/adr/0021).
+pub fn diff_size(before: &Canvas, after: &Canvas) -> Result<(usize, usize)> {
     let width = before.width.max(after.width);
     let height = before.height.max(after.height);
+    if width as u64 * height as u64 > crate::image::MAX_PIXELS {
+        return Err(Error::new(format!(
+            "the diff image is too large: {width} × {height} pixels"
+        )));
+    }
+    Ok((width, height))
+}
+
+/// The diff of two images, or `None` if they are the same.
+pub fn diff(before: &Canvas, after: &Canvas) -> Result<Option<Diff>> {
+    let (width, height) = diff_size(before, after)?;
     // Each pixel: its color and whether it differs.
     let cells: Vec<([u8; 3], bool)> = (0..height)
         .flat_map(|y| (0..width).map(move |x| (x, y)))
@@ -65,7 +78,7 @@ pub fn diff(before: &Canvas, after: &Canvas) -> Option<Diff> {
         .collect();
     let count = differing.len();
     if count == 0 {
-        return None;
+        return Ok(None);
     }
     let x0 = differing.iter().map(|p| p.0).min().unwrap_or(0);
     let x1 = differing.iter().map(|p| p.0).max().unwrap_or(0) + 1;
@@ -91,7 +104,7 @@ pub fn diff(before: &Canvas, after: &Canvas) -> Option<Diff> {
             }
         })
         .collect();
-    Some(Diff {
+    Ok(Some(Diff {
         image: Canvas {
             width,
             height,
@@ -99,7 +112,7 @@ pub fn diff(before: &Canvas, after: &Canvas) -> Option<Diff> {
         },
         count,
         bbox: (x0, y0, x1, y1),
-    })
+    }))
 }
 
 #[cfg(test)]

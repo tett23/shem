@@ -28,7 +28,7 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 fn same(data: &[u8]) {
-    let (new, before) = (inflate_zlib(data), old::inflate_zlib(data));
+    let (new, before) = (inflate_zlib(data, 1 << 26), old::inflate_zlib(data));
     match (&new, &before) {
         (Ok(a), Ok(b)) => assert_eq!(a, b),
         (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),

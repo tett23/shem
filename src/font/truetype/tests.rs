@@ -396,6 +396,41 @@ fn unsupported_composites() {
 }
 
 #[test]
+fn an_outline_reads_at_most_256_glyphs() {
+    // docs/adr/0021: glyphs 0 to 7 each refer twice to the next one, and
+    // glyph 8 is a square: 1 + 2 + ... + 256 = 511 glyphs.
+    let twice = |g: u16| {
+        composite(&[
+            component(XY | MORE, g, &[0, 0], &[]),
+            component(XY, g, &[0, 0], &[]),
+        ])
+    };
+    let glyphs: Vec<Vec<u8>> = (1..=8).map(twice).chain([unit_square()]).collect();
+    let exponential = TrueType::parse(&font(&glyphs, true, 1000)).unwrap();
+    assert_eq!(
+        exponential.outline(0).unwrap_err().message(),
+        "composite glyph of more than 256 glyphs"
+    );
+    // A composite of n squares reads n + 1 glyphs.
+    let squares = |n: usize| {
+        let components: Vec<Vec<u8>> = (0..n)
+            .map(|k| {
+                let flags = if k + 1 < n { XY | MORE } else { XY };
+                component(flags, 1, &[0, 0], &[])
+            })
+            .collect();
+        composite(&components)
+    };
+    let full = TrueType::parse(&font(&[squares(255), unit_square()], true, 1000)).unwrap();
+    assert_eq!(full.outline(0).unwrap().len(), 255 * 5);
+    let over = TrueType::parse(&font(&[squares(256), unit_square()], true, 1000)).unwrap();
+    assert_eq!(
+        over.outline(0).unwrap_err().message(),
+        "composite glyph of more than 256 glyphs"
+    );
+}
+
+#[test]
 fn loca_formats_and_empty_glyphs() {
     let short = TrueType::parse(&font(&[vec![], unit_square()], false, 2048)).unwrap();
     let long = TrueType::parse(&font(&[vec![], unit_square()], true, 2048)).unwrap();

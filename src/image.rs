@@ -3,12 +3,13 @@
 //! is an error.
 
 use crate::error::{Error, Result};
-use crate::flate::inflate_zlib;
+use crate::flate::{inflate_zlib, too_large};
 use crate::png::{crc32, paeth};
 use crate::raster::Canvas;
 
-/// The largest number of pixels of an image (docs/adr/0007).
-const MAX_PIXELS: u64 = 1 << 28;
+/// The largest number of pixels of an image (docs/adr/0007), and of a diff
+/// image (docs/adr/0021).
+pub(crate) const MAX_PIXELS: u64 = 1 << 28;
 
 fn bad(what: &str) -> Error {
     Error::new(format!("malformed image: {what}"))
@@ -90,10 +91,19 @@ fn decode_png(data: &[u8]) -> Result<Canvas> {
         }
     }
     let (width, height) = header.ok_or_else(|| bad("no IHDR"))?;
-    let raw = inflate_zlib(&idat)?;
     let stride = width * 3;
-    if raw.len() != height * (stride + 1) {
-        return Err(bad("the image data does not have the size of the image"));
+    // The data inflates to at most the size of the image (docs/adr/0021).
+    let size = height * (stride + 1);
+    let wrong_size = || bad("the image data does not have the size of the image");
+    let raw = inflate_zlib(&idat, size).map_err(|e| {
+        if e == too_large(size) {
+            wrong_size()
+        } else {
+            e
+        }
+    })?;
+    if raw.len() != size {
+        return Err(wrong_size());
     }
     let mut pixels: Vec<u8> = Vec::with_capacity(stride * height);
     raw.chunks(stride + 1)

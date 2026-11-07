@@ -106,7 +106,7 @@ Its functions take and return 32-bit integers: pointers into its memory, lengths
 
 | Function | Arguments | Returns |
 |---|---|---|
-| `shem_alloc` | `len` | a pointer to `len` bytes of 0, to write the PDF to |
+| `shem_alloc` | `len` | a pointer to `len` bytes of 0, to write the PDF to, or 0 |
 | `shem_free` | `ptr` | nothing; frees what `shem_alloc` gave |
 | `shem_open` | `ptr`, `len`, `dpi` | the number of a document (from 1), or 0 |
 | `shem_page_count` | `doc` | the number of pages, or 0 for no such document |
@@ -132,6 +132,7 @@ shem.shem_close(doc);
 ```
 
 Here `message` reads `shem_error_len()` bytes at `shem_error_ptr()`.
+`shem_alloc` returns 0 when the bytes cannot be allocated; the message is then `cannot allocate <len> bytes`.
 `shem_render` checks only the page it renders, so the first page can be shown before the others are read.
 The messages of errors are those that `shem render` prints.
 The image stays valid until the next `shem_render` or `shem_close` of the document.

@@ -18,7 +18,11 @@ fn set(c: &mut Canvas, x: usize, y: usize, rgb: [u8; 3]) {
 
 #[test]
 fn the_same_images_have_no_diff() {
-    assert!(diff(&solid(5, 4, WHITE), &solid(5, 4, WHITE)).is_none());
+    assert!(
+        diff(&solid(5, 4, WHITE), &solid(5, 4, WHITE))
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -26,7 +30,7 @@ fn a_darker_pixel_is_red_and_framed() {
     let before = solid(20, 20, WHITE);
     let mut after = before.clone();
     set(&mut after, 10, 10, [0, 0, 0]);
-    let d = diff(&before, &after).unwrap();
+    let d = diff(&before, &after).unwrap().unwrap();
     assert_eq!((d.count, d.bbox), (1, (10, 10, 11, 11)));
     assert_eq!(d.image.pixel(10, 10), ADDED);
     // the same pixels are the faded after image: white stays white
@@ -46,7 +50,7 @@ fn a_lighter_pixel_is_blue() {
     let before = solid(5, 5, [0, 0, 0]);
     let mut after = before.clone();
     set(&mut after, 2, 2, WHITE);
-    let d = diff(&before, &after).unwrap();
+    let d = diff(&before, &after).unwrap().unwrap();
     assert_eq!(d.image.pixel(2, 2), REMOVED);
     // (0, 0) is on the frame; (1, 1), inside the frame, is black faded to 255 - 255 / 4 = 192
     assert_eq!(d.image.pixel(0, 0), FRAME);
@@ -64,7 +68,10 @@ fn a_change_of_color_with_the_same_luminance_is_purple() {
     let before = solid(3, 3, gray);
     let mut after = before.clone();
     set(&mut after, 1, 1, other);
-    assert_eq!(diff(&before, &after).unwrap().image.pixel(1, 1), CHANGED);
+    assert_eq!(
+        diff(&before, &after).unwrap().unwrap().image.pixel(1, 1),
+        CHANGED
+    );
 }
 
 #[test]
@@ -72,7 +79,7 @@ fn faded_pixels_follow_the_formula() {
     let before = solid(12, 12, [100, 150, 200]);
     let mut after = before.clone();
     set(&mut after, 11, 11, WHITE);
-    let d = diff(&before, &after).unwrap();
+    let d = diff(&before, &after).unwrap().unwrap();
     let l = luminance([100, 150, 200]);
     let v = 255 - (255 - l) / 4;
     assert_eq!(d.image.pixel(0, 0), [v, v, v]);
@@ -82,7 +89,7 @@ fn faded_pixels_follow_the_formula() {
 fn images_of_different_sizes() {
     let before = solid(4, 3, WHITE);
     let after = solid(6, 3, WHITE);
-    let d = diff(&before, &after).unwrap();
+    let d = diff(&before, &after).unwrap().unwrap();
     assert_eq!((d.image.width, d.image.height), (6, 3));
     assert_eq!(d.count, 6);
     assert_eq!(d.bbox, (4, 0, 6, 3));
@@ -97,12 +104,28 @@ fn the_frame_is_cut_at_the_edges_and_spares_the_differences() {
     let mut after = before.clone();
     set(&mut after, 0, 0, [0, 0, 0]);
     set(&mut after, 3, 3, [0, 0, 0]);
-    let d = diff(&before, &after).unwrap();
+    let d = diff(&before, &after).unwrap().unwrap();
     assert_eq!(d.bbox, (0, 0, 4, 4));
     assert_eq!(d.image.pixel(0, 0), ADDED);
     assert_eq!(d.image.pixel(3, 3), ADDED);
     // the frame is outside the image, so no pixel is orange
     assert!(d.image.pixels.chunks(3).all(|p| p != FRAME));
+}
+
+#[test]
+fn the_diff_image_has_at_most_2_28_pixels() {
+    // docs/adr/0021: the size is checked before any pixel is made.
+    let wide = solid(16384, 1, WHITE);
+    assert_eq!(
+        diff_size(&wide, &solid(1, 16384, WHITE)).unwrap(),
+        (16384, 16384)
+    );
+    assert_eq!(
+        diff_size(&wide, &solid(1, 16385, WHITE))
+            .unwrap_err()
+            .message(),
+        "the diff image is too large: 16384 × 16385 pixels"
+    );
 }
 
 #[test]
