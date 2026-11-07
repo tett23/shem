@@ -739,10 +739,25 @@ fn join(out: &mut Path, v: Point, d1: (i64, i64), d2: (i64, i64), half: i64) {
         return;
     }
     let sign = if cross > 0 { -1 } else { 1 };
+    let a = add(v, normal(d1, half * sign));
+    let b = add(v, normal(d2, half * sign));
+    match miter(d1, d2, half) {
+        Some(m) => out.push_positive(&[v, a, add(v, m), b]),
+        None => out.push_positive(&[v, a, b]),
+    }
+}
+
+/// The offset of the miter point of the join between the directions `d1`
+/// and `d2` from its vertex, or `None` for a bevel: when the directions
+/// are parallel or the miter ratio is past the limit of 10.
+fn miter(d1: (i64, i64), d2: (i64, i64), half: i64) -> Option<(i64, i64)> {
+    let cross = i128::from(d1.0) * i128::from(d2.1) - i128::from(d1.1) * i128::from(d2.0);
+    if cross == 0 {
+        return None;
+    }
+    let sign = if cross > 0 { -1 } else { 1 };
     let n1 = normal(d1, half * sign);
     let n2 = normal(d2, half * sign);
-    let a = add(v, n1);
-    let b = add(v, n2);
     let dot = i128::from(d1.0) * i128::from(d2.0) + i128::from(d1.1) * i128::from(d2.1);
     let len2 = |d: (i64, i64)| {
         (i128::from(d.0) * i128::from(d.0) + i128::from(d.1) * i128::from(d.1)) as u128
@@ -752,16 +767,34 @@ fn join(out: &mut Path, v: Point, d1: (i64, i64), d2: (i64, i64), half: i64) {
     // where cos phi = −dot / lens.
     let within_limit = 100 * dot + 98 * lens >= 0;
     let det = i128::from(n1.0) * i128::from(n2.1) - i128::from(n1.1) * i128::from(n2.0);
-    if within_limit && det != 0 {
-        let h2 = i128::from(half) * i128::from(half);
-        let m = (
-            div_round(h2 * i128::from(n2.1 - n1.1), det) as i64,
-            div_round(h2 * i128::from(n1.0 - n2.0), det) as i64,
-        );
-        out.push_positive(&[v, a, add(v, m), b]);
-    } else {
-        out.push_positive(&[v, a, b]);
+    if !within_limit || det == 0 {
+        return None;
     }
+    // m = half (N1 + N2) / (1 + cos θ), from the directions shifted under
+    // 2^28 and their lengths to 2^−32 (docs/adr/0023).
+    let (e1, e2) = (under_2_28(d1), under_2_28(d2));
+    let length = |e: (i128, i128)| isqrt(((e.0 * e.0 + e.1 * e.1) as u128) << 64) as i128;
+    let (l1, l2) = (length(e1), length(e2));
+    let sign = i128::from(sign);
+    let (p1, p2) = ((-sign * e1.1, sign * e1.0), (-sign * e2.1, sign * e2.0));
+    let den = l1 * l2 + ((e1.0 * e2.0 + e1.1 * e2.1) << 64);
+    if den <= 0 {
+        return None;
+    }
+    let den = div_round(den, 1 << 32);
+    let half = i128::from(half);
+    let part = |a: i128, b: i128| -> Option<i64> {
+        let num = half.checked_mul(a * l2 + b * l1)?;
+        i64::try_from(div_round(num, den)).ok()
+    };
+    Some((part(p1.0, p2.0)?, part(p1.1, p2.1)?))
+}
+
+/// A direction shifted right until its components are under 2^28.
+fn under_2_28(d: (i64, i64)) -> (i128, i128) {
+    let bits = 64 - (d.0.unsigned_abs() | d.1.unsigned_abs()).leading_zeros();
+    let shift = bits.saturating_sub(28);
+    (i128::from(d.0 >> shift), i128::from(d.1 >> shift))
 }
 
 /// The outline of the stroke of a path, `half` units on each side, with
@@ -915,3 +948,6 @@ mod tests;
 
 #[cfg(test)]
 mod reference_tests;
+
+#[cfg(test)]
+mod miter_tests;
