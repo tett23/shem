@@ -127,4 +127,57 @@ mod tests {
         );
         assert_eq!(e.message(), "bad");
     }
+
+    #[test]
+    fn every_combination_of_places_reads_and_prints_as_before() {
+        // docs/adr/0019: the accessors read the fields behind the Box, and
+        // Display lists the known places in the order page, object, offset,
+        // whatever the order they were given in.
+        [None, Some(3usize)].iter().for_each(|&page| {
+            [None, Some(12u32)].iter().for_each(|&object| {
+                [None, Some(7usize)].iter().for_each(|&offset| {
+                    let e = Error::new("bad");
+                    let e = page.into_iter().fold(e, Error::at_page);
+                    let e = object.into_iter().fold(e, Error::at_object);
+                    let e = offset.into_iter().fold(e, Error::at_offset);
+                    let reversed = Error::new("bad");
+                    let reversed = offset.into_iter().fold(reversed, Error::at_offset);
+                    let reversed = object.into_iter().fold(reversed, Error::at_object);
+                    let reversed = page.into_iter().fold(reversed, Error::at_page);
+                    let expected: String = [
+                        page.map(|p| format!("page {p}: ")),
+                        object.map(|o| format!("object {o}: ")),
+                        offset.map(|o| format!("offset {o}: ")),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .chain(std::iter::once("bad".to_string()))
+                    .collect();
+                    assert_eq!(e.to_string(), expected);
+                    assert_eq!(reversed, e);
+                    assert_eq!((e.page(), e.object(), e.offset()), (page, object, offset));
+                    assert_eq!(e.message(), "bad");
+                    assert_eq!(e.clone(), e);
+                    // A place that is known is kept; one that is not is taken.
+                    let again = e.clone().at_page(99).at_object(99).at_offset(99);
+                    assert_eq!(
+                        (again.page(), again.object(), again.offset()),
+                        (page.or(Some(99)), object.or(Some(99)), offset.or(Some(99)))
+                    );
+                    assert!(format!("{e:?}").contains("bad"));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn messages_and_the_error_trait() {
+        assert_eq!(Error::overflow().to_string(), "arithmetic overflow");
+        assert_eq!(Error::new(String::from("owned")).message(), "owned");
+        assert_eq!(Error::new("").at_offset(0).to_string(), "offset 0: ");
+        let e: Box<dyn std::error::Error> = Box::new(Error::new("boxed").at_page(1));
+        assert_eq!(e.to_string(), "page 1: boxed");
+        assert_ne!(Error::new("a"), Error::new("b"));
+        assert_ne!(Error::new("a"), Error::new("a").at_page(1));
+    }
 }

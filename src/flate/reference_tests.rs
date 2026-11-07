@@ -128,3 +128,27 @@ fn adler32_around_its_parts_is_the_reference() {
         assert_eq!(adler32(&data), old::adler32(&data), "{len}");
     });
 }
+
+#[test]
+fn adler32_at_the_edges_of_its_chunks_and_parts_is_the_reference() {
+    // docs/adr/0019: the 16 lanes are summed in u16 over parts of 256 blocks
+    // (4096 bytes), inside chunks of 5552 bytes; a part of 255s sums to
+    // 65280 in a lane, the most u16 is asked to hold. Lengths at the edges
+    // of the parts and the chunks, over up to four chunks, of 255s and of
+    // random bytes.
+    let mut rng = Rng(0x0019_000b);
+    let edges = [
+        0, 1, 15, 16, 17, 255, 256, 257, 4095, 4096, 4097, 4111, 4112, 4113, 5551,
+    ];
+    (0..4usize).for_each(|m| {
+        edges.iter().for_each(|&e| {
+            let len = 5552 * m + e;
+            [true, false].iter().for_each(|&flat| {
+                let data: Vec<u8> = (0..len)
+                    .map(|_| if flat { 255 } else { rng.below(256) as u8 })
+                    .collect();
+                assert_eq!(adler32(&data), old::adler32(&data), "{len} {flat}");
+            });
+        });
+    });
+}

@@ -197,3 +197,391 @@ fn numbers_as_operands() {
     assert_eq!(err("/N Tr"), "offset 3: wrong operands of Tr");
     assert!(parse(b"2 Tr").is_ok());
 }
+
+// --- the operands kept as tokens (docs/adr/0019)
+
+/// The operators in a compact form, with the numbers as `Fixed` displays
+/// them: the shape of what reached each operator, not the exact value,
+/// which the tests of the lexer and of `Fixed::parse` cover.
+fn show(ops: &[Op]) -> String {
+    use Operator::*;
+    let nums = |v: &[Fixed]| {
+        v.iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let name = |n: &[u8]| format!("/{}", String::from_utf8_lossy(n));
+    let matrix = |m: &Matrix| nums(&[m.a, m.b, m.c, m.d, m.e, m.f]);
+    let show_op = |op: &Operator| match op {
+        Save => "q".into(),
+        Restore => "Q".into(),
+        Concat(m) => format!("cm({})", matrix(m)),
+        LineWidth(v) => format!("w({v})"),
+        MoveTo(x, y) => format!("m({x},{y})"),
+        CurveTo(v) => format!("c({})", nums(v)),
+        ClosePath => "h".into(),
+        Rect(v) => format!("re({})", nums(v)),
+        Fill => "f".into(),
+        FillCmyk(v) => format!("k({})", nums(v)),
+        StrokeCmyk(v) => format!("K({})", nums(v)),
+        FillSpace(n) => format!("cs({})", name(n)),
+        FillColor(v) => format!("scn({v})"),
+        BeginText => "BT".into(),
+        EndText => "ET".into(),
+        Font(n, s) => format!("Tf({},{s})", name(n)),
+        HScale(v) => format!("Tz({v})"),
+        TextMatrix(m) => format!("Tm({})", matrix(m)),
+        RenderMode(m) => format!("Tr({m})"),
+        ShowText(t) => format!(
+            "Tj(<{}>)",
+            t.bytes().map(|b| format!("{b:02x}")).collect::<String>()
+        ),
+        Do(n) => format!("Do({})", name(n)),
+        BeginMarked => "BDC".into(),
+        EndMarked => "EMC".into(),
+    };
+    ops.iter()
+        .map(|op| show_op(&op.operator))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn result(s: &str) -> String {
+    match parse(s.as_bytes()) {
+        Ok(ops) => show(&ops),
+        Err(e) => format!("error: {e}"),
+    }
+}
+
+/// Numbers of every shape as the operands of every operator of the table,
+/// and the operands that are not numbers where numbers are expected, with
+/// the results that the parser gave before docs/adr/0019 (f60c40c): the
+/// operator or the message of the error, with its offset.
+///
+/// The cases are those of a differential run of the parsers of f60c40c
+/// and of docs/adr/0019 on 1,200,000 generated content streams (three
+/// kinds: random tokens, operators with mostly fitting operands, and the
+/// whole table with numbers of every shape), which gave the same
+/// operators, offsets and messages for every case. The expected values
+/// here were written by the parser of f60c40c.
+const CASES_OF_OPERANDS: &[(&str, &str)] = &[
+    ("-0 +3 m .5 5. -.25 007 re f", "m(0,3) re(0.5,5,-0.25,7) f"),
+    (
+        "2.0 1.5 0.1 9.2126 k 100 50 2147483647 -2147483647 K",
+        "k(2,1.5,0.1,9.212599) K(100,50,2147483647,-2147483647)",
+    ),
+    ("2147483647.5 w", "w(2147483647.5)"),
+    ("-2147483647.5 w", "error: offset 14: wrong operands of w"),
+    (
+        "2147483647.5 w -2147483647.5 w",
+        "error: offset 29: wrong operands of w",
+    ),
+    ("0.00000000023283064365386962890625 w", "w(0)"),
+    ("0.000000000116415321826934814453125 w", "w(0)"),
+    ("00000000000000000000001 w", "w(1)"),
+    ("1.00000000000000000000001 w", "w(1)"),
+    ("-00.000 w", "w(0)"),
+    ("-.0 w", "w(0)"),
+    ("-1 w", "error: offset 3: wrong operands of w"),
+    ("-0 w", "w(0)"),
+    ("+0.0 w", "w(0)"),
+    ("2147483648 0 m f", "error: offset 13: wrong operands of m"),
+    ("-2147483648 0 m f", "error: offset 14: wrong operands of m"),
+    ("0 2147483648 m f", "error: offset 13: wrong operands of m"),
+    (
+        "2147483647.9999999999 w",
+        "error: offset 0: number out of range: 2147483647.9999999999",
+    ),
+    (
+        "-2147483647.9999999999 w",
+        "error: offset 0: number out of range: -2147483647.9999999999",
+    ),
+    (
+        "9223372036854775807 w",
+        "error: offset 20: wrong operands of w",
+    ),
+    (
+        "9223372036854775808 w",
+        "error: offset 0: integer out of range: 9223372036854775808",
+    ),
+    (
+        "-9223372036854775808 w",
+        "error: offset 21: wrong operands of w",
+    ),
+    (
+        "-9223372036854775809 w",
+        "error: offset 0: integer out of range: -9223372036854775809",
+    ),
+    (
+        "123456789012345678901234567890.5 w",
+        "error: offset 0: number out of range: 123456789012345678901234567890.5",
+    ),
+    ("1e5 w", "error: offset 0: unsupported operator 1e5"),
+    ("1.2.3 w", "error: offset 0: unsupported operator 1.2.3"),
+    ("+ w", "error: offset 0: unsupported operator +"),
+    ("- w", "error: offset 0: unsupported operator -"),
+    (". w", "error: offset 0: unsupported operator ."),
+    ("--1 w", "error: offset 0: unsupported operator --1"),
+    ("+-1 w", "error: offset 0: unsupported operator +-1"),
+    ("1-2 w", "error: offset 0: unsupported operator 1-2"),
+    ("1 0 R", "error: offset 4: unsupported operator R"),
+    ("1 cs", "error: offset 2: wrong operands of cs"),
+    ("1.0 cs", "error: offset 4: wrong operands of cs"),
+    ("1 Do", "error: offset 2: wrong operands of Do"),
+    ("2.5 Do", "error: offset 4: wrong operands of Do"),
+    ("BT 1 Tj ET", "error: offset 5: wrong operands of Tj"),
+    ("BT 1.5 Tj ET", "error: offset 7: wrong operands of Tj"),
+    ("BT /F1 Tj ET", "error: offset 7: wrong operands of Tj"),
+    ("/F1 /F2 Tf", "error: offset 8: wrong operands of Tf"),
+    ("1 2 Tf", "error: offset 4: wrong operands of Tf"),
+    ("/F1 (1) Tf", "error: offset 8: wrong operands of Tf"),
+    ("/F1 <01> Tf", "error: offset 9: wrong operands of Tf"),
+    ("/F1 [1] Tf", "error: offset 8: wrong operands of Tf"),
+    (
+        "/F1 2147483648 Tf",
+        "error: offset 15: wrong operands of Tf",
+    ),
+    ("/F1 -1 Tf", "Tf(/F1,-1)"),
+    ("/F1 +1.5 Tf", "Tf(/F1,1.5)"),
+    ("1 /P BDC EMC", "error: offset 5: wrong operands of BDC"),
+    ("/P 1 BDC EMC", "error: offset 5: wrong operands of BDC"),
+    ("/P 1.0 BDC EMC", "error: offset 7: wrong operands of BDC"),
+    ("/P [1] BDC EMC", "error: offset 7: wrong operands of BDC"),
+    ("/P (x) BDC EMC", "error: offset 7: wrong operands of BDC"),
+    ("/P <01> BDC EMC", "error: offset 8: wrong operands of BDC"),
+    ("/P << /MCID 1 >> BDC EMC", "BDC EMC"),
+    ("/P << /MCID 2147483648 >> BDC EMC", "BDC EMC"),
+    (
+        "/P << /MCID 9223372036854775808 >> BDC EMC",
+        "error: offset 12: integer out of range: 9223372036854775808",
+    ),
+    (
+        "/P << /A 2147483647.9999999999 >> BDC EMC",
+        "error: offset 9: number out of range: 2147483647.9999999999",
+    ),
+    (
+        "/P << /A 1 0 R >> BDC EMC",
+        "error: offset 11: dictionary key is not a name",
+    ),
+    ("/P << /A [1 2.0 /B] >> BDC EMC", "BDC EMC"),
+    (
+        "/P << /A 1.2.3 >> BDC EMC",
+        "error: offset 9: unexpected keyword 1.2.3",
+    ),
+    (
+        "/P << /A q >> BDC EMC",
+        "error: offset 9: unexpected keyword q",
+    ),
+    (
+        "/P << /A >> BDC EMC",
+        "error: offset 9: dictionary key without a value",
+    ),
+    (
+        "/P << 1 2 >> BDC EMC",
+        "error: offset 6: dictionary key is not a name",
+    ),
+    ("/P [1 2] BDC EMC", "error: offset 9: wrong operands of BDC"),
+    ("[1 2] w", "error: offset 6: wrong operands of w"),
+    ("<< /A 1 >> w", "error: offset 11: wrong operands of w"),
+    ("[1] 0 m f", "error: offset 6: wrong operands of m"),
+    ("true w", "error: offset 5: wrong operands of w"),
+    ("null 0 m f", "error: offset 7: wrong operands of m"),
+    ("false Tr", "error: offset 6: wrong operands of Tr"),
+    ("/F1 true Tf", "error: offset 9: wrong operands of Tf"),
+    ("true cs", "error: offset 5: wrong operands of cs"),
+    ("null Do", "error: offset 5: wrong operands of Do"),
+    ("0 Tr", "Tr(0)"),
+    ("2 Tr", "Tr(2)"),
+    ("+2 Tr", "Tr(2)"),
+    ("-0 Tr", "Tr(0)"),
+    ("002 Tr", "Tr(2)"),
+    ("2.0 Tr", "error: offset 4: wrong operands of Tr"),
+    ("0.0 Tr", "error: offset 4: wrong operands of Tr"),
+    ("2. Tr", "error: offset 3: wrong operands of Tr"),
+    ("1 Tr", "error: offset 2: unsupported Tr 1"),
+    ("-1 Tr", "error: offset 3: unsupported Tr -1"),
+    ("3 Tr", "error: offset 2: unsupported Tr 3"),
+    (
+        "2147483648 Tr",
+        "error: offset 11: unsupported Tr 2147483648",
+    ),
+    (
+        "-2147483648 Tr",
+        "error: offset 12: unsupported Tr -2147483648",
+    ),
+    (
+        "9223372036854775807 Tr",
+        "error: offset 20: unsupported Tr 9223372036854775807",
+    ),
+    (
+        "-9223372036854775808 Tr",
+        "error: offset 21: unsupported Tr -9223372036854775808",
+    ),
+    (
+        "9223372036854775808 Tr",
+        "error: offset 0: integer out of range: 9223372036854775808",
+    ),
+    ("1 2 Tr", "error: offset 4: wrong operands of Tr"),
+    ("2 2 Tr", "error: offset 4: wrong operands of Tr"),
+    ("Tr", "error: offset 0: wrong operands of Tr"),
+    ("true Tr", "error: offset 5: wrong operands of Tr"),
+    ("null Tr", "error: offset 5: wrong operands of Tr"),
+    ("(2) Tr", "error: offset 4: wrong operands of Tr"),
+    ("<02> Tr", "error: offset 5: wrong operands of Tr"),
+    ("[2] Tr", "error: offset 4: wrong operands of Tr"),
+    ("<< >> Tr", "error: offset 6: wrong operands of Tr"),
+    ("/2 Tr", "error: offset 3: wrong operands of Tr"),
+    ("1 2 3 m f", "error: offset 6: wrong operands of m"),
+    ("1 m f", "error: offset 2: wrong operands of m"),
+    ("1 2 3 4 5 6 7 cm", "error: offset 14: wrong operands of cm"),
+    ("1 2 3 4 5 cm", "error: offset 10: wrong operands of cm"),
+    ("cm", "error: offset 0: wrong operands of cm"),
+    ("w", "error: offset 0: wrong operands of w"),
+    ("1 2 w", "error: offset 4: wrong operands of w"),
+    ("q 1 Q", "error: offset 4: wrong operands of Q"),
+    ("0 0 m 1 h f", "error: offset 8: wrong operands of h"),
+    ("0 0 m 1 f", "error: offset 8: wrong operands of f"),
+    ("1 BT ET", "error: offset 2: wrong operands of BT"),
+    ("BT 1 ET", "error: offset 5: wrong operands of ET"),
+    (
+        "/P /MC0 BDC 1 EMC",
+        "error: offset 14: wrong operands of EMC",
+    ),
+    (
+        "1 2",
+        "error: offset 3: operands without an operator at the end of the content",
+    ),
+    (
+        "q Q 1.5",
+        "error: offset 7: operands without an operator at the end of the content",
+    ),
+    (
+        "q Q /A",
+        "error: offset 6: operands without an operator at the end of the content",
+    ),
+    (
+        "q Q (x)",
+        "error: offset 7: operands without an operator at the end of the content",
+    ),
+    (
+        "q Q <0001>",
+        "error: offset 10: operands without an operator at the end of the content",
+    ),
+    (
+        "q Q [1]",
+        "error: offset 7: operands without an operator at the end of the content",
+    ),
+    (
+        "q Q << >>",
+        "error: offset 9: operands without an operator at the end of the content",
+    ),
+    (
+        "q Q true",
+        "error: offset 8: operands without an operator at the end of the content",
+    ),
+    ("BT/F1 1 Tf(x)Tj ET", "BT Tf(/F1,1) Tj(<78>) ET"),
+    ("BT /F1 1 Tf <0001>Tj ET", "BT Tf(/F1,1) Tj(<0001>) ET"),
+    ("1/Reg cs", "error: offset 6: wrong operands of cs"),
+    (
+        "0 0 10 20 re 1 2 3 4 5 6 c h f",
+        "re(0,0,10,20) c(1,2,3,4,5,6) h f",
+    ),
+    (
+        "1 0 0 1 10 20 cm BT 1 0 0 1 3 4 Tm ET",
+        "cm(1,0,0,1,10,20) BT Tm(1,0,0,1,3,4) ET",
+    ),
+    ("BT 1 0 0 1 3 4.5 Tm ET", "BT Tm(1,0,0,1,3,4.5) ET"),
+    (
+        "+1 -0 +0 1. .0 -.0 Tm",
+        "error: offset 19: Tm outside a text object",
+    ),
+    ("BT +1 -0 +0 1. .0 -.0 Tm ET", "BT Tm(1,0,0,1,0,0) ET"),
+    ("1 2 3 4 k 1 2 3 4 K", "k(1,2,3,4) K(1,2,3,4)"),
+    ("1 2 3 k", "error: offset 6: wrong operands of k"),
+    ("1 2 3 4 5 K", "error: offset 10: wrong operands of K"),
+    ("0 scn", "scn(0)"),
+    ("0.5 scn", "scn(0.5)"),
+    ("-0.5 scn", "scn(-0.5)"),
+    ("2147483648 scn", "error: offset 11: wrong operands of scn"),
+    ("1 2 scn", "error: offset 4: wrong operands of scn"),
+    ("100 Tz", "Tz(100)"),
+    ("-100 Tz", "Tz(-100)"),
+    ("2147483648 Tz", "error: offset 11: wrong operands of Tz"),
+    ("q 1 2 3 4 5 6 cm Q", "q cm(1,2,3,4,5,6) Q"),
+    (
+        "q 2147483648 0 0 1 0 0 cm Q",
+        "error: offset 23: wrong operands of cm",
+    ),
+    (
+        "q 1 0 0 1 0 2147483647.9999999999 cm Q",
+        "error: offset 12: number out of range: 2147483647.9999999999",
+    ),
+];
+
+#[test]
+fn operands_of_every_shape_give_what_they_gave_before() {
+    CASES_OF_OPERANDS.iter().for_each(|&(content, expected)| {
+        assert_eq!(result(content), expected, "{content}");
+    });
+}
+
+#[test]
+fn a_number_token_is_the_fixed_of_its_text() {
+    // docs/adr/0019: an integer token is `Fixed::from_int` of its i64, and
+    // a real token is `Fixed::parse` of its text; both are what
+    // `Fixed::parse` makes of the token.
+    [
+        "0",
+        "-0",
+        "+3",
+        "007",
+        "-2147483647",
+        "2147483647",
+        "00000000000000000000001",
+        ".5",
+        "5.",
+        "-.25",
+        "2.0",
+        "0.1",
+        "9.2126",
+        "2147483647.5",
+        "0.00000000023283064365386962890625",
+        "0.000000000116415321826934814453125",
+    ]
+    .iter()
+    .for_each(|t| {
+        let v = n(t);
+        assert_eq!(
+            ops(&format!("{t} {t} m f")),
+            vec![Operator::MoveTo(v, v), Operator::Fill],
+            "{t}"
+        );
+    });
+}
+
+#[test]
+fn an_integer_is_an_operand_when_it_is_a_fixed() {
+    // docs/adr/0019: an integer that `Fixed::from_int` refuses is a wrong
+    // operand, as the Int object was; `Tr` takes any i64.
+    [
+        2147483647i64,
+        2147483648,
+        -2147483647,
+        -2147483648,
+        i64::MAX,
+        i64::MIN,
+    ]
+    .iter()
+    .for_each(|&i| {
+        let fits = Fixed::from_int(i).is_ok();
+        assert_eq!(parse(format!("{i} 0 m f").as_bytes()).is_ok(), fits, "{i}");
+        assert_eq!(
+            result(&format!("{i} Tr")),
+            format!(
+                "error: offset {}: unsupported Tr {i}",
+                i.to_string().len() + 1
+            )
+        );
+    });
+}
