@@ -99,10 +99,10 @@ shem diff before after diffs
 
 ## 開発
 
-[adr-guard](https://github.com/tett23/adr-guard) の v0.8.3 以降をインストールし、クローンごとに git の hook を有効にする。
+[adr-guard](https://github.com/tett23/adr-guard) の v0.10.0 以降をインストールし、クローンごとに git の hook を有効にする。
 
 ```sh
-cargo install --git https://github.com/tett23/adr-guard --tag v0.8.3
+cargo install --git https://github.com/tett23/adr-guard --tag v0.10.0
 git config core.hooksPath .githooks
 ```
 

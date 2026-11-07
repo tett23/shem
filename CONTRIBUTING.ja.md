@@ -8,11 +8,11 @@
 ## 開発環境
 
 Rust の stable のツールチェーンを使う。
-[adr-guard](https://github.com/tett23/adr-guard) の v0.8.3 以降をインストールし、クローンしたら git の hook を有効にする。
+[adr-guard](https://github.com/tett23/adr-guard) の v0.10.0 以降をインストールし、クローンしたら git の hook を有効にする。
 この設定はリポジトリに保存されないため、クローンのたびに実行する。
 
 ```sh
-cargo install --git https://github.com/tett23/adr-guard --tag v0.8.3
+cargo install --git https://github.com/tett23/adr-guard --tag v0.10.0
 git config core.hooksPath .githooks
 ```
 
@@ -47,6 +47,7 @@ v1 では、汎用の PDF のラスタライザを目指す。
 - ADR は `docs/adr/` に置き、`0001-scope-and-determinism.md` のように、連番と、読んでわかる kebab-case の名前を付ける。
 - ADR は、`ステータス:` で始まるステータスの行をちょうど一つ持つ。
 - コミットした ADR は、ステータスの行とリンクを除いて変えない。adr-guard が pre-commit の hook と CI でこれを強制する。決定を変えるときは、古い ADR を置き換える新しい ADR を書く。
+- 二つの ADR が同じ番号を持つことはない。CI が adr-guard でこれを検査する（[ADR 0017](docs/adr/0017-update-adr-guard-to-v0.10.0.md)）。
 - ADR を破棄するときは、ステータスを `破棄` にし、理由を docs/specifications.md に書く。
 - ADR からソースコードを参照するときは、コミットのハッシュを含む GitHub の URL で書く。`main` は rebase しないので、その URL は変わらない。
 - ADR は、決定に使った文献を末尾に挙げる。

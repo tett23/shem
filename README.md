@@ -99,10 +99,10 @@ The library of the crate (`shem::render::Session`, `shem::parallel::run`) may ch
 
 ## Development
 
-Install [adr-guard](https://github.com/tett23/adr-guard) v0.8.3 or later, and enable the git hooks in each clone.
+Install [adr-guard](https://github.com/tett23/adr-guard) v0.10.0 or later, and enable the git hooks in each clone.
 
 ```sh
-cargo install --git https://github.com/tett23/adr-guard --tag v0.8.3
+cargo install --git https://github.com/tett23/adr-guard --tag v0.10.0
 git config core.hooksPath .githooks
 ```
 
