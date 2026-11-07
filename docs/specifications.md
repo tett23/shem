@@ -189,6 +189,14 @@ README.md と CONTRIBUTING.md は英語を正とし、README.ja.md と CONTRIBUT
 - コミットメッセージの最後の段落に `Translation-Unchanged: <理由>`（キーの大文字と小文字は区別しない。理由は空でない）があれば、翻訳を変えなくてよい。
 - 検査は `scripts/check-translations.sh` が行う。git の commit-msg の hook はステージされた変更を、CI は範囲のマージ以外の各コミットを検査する。違反は `check-translations: <コミット>: <英語版> changed without <翻訳> (...)` を出し、終了コード 1 で終わる。使い方の誤りは終了コード 64 で終わる。
 
+## ADR の検査
+
+ADR の検査には adr-guard の v0.10.0 を使う（[ADR 0017](adr/0017-update-adr-guard-to-v0.10.0.md)）。
+
+- git の pre-commit の hook と CI は、コミット済みの ADR がステータスの行とリンクを除いて変わらないことを検査する。
+- CI は、`docs/adr/` で番号が重複した ADR がないことも検査する。
+- 文書の ADR の参照には、`adr-guard links --fix` でリンクを付ける。ほかのリポジトリの ADR を指すときは、外部リンクの中に書く。
+
 ## 破棄した ADR
 
 なし。

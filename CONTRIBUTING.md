@@ -8,11 +8,11 @@ CONTRIBUTING.ja.md is a machine translation of it.
 ## Development environment
 
 Use the stable Rust toolchain.
-Install [adr-guard](https://github.com/tett23/adr-guard) v0.8.3 or later, and enable the git hooks after cloning.
+Install [adr-guard](https://github.com/tett23/adr-guard) v0.10.0 or later, and enable the git hooks after cloning.
 The setting is not stored in the repository, so run it in every clone.
 
 ```sh
-cargo install --git https://github.com/tett23/adr-guard --tag v0.8.3
+cargo install --git https://github.com/tett23/adr-guard --tag v0.10.0
 git config core.hooksPath .githooks
 ```
 
@@ -47,6 +47,7 @@ The plan of each version is in [docs/roadmap.md](docs/roadmap.md).
 - ADRs are in `docs/adr/`, named like `0001-scope-and-determinism.md`: a sequential number and a readable kebab-case name.
 - An ADR has exactly one status line, which begins with `ステータス:`.
 - A committed ADR does not change, except for its status line and its links. adr-guard enforces this in the pre-commit hook and in CI. To change a decision, write a new ADR that supersedes the old one.
+- No two ADRs share a number. CI checks this with adr-guard ([ADR 0017](docs/adr/0017-update-adr-guard-to-v0.10.0.md)).
 - To discard an ADR, set its status to `破棄` and write the reason in docs/specifications.md.
 - An ADR refers to source code by a GitHub URL that contains a commit hash. `main` is never rebased, so such a URL does not change.
 - An ADR lists the references used for its decision at its end.
