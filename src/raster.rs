@@ -786,7 +786,9 @@ impl Canvas {
 
 /// Paints the pixels of `run`, three bytes each, with the opacities.
 fn paint_run(run: &mut [u8], alphas: &[u8], paint: impl Fn(&mut [u8], u8)) {
-    run.chunks_exact_mut(3)
+    run.as_chunks_mut::<3>()
+        .0
+        .iter_mut()
         .zip(alphas)
         .for_each(|(p, &a)| paint(p, a));
 }
