@@ -123,6 +123,84 @@ fn the_errors_are_those_of_the_command() {
     );
 }
 
+/// A PDF of one page with the given content and no resources.
+fn one_page(content: &str) -> Vec<u8> {
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << >> /Contents 4 0 R >>"
+            .to_string(),
+        format!(
+            "<< /Length {} >>\nstream\n{content}\nendstream",
+            content.len()
+        ),
+    ];
+    let mut out = b"%PDF-1.6\n".to_vec();
+    let offsets: Vec<usize> = objects
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let at = out.len();
+            out.extend(format!("{} 0 obj\n{o}\nendobj\n", i + 1).into_bytes());
+            at
+        })
+        .collect();
+    let xref = out.len();
+    out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).into_bytes());
+    offsets
+        .iter()
+        .for_each(|o| out.extend(format!("{o:010} 00000 n \n").into_bytes()));
+    out.extend(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .into_bytes(),
+    );
+    out
+}
+
+#[test]
+fn the_errors_of_a_content_are_those_of_the_command() {
+    // docs/adr/0019: the message of a broken content is the one that
+    // `shem render` writes after the path, with the page and the offset.
+    [
+        ("q /A w Q", "page 1: offset 5: wrong operands of w"),
+        (
+            "q 2147483648 0 m f Q",
+            "page 1: offset 15: wrong operands of m",
+        ),
+        (
+            "q 9223372036854775808 w Q",
+            "page 1: offset 2: integer out of range: 9223372036854775808",
+        ),
+        ("BT 2.0 Tr ET", "page 1: offset 7: wrong operands of Tr"),
+        ("BT 1 Tr ET", "page 1: offset 5: unsupported Tr 1"),
+        ("q (x) TJ Q", "page 1: offset 6: unsupported operator TJ"),
+        (
+            "q /F1 1 Tf Q",
+            "page 1: offset 8: no font F1 in the resources",
+        ),
+    ]
+    .iter()
+    .for_each(|&(content, message)| {
+        let data = one_page(content);
+        let mut m = Module::new();
+        let ptr = put(&mut m, &data);
+        let doc = m.open(ptr, data.len(), 36);
+        assert!(doc >= 1, "{content}: {}", m.error());
+        assert_eq!(m.render(doc, 0), 0, "{content}");
+        assert_eq!(m.error(), message, "{content}");
+        assert!(m.image(doc).is_some_and(|(rgba, _, _)| rgba.is_empty()));
+    });
+    // A content that is well formed renders.
+    let data = one_page("q 0 0 5 5 re f Q");
+    let mut m = Module::new();
+    let ptr = put(&mut m, &data);
+    let doc = m.open(ptr, data.len(), 36);
+    assert_eq!(m.render(doc, 0), 1, "{}", m.error());
+}
+
 #[test]
 fn broken_pdfs_fail_without_a_panic() {
     // docs/adr/0018: in wasm a panic is a trap, so every input must give a
