@@ -159,6 +159,29 @@ fn nonzero_and_even_odd() {
 }
 
 #[test]
+fn even_odd_folds_a_cover_past_two() {
+    // Squares nested in the same direction: the cover at the center is
+    // their number. Nonzero clamps it to one; even-odd keeps its parity,
+    // also past two (docs/adr/0019 sweeps the cover as a sum).
+    (1..=4).for_each(|n| {
+        let mut path = Path::new();
+        (0..n).for_each(|i| square(&mut path, i * PX, i * PX, (8 - i) * PX, (8 - i) * PX));
+        let center = 4 * 8 + 4;
+        assert_eq!(
+            alpha_map(&path, FillRule::NonZero, 8, 8)[center],
+            255,
+            "{n}"
+        );
+        let even_odd = alpha_map(&path, FillRule::EvenOdd, 8, 8);
+        assert_eq!(even_odd[center], if n % 2 == 1 { 255 } else { 0 }, "{n}");
+        // The outermost ring is under one square.
+        assert_eq!(even_odd[0], 255, "{n}");
+        // The second ring is under two, when there are two.
+        assert_eq!(even_odd[8 + 1], if n >= 2 { 0 } else { 255 }, "{n}");
+    });
+}
+
+#[test]
 fn an_unclosed_subpath_is_filled_as_closed() {
     let mut path = Path::new();
     path.move_to((0, 0));
