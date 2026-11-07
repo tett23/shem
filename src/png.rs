@@ -746,7 +746,9 @@ pub fn encode_ppm(canvas: &Canvas) -> Vec<u8> {
 /// Writes the bytes of [`encode_ppm`] without making them in memory first
 /// (docs/adr/0013).
 pub fn write_ppm(canvas: &Canvas, out: &mut impl std::io::Write) -> std::io::Result<()> {
-    write!(out, "P6\n{} {}\n255\n", canvas.width, canvas.height)?;
+    // The header goes in one write: `write!` on an unbuffered file would
+    // make one system call per piece.
+    out.write_all(format!("P6\n{} {}\n255\n", canvas.width, canvas.height).as_bytes())?;
     out.write_all(&canvas.pixels)
 }
 

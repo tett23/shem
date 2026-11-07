@@ -2,68 +2,86 @@
 
 use std::fmt;
 
-/// An error, with the place where it happened as far as it is known.
+/// An error, with the place where it happened as far as it is known. The
+/// fields are behind a `Box`, so that a `Result` of a value is small and
+/// the path without an error moves little.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Error {
-    pub page: Option<usize>,
-    pub object: Option<u32>,
-    pub offset: Option<usize>,
-    pub message: String,
+pub struct Error(Box<Place>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Place {
+    page: Option<usize>,
+    object: Option<u32>,
+    offset: Option<usize>,
+    message: String,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
     pub fn new(message: impl Into<String>) -> Error {
-        Error {
+        Error(Box::new(Place {
             page: None,
             object: None,
             offset: None,
             message: message.into(),
-        }
+        }))
     }
 
     pub fn overflow() -> Error {
         Error::new("arithmetic overflow")
     }
 
+    pub fn page(&self) -> Option<usize> {
+        self.0.page
+    }
+
+    pub fn object(&self) -> Option<u32> {
+        self.0.object
+    }
+
+    pub fn offset(&self) -> Option<usize> {
+        self.0.offset
+    }
+
+    pub fn message(&self) -> &str {
+        &self.0.message
+    }
+
+    /// The error with the place `update` makes of its place.
+    fn with(mut self, update: impl FnOnce(&mut Place)) -> Error {
+        update(&mut self.0);
+        self
+    }
+
     /// The error with the page number, unless it already has one.
     pub fn at_page(self, page: usize) -> Error {
-        Error {
-            page: self.page.or(Some(page)),
-            ..self
-        }
+        self.with(|p| p.page = p.page.or(Some(page)))
     }
 
     /// The error with the object number, unless it already has one.
     pub fn at_object(self, object: u32) -> Error {
-        Error {
-            object: self.object.or(Some(object)),
-            ..self
-        }
+        self.with(|p| p.object = p.object.or(Some(object)))
     }
 
     /// The error with the byte offset, unless it already has one.
     pub fn at_offset(self, offset: usize) -> Error {
-        Error {
-            offset: self.offset.or(Some(offset)),
-            ..self
-        }
+        self.with(|p| p.offset = p.offset.or(Some(offset)))
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let places = [
-            self.page.map(|p| format!("page {p}")),
-            self.object.map(|o| format!("object {o}")),
-            self.offset.map(|o| format!("offset {o}")),
+            self.0.page.map(|p| format!("page {p}")),
+            self.0.object.map(|o| format!("object {o}")),
+            self.0.offset.map(|o| format!("offset {o}")),
         ];
         places
             .iter()
             .flatten()
             .try_for_each(|place| write!(f, "{place}: "))?;
-        write!(f, "{}", self.message)
+        write!(f, "{}", self.0.message)
     }
 }
 
@@ -84,6 +102,6 @@ mod tests {
     #[test]
     fn inner_place_wins() {
         let e = Error::new("x").at_page(1).at_page(2);
-        assert_eq!(e.page, Some(1));
+        assert_eq!(e.page(), Some(1));
     }
 }
