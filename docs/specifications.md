@@ -11,7 +11,7 @@ v1 では、汎用の PDF のラスタライザを目指す（[roadmap.md](roadm
 ## 状態
 
 v0.1 の範囲（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)〜[0012](adr/0012-parallel-library-api.md)）、musl の配布物でスレッドを増やすと遅くなる問題の修正（[ADR 0013](adr/0013-fewer-allocations-for-musl-threads.md)）、スレッドごとの作業用の場所と、検査と塗りの高速化（[ADR 0014](adr/0014-thread-workspaces-and-faster-check-and-fill.md)）、PNG の書き出し、描画、Flate の展開の高速化（[ADR 0015](adr/0015-faster-png-render-and-decoding.md)）、ブラウザと Deno で動かす wasm のモジュール（[ADR 0018](adr/0018-wasm-module-for-the-browser.md)）を実装し、v0.1.0-rc5 をプレリリースとして出した。
-その後、Deflate の探索、密な格子の掃き出し、演算子の数の高速化（[ADR 0019](adr/0019-faster-deflate-sweep-and-operands.md)）を実装した。
+その後、Deflate の探索、密な格子の掃き出し、演算子の数の高速化（[ADR 0019](adr/0019-faster-deflate-sweep-and-operands.md)）と、交点の持ち越しを i64 のどの座標でも正しくする変更（[ADR 0020](adr/0020-carried-crossings-for-every-i64.md)）を実装した。
 版ごとの計画は [roadmap.md](roadmap.md) にある。
 
 ## コマンド
@@ -207,7 +207,7 @@ musl のメモリ割り当ては一つの錠で守られ、割り当てのたび
 
 - Deflate は、探索で数えた今の位置の同じバイトの連続とハッシュを、探索の後の位置の追加に使う。連続と一致の長さの 8 バイトに満たない残りは、等しいとわかっているバイトに重ねた 8 バイトの語一つで比べる。
 - PNG の行のフィルタの費用は、2^24 バイト以下の行では u32 で足す。Adler-32 の 16 本の列は、256 個の塊ごとに u16 で足してから畳む。
-- 線分と行や列との交点は、積が i64 に収まれば、最初の交点だけを割り、次からは商と余りを持ち越す。値と丸めは、交点ごとに割るものと同じである。
+- 線分と行や列との交点は、最初の交点だけを割り、次からは商と余りを持ち越す。値と丸めは、交点ごとに i128 で割るものと同じである。座標の差が小さい線分（|db| ≤ 2^54、d ≤ 2^61）は i64 で、ほかは i128 で持ち越すので、i64 のどの座標でも正しい（[ADR 0020](adr/0020-carried-crossings-for-every-i64.md)）。
 - 密な格子は、行ごとに、最初と最後に足された場所の間だけを掃く。その右の画素は、行の覆いの累積から一つの範囲として出す。掃いた場所は塗りの後で 0 に戻すので、格子は塗りの間で 0 である。黒の塗りは、色の項を省いた同じ式で重ねる。
 - 内容の字句の数は、オブジェクトに包まずにオペランドのスタックに置く。
 
