@@ -5,10 +5,10 @@ use super::reference as old;
 use super::*;
 
 /// A xorshift64* generator, for inputs that are the same on every run.
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
@@ -16,17 +16,17 @@ impl Rng {
     }
 
     /// An integer in `lo..hi`.
-    fn range(&mut self, lo: i64, hi: i64) -> i64 {
+    pub(super) fn range(&mut self, lo: i64, hi: i64) -> i64 {
         lo + (self.next() % (hi - lo) as u64) as i64
     }
 
-    fn point(&mut self, lo: i64, hi: i64) -> Point {
+    pub(super) fn point(&mut self, lo: i64, hi: i64) -> Point {
         (self.range(lo, hi) as i32, self.range(lo, hi) as i32)
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Cmd {
+pub(super) enum Cmd {
     Move(Point),
     Line(Point),
     Curve(Point, Point, Point),
@@ -40,7 +40,7 @@ fn random_cmds(rng: &mut Rng, curves: bool, lo: i64, hi: i64) -> Vec<Cmd> {
 }
 
 /// [`random_cmds`] with the points that `point` draws.
-fn random_cmds_from(
+pub(super) fn random_cmds_from(
     rng: &mut Rng,
     curves: bool,
     mut point: impl FnMut(&mut Rng) -> Point,
@@ -68,7 +68,7 @@ fn random_cmds_from(
     cmds
 }
 
-fn build(cmds: &[Cmd]) -> Path {
+pub(super) fn build(cmds: &[Cmd]) -> Path {
     let mut path = Path::new();
     cmds.iter().for_each(|&c| match c {
         Cmd::Move(p) => path.move_to(p),
@@ -79,7 +79,7 @@ fn build(cmds: &[Cmd]) -> Path {
     path
 }
 
-fn build_old(cmds: &[Cmd]) -> old::Path {
+pub(super) fn build_old(cmds: &[Cmd]) -> old::Path {
     let mut path = old::Path::new();
     cmds.iter().for_each(|&c| match c {
         Cmd::Move(p) => path.move_to(p),
@@ -105,7 +105,7 @@ fn owned_old(path: &old::Path) -> Owned {
         .collect()
 }
 
-fn old_rule(rule: FillRule) -> old::FillRule {
+pub(super) fn old_rule(rule: FillRule) -> old::FillRule {
     match rule {
         FillRule::NonZero => old::FillRule::NonZero,
         FillRule::EvenOdd => old::FillRule::EvenOdd,
@@ -421,7 +421,7 @@ fn check_fill(
 
 /// The rule and the color of the k-th fill of a test: both rules, black
 /// (painted on its own in docs/adr/0019) and other colors.
-fn rule_and_color(rng: &mut Rng, k: usize) -> (FillRule, [u8; 3]) {
+pub(super) fn rule_and_color(rng: &mut Rng, k: usize) -> (FillRule, [u8; 3]) {
     let rule = [FillRule::NonZero, FillRule::EvenOdd][k % 2];
     let rgb = match k % 3 {
         0 => [0, 0, 0],
@@ -430,8 +430,10 @@ fn rule_and_color(rng: &mut Rng, k: usize) -> (FillRule, [u8; 3]) {
     (rule, rgb)
 }
 
-/// [`render_line`] before docs/adr/0019: one `interpolate` at each row.
-fn render_line_divided(add: &mut impl FnMut(i32, i32, i64, i64), p0: Point, p1: Point) {
+/// [`render_line`] before docs/adr/0019: one `interpolate` at each row,
+/// every row of y ≥ 0, and every column of the pieces (the cells left of
+/// x = 0 are summed in column −1, as on a canvas, docs/adr/0022).
+pub(super) fn render_line_divided(add: &mut impl FnMut(i32, i32, i64, i64), p0: Point, p1: Point) {
     let (x0, y0, x1, y1) = (
         i64::from(p0.0),
         i64::from(p0.1),
@@ -441,36 +443,43 @@ fn render_line_divided(add: &mut impl FnMut(i32, i32, i64, i64), p0: Point, p1: 
     if y0 == y1 {
         return;
     }
+    // Every row of y ≥ 0 and every column of x ≥ 0.
+    let all = Area {
+        width: i64::MAX / ONE64,
+        height: i64::MAX / ONE64,
+    };
     let mut last = (x0, y0);
     for y in crossings(y0, y1) {
         let p = (interpolate(y0, y1, x0, x1, y), y);
-        render_row_piece(add, last, p);
+        render_row_piece(add, last, p, all);
         last = p;
     }
-    render_row_piece(add, last, (x1, y1));
+    render_row_piece(add, last, (x1, y1), all);
 }
 
 #[test]
 fn a_segment_whose_products_pass_i64_is_divided_at_each_row() {
     // docs/adr/0019: the quotient is carried only when the product of the
-    // differences of a segment fits in i64. A segment across more than
-    // half of the range of i32 in both x and y is divided at each row
-    // instead, as before. The pieces within a row never are: their |dy|
-    // is at most 256, so their product is below 2^40. The reference of
-    // v0.1.0-rc2 allocates at each of the 2^23 rows, so the expected cells
-    // come from the form before docs/adr/0019.
+    // differences of a segment fits in i64. A segment across the whole
+    // range of i32 in both x and y is divided at each row instead, as
+    // before. The pieces within a row never are: their |dy| is at most
+    // 256, so their product is below 2^40. The reference of v0.1.0-rc2
+    // allocates at each of the 2^23 rows, so the expected cells come from
+    // the form before docs/adr/0019, on a canvas of 2^23 rows
+    // (docs/adr/0022).
     let (lo, hi) = (i32::MIN, i32::MAX);
-    // (hi − lo) · (1 − lo) = (2^32 − 1) (2^31 + 1) passes i64::MAX.
+    // (hi − lo)² = (2^32 − 1)² passes i64::MAX.
     assert!(
         (i64::from(hi) - i64::from(lo))
-            .checked_mul(1 - i64::from(lo))
+            .checked_mul(i64::from(hi) - i64::from(lo))
             .is_none()
     );
+    let area = Area::new(1 << 23, 1 << 23);
     // Down in y and up in x, and the reverse.
-    let segments = [((lo, 1), (hi, lo)), ((hi, lo), (lo, 1))];
+    let segments = [((lo, hi), (hi, lo)), ((hi, lo), (lo, hi))];
     // The cells of a few rows across the range, with the first and the
     // last, as the whole are too many to hold.
-    let keep = |row: i32| row.rem_euclid(1 << 20) < 2 || row == -1 || row == i32::MIN >> 8;
+    let keep = |row: i32| row.rem_euclid(1 << 20) < 2 || row == (1 << 23) - 1;
     segments.iter().for_each(|&(p0, p1)| {
         let mut cells = Vec::new();
         let mut expected = Vec::new();
@@ -482,6 +491,7 @@ fn a_segment_whose_products_pass_i64_is_divided_at_each_row() {
             },
             p0,
             p1,
+            area,
         );
         render_line_divided(
             &mut |row, col, cover, area| {
@@ -493,7 +503,7 @@ fn a_segment_whose_products_pass_i64_is_divided_at_each_row() {
             p1,
         );
         merge(&mut cells);
-        merge(&mut expected);
+        let expected = super::outside_tests::on_canvas(&expected, area);
         assert!(cells.len() > 16, "{p0:?} {p1:?}: {}", cells.len());
         assert_eq!(cells, expected, "{p0:?} {p1:?}");
     });
@@ -882,18 +892,28 @@ fn the_two_paths_of_the_crossings_meet_at_their_bounds() {
 }
 
 fn cells_equal_the_divided_ones(p0: Point, p1: Point) {
+    // On a canvas of 2^23 rows and columns, which holds every row of y ≥ 0
+    // (docs/adr/0022).
+    let area = Area::new(1 << 23, 1 << 23);
     let mut carried = Vec::new();
     render_line(
         &mut |r, c, cover, area| carried.push((r, c, cover, area)),
         p0,
         p1,
+        area,
     );
     let mut each = Vec::new();
     render_line_divided(
-        &mut |r, c, cover, area| each.push((r, c, cover, area)),
+        &mut |r, c, cover, a| {
+            if (0..area.height).contains(&i64::from(r)) {
+                each.push((r, c, cover, a));
+            }
+        },
         p0,
         p1,
     );
+    merge(&mut carried);
+    let each = super::outside_tests::on_canvas(&each, area);
     assert!(carried == each, "{p0:?} {p1:?}");
 }
 
