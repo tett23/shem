@@ -81,6 +81,78 @@ fn pdf(contents: &[&str], media_box: &str) -> Vec<u8> {
     out
 }
 
+/// A one-page PDF with the given MediaBox and content, whose font F1 is
+/// the font F2 of the fixture sample.pdf (Source Sans Pro, CFF), with the
+/// CIDs of its W array.
+fn pdf_with_a_font(content: &str, media_box: &str) -> Vec<u8> {
+    use shem::pdf::{Document, Object};
+    let sample = std::fs::read(fixture("sample")).unwrap();
+    let doc = Document::parse(&sample).unwrap();
+    let page = &doc.pages().unwrap()[0];
+    let fonts = doc.get_dict(&page.resources, "Font").unwrap().unwrap();
+    let type0 = doc.resolve(&fonts[b"F2".as_slice()]).unwrap();
+    let Some(Object::Array(descendants)) = doc
+        .get(type0.as_dict().unwrap(), "DescendantFonts")
+        .unwrap()
+    else {
+        panic!()
+    };
+    let cidfont = doc.resolve(&descendants[0]).unwrap();
+    let cidfont = cidfont.as_dict().unwrap();
+    let descriptor = doc.get_dict(cidfont, "FontDescriptor").unwrap().unwrap();
+    let Some(Object::Stream(file)) = doc.get(&descriptor, "FontFile3").unwrap() else {
+        panic!()
+    };
+    let program = file.data;
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+        )
+        .into_bytes(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()).into_bytes(),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType0 /BaseFont /X /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R /DW 500 >>".to_vec(),
+        b"<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile3 8 0 R >>".to_vec(),
+        [
+            format!(
+                "<< /Filter /FlateDecode /Length {} /Subtype /CIDFontType0C >>\nstream\n",
+                program.len()
+            )
+            .into_bytes(),
+            program,
+            b"\nendstream".to_vec(),
+        ]
+        .concat(),
+    ];
+    let mut out = b"%PDF-1.6\n".to_vec();
+    let offsets: Vec<usize> = objects
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let at = out.len();
+            out.extend(format!("{} 0 obj\n", i + 1).into_bytes());
+            out.extend(o);
+            out.extend(b"\nendobj\n");
+            at
+        })
+        .collect();
+    let xref = out.len();
+    out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).into_bytes());
+    offsets
+        .iter()
+        .for_each(|o| out.extend(format!("{o:010} 00000 n \n").into_bytes()));
+    out.extend(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .into_bytes(),
+    );
+    out
+}
+
 fn write_pdf(dir: &Path, name: &str, data: &[u8]) -> String {
     let path = dir.join(name);
     std::fs::write(&path, data).unwrap();
@@ -281,6 +353,39 @@ fn the_messages_of_broken_contents_are_unchanged() {
         assert_eq!(stderr, format!("shem: {input}: {message}\n"));
         assert!(files(&out).is_empty());
     });
+}
+
+#[test]
+fn a_stroked_glyph_beyond_the_device_writes_nothing() {
+    // docs/adr/0022: a glyph of Tr 2 placed where its points with the
+    // margin of the stroke pass i32 in device space fails the check, so no
+    // file is written; placed where they fit, the page is written. At 72
+    // dpi, i32::MAX is 8388607.996 points.
+    let dir = scratch("stroke-range");
+    let text = |x: &str| format!("BT /F1 10 Tf 2 Tr 2 w 1 0 0 1 {x} 5 Tm <0005> Tj ET");
+    let beyond = write_pdf(
+        &dir,
+        "beyond.pdf",
+        &pdf_with_a_font(&text("8388590"), "0 0 40 40"),
+    );
+    let out = dir.join("beyond");
+    let (code, stdout, stderr) = shem(&["render", "--dpi", "72", &beyond, out.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.ends_with("glyph stroke outside the range of coordinates\n"),
+        "{stderr}"
+    );
+    assert!(files(&out).is_empty());
+    let within = write_pdf(
+        &dir,
+        "within.pdf",
+        &pdf_with_a_font(&text("8388500"), "0 0 40 40"),
+    );
+    let out = dir.join("within");
+    let (code, _, stderr) = shem(&["render", "--dpi", "72", &within, out.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(files(&out), ["page-0001.png"]);
 }
 
 #[test]

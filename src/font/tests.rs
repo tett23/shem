@@ -205,6 +205,43 @@ fn synthetic_bold_strokes_the_outline() {
 }
 
 #[test]
+fn a_stroked_glyph_near_the_end_of_the_device_is_an_error() {
+    // docs/adr/0022: a glyph of Tr 2 whose points, with the margin of
+    // 16 · half + 16 around them, pass i32 in device space is an error of
+    // the check, before anything is drawn; filled only, or with a margin
+    // that fits, it is drawn as before. At 72 dpi a point is 256 units:
+    // the square of 10 points at x = 8388590 reaches 2147481600, which is
+    // 2047 units below i32::MAX.
+    let text =
+        |tr: &str, w: &str| format!("BT /F1 10 Tf {tr} Tr {w} w 1 0 0 1 8388590 5 Tm <0001> Tj ET");
+    let message = "glyph stroke outside the range of coordinates";
+    // 2 w: half is 256 and the margin 4112; 0 w: half is 128 and the
+    // margin 2064.
+    ["2", "0"].iter().for_each(|w| {
+        let e = render(&Text::default(), &text("2", w)).unwrap_err();
+        assert!(e.to_string().contains(message), "{w} w: {e}");
+        let data = text_pdf(&Text::default(), &text("2", w));
+        let doc = Document::parse(&data).unwrap();
+        let pages = doc.pages().unwrap();
+        let e = crate::render::check_page(&doc, &pages[0], 72).unwrap_err();
+        assert!(e.to_string().contains(message), "{w} w: {e}");
+    });
+    // 0.5 w: half is 64 and the margin 1040, which fits.
+    let c = render(&Text::default(), &text("2", "0.5")).unwrap();
+    assert!(c.pixels.iter().all(|&v| v == 255));
+    let c = render(&Text::default(), &text("0", "2")).unwrap();
+    assert!(c.pixels.iter().all(|&v| v == 255));
+    // Within the canvas, the stroke is drawn as before.
+    let c = render(
+        &Text::default(),
+        "BT /F1 10 Tf 2 Tr 2 w 1 0 0 1 5 5 Tm <0001> Tj ET",
+    )
+    .unwrap();
+    assert_eq!(at(&c, 4, 10), BLACK);
+    assert_eq!(at(&c, 3, 10), WHITE);
+}
+
+#[test]
 fn fill_and_stroke_colors_are_apart() {
     let c = render(
         &Text::default(),

@@ -305,13 +305,14 @@ fn reference_coverage(path: &Path, rule: FillRule, w: usize, h: usize) -> Vec<(u
         e.0 += cover;
         e.1 += area;
     };
+    let area = Area::new(w, h);
     path.subpaths()
         .filter(|s| s.points.len() > 1)
         .for_each(|s| {
             s.points
                 .windows(2)
-                .for_each(|w| render_line(&mut add, w[0], w[1]));
-            render_line(&mut add, s.points[s.points.len() - 1], s.points[0]);
+                .for_each(|w| render_line(&mut add, w[0], w[1], area));
+            render_line(&mut add, s.points[s.points.len() - 1], s.points[0], area);
         });
     let cells: Vec<Cell> = map
         .into_iter()

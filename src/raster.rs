@@ -78,10 +78,16 @@ impl Path {
     }
 
     pub fn curve_to(&mut self, c1: Point, c2: Point, p: Point) {
+        self.curve_to_within(c1, c2, p, &Frame::NONE);
+    }
+
+    /// [`Path::curve_to`] on a canvas: the parts of the curve beyond the
+    /// frame are one segment each (docs/adr/0022).
+    pub fn curve_to_within(&mut self, c1: Point, c2: Point, p: Point, frame: &Frame) {
         let start = self.current_point().unwrap_or(c1);
         // After the first point, the subpath is open: the others are pushed.
         let mut first = true;
-        flatten_curve_into(start, c1, c2, p, |q| {
+        flatten_curve_into(start, c1, c2, p, frame, |q| {
             if first {
                 self.line_to(q);
                 first = false;
@@ -151,11 +157,100 @@ fn flatness(p0: Point, p1: Point, p2: Point, p3: Point) -> i64 {
     second(p0, p1, p2).max(second(p1, p2, p3))
 }
 
+/// The size of a canvas in pixels, for the arithmetic of the cells
+/// (docs/adr/0022).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Area {
+    pub width: i64,
+    pub height: i64,
+}
+
+impl Area {
+    pub fn new(width: usize, height: usize) -> Area {
+        Area {
+            width: width as i64,
+            height: height as i64,
+        }
+    }
+}
+
+/// The regions beyond a canvas and a margin around it, in device units: a
+/// curve whose control points are all in one of them is one segment there
+/// (docs/adr/0022). A point is beyond the frame above if y ≤ `top`, below
+/// if y ≥ `bottom`, right if x ≥ `right`, and left if x ≤ `left`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frame {
+    left: i64,
+    top: i64,
+    right: i64,
+    bottom: i64,
+}
+
+impl Frame {
+    /// No region: every curve is split as [`flatten_curve`] splits it.
+    pub const NONE: Frame = Frame {
+        left: i64::MIN,
+        top: i64::MIN,
+        right: i64::MAX,
+        bottom: i64::MAX,
+    };
+
+    /// The frame `margin` units around a `width` × `height` canvas.
+    pub fn around(width: usize, height: usize, margin: i64) -> Frame {
+        Frame {
+            left: -margin - 1,
+            top: -margin,
+            right: width as i64 * ONE64 + margin,
+            bottom: height as i64 * ONE64 + margin,
+        }
+    }
+
+    /// The bounds of four points: the least and the largest x and y.
+    fn bounds(a: Point, b: Point, c: Point, d: Point) -> (i64, i64, i64, i64) {
+        let (xs, ys) = (
+            [a.0, b.0, c.0, d.0].map(i64::from),
+            [a.1, b.1, c.1, d.1].map(i64::from),
+        );
+        (
+            xs[0].min(xs[1]).min(xs[2]).min(xs[3]),
+            xs[0].max(xs[1]).max(xs[2]).max(xs[3]),
+            ys[0].min(ys[1]).min(ys[2]).min(ys[3]),
+            ys[0].max(ys[1]).max(ys[2]).max(ys[3]),
+        )
+    }
+
+    /// Whether the four points are all in one region beyond the frame.
+    fn holds(&self, a: Point, b: Point, c: Point, d: Point) -> bool {
+        let (xlo, xhi, ylo, yhi) = Frame::bounds(a, b, c, d);
+        yhi <= self.top || ylo >= self.bottom || xlo >= self.right || xhi <= self.left
+    }
+
+    /// Whether some point of the bounds of the four points is in a region
+    /// beyond the frame. If none is, no curve within those bounds is held
+    /// by a region, so the curves split from one need not be checked.
+    fn reaches(&self, a: Point, b: Point, c: Point, d: Point) -> bool {
+        let (xlo, xhi, ylo, yhi) = Frame::bounds(a, b, c, d);
+        ylo <= self.top || yhi >= self.bottom || xhi >= self.right || xlo <= self.left
+    }
+}
+
 /// The points that approximate a cubic Bézier curve, without `p0` and with
 /// `p3`, by de Casteljau's subdivision at the midpoint.
 pub fn flatten_curve(p0: Point, p1: Point, p2: Point, p3: Point) -> Vec<Point> {
+    flatten_curve_within(p0, p1, p2, p3, &Frame::NONE)
+}
+
+/// [`flatten_curve`] on a canvas: the parts of the curve beyond the frame
+/// are one segment each (docs/adr/0022).
+pub fn flatten_curve_within(
+    p0: Point,
+    p1: Point,
+    p2: Point,
+    p3: Point,
+    frame: &Frame,
+) -> Vec<Point> {
     let mut out = Vec::new();
-    flatten_curve_into(p0, p1, p2, p3, |q| out.push(q));
+    flatten_curve_into(p0, p1, p2, p3, frame, |q| out.push(q));
     out
 }
 
@@ -163,10 +258,36 @@ pub fn flatten_curve(p0: Point, p1: Point, p2: Point, p3: Point) -> Vec<Point> {
 /// is flat enough, or at the deepest level, gives its end point; another is
 /// split at its midpoint, first half first. The recursion is at most
 /// MAX_DEPTH deep, and keeps only the curves of the levels it is in
-/// (docs/adr/0015).
-fn flatten_curve_into(p0: Point, p1: Point, p2: Point, p3: Point, mut emit: impl FnMut(Point)) {
-    fn split(a: Point, b: Point, c: Point, d: Point, depth: u32, emit: &mut impl FnMut(Point)) {
-        if depth >= MAX_DEPTH || flatness(a, b, c, d) <= FLATNESS {
+/// (docs/adr/0015). A curve whose control points are all in one region
+/// beyond the frame gives its end point too: the points it would give are
+/// within the bounds of its control points (a midpoint is between its
+/// ends), so they and the one segment are in the same region, where the
+/// cells change no pixel, or only add to a row the cover from the start
+/// to the end (docs/adr/0022).
+fn flatten_curve_into(
+    p0: Point,
+    p1: Point,
+    p2: Point,
+    p3: Point,
+    frame: &Frame,
+    mut emit: impl FnMut(Point),
+) {
+    // The regions are checked only for a curve whose bounds reach one:
+    // the control points of the curves split from it, and so their
+    // bounds, are within its bounds.
+    fn split(
+        a: Point,
+        b: Point,
+        c: Point,
+        d: Point,
+        depth: u32,
+        frame: Option<&Frame>,
+        emit: &mut impl FnMut(Point),
+    ) {
+        if depth >= MAX_DEPTH
+            || flatness(a, b, c, d) <= FLATNESS
+            || frame.is_some_and(|f| f.holds(a, b, c, d))
+        {
             emit(d);
             return;
         }
@@ -176,10 +297,34 @@ fn flatten_curve_into(p0: Point, p1: Point, p2: Point, p3: Point, mut emit: impl
         let abc = mid(ab, bc);
         let bcd = mid(bc, cd);
         let m = mid(abc, bcd);
-        split(a, ab, abc, m, depth + 1, emit);
-        split(m, bcd, cd, d, depth + 1, emit);
+        split(a, ab, abc, m, depth + 1, frame, emit);
+        split(m, bcd, cd, d, depth + 1, frame, emit);
     }
-    split(p0, p1, p2, p3, 0, &mut emit);
+    let frame = frame.reaches(p0, p1, p2, p3).then_some(frame);
+    split(p0, p1, p2, p3, 0, frame, &mut emit);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The calls of `add` by [`render_line`] on this thread, for the tests
+    /// of the work off the canvas (docs/adr/0022).
+    static ADDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts a call of `add`.
+#[inline]
+fn count_add() {
+    #[cfg(test)]
+    ADDS.with(|c| c.set(c.get() + 1));
+}
+
+/// The number of calls of `add` by [`render_line`] while `f` runs on this
+/// thread, with its result.
+#[cfg(test)]
+pub(crate) fn counting_adds<R>(f: impl FnOnce() -> R) -> (R, u64) {
+    let before = ADDS.with(std::cell::Cell::get);
+    let result = f();
+    (result, ADDS.with(std::cell::Cell::get) - before)
 }
 
 /// A cell: (row, column, cover, area).
@@ -204,9 +349,16 @@ fn merge(cells: &mut Vec<Cell>) {
 
 /// The multiples of ONE strictly between `a` and `b`, from `a` to `b`.
 fn crossings(a: i64, b: i64) -> impl Iterator<Item = i64> {
+    crossings_within(a, b, i64::MIN, i64::MAX)
+}
+
+/// The multiples k · ONE of [`crossings`] with `k0 ≤ k ≤ k1`, in the same
+/// order: the crossings on the rows or the columns of a canvas, without
+/// walking the others (docs/adr/0022).
+fn crossings_within(a: i64, b: i64, k0: i64, k1: i64) -> impl Iterator<Item = i64> {
     let (lo, hi) = (a.min(b), a.max(b));
-    let first = lo.div_euclid(ONE64) + 1;
-    let last = (hi - 1).div_euclid(ONE64);
+    let first = (lo.div_euclid(ONE64) + 1).max(k0);
+    let last = (hi - 1).div_euclid(ONE64).min(k1);
     let count = (last - first + 1).max(0);
     (0..count).map(move |i| if a <= b { first + i } else { last - i } * ONE64)
 }
@@ -249,6 +401,9 @@ trait Carry:
 {
     /// The Euclidean quotient and remainder by a positive `d`.
     fn euclid(self, d: Self) -> (Self, Self);
+    /// Those of the product `db · delta`, which may pass the integers of
+    /// the carrier when `delta` is far from 0 (docs/adr/0022).
+    fn product_euclid(db: Self, delta: Self, d: Self) -> (Self, Self);
     fn is_odd(self) -> bool;
     /// The value, which the caller knows to be within i64.
     fn narrow(self) -> i64;
@@ -257,6 +412,17 @@ trait Carry:
 impl Carry for i64 {
     fn euclid(self, d: i64) -> (i64, i64) {
         (self.div_euclid(d), self.rem_euclid(d))
+    }
+    fn product_euclid(db: i64, delta: i64, d: i64) -> (i64, i64) {
+        // The quotient is at most |db| and the remainder below d, which
+        // fit; only the product may not.
+        match db.checked_mul(delta) {
+            Some(n) => n.euclid(d),
+            None => {
+                let (q, r) = (i128::from(db) * i128::from(delta)).euclid(i128::from(d));
+                (q as i64, r as i64)
+            }
+        }
     }
     fn is_odd(self) -> bool {
         self & 1 == 1
@@ -269,6 +435,9 @@ impl Carry for i64 {
 impl Carry for i128 {
     fn euclid(self, d: i128) -> (i128, i128) {
         (self.div_euclid(d), self.rem_euclid(d))
+    }
+    fn product_euclid(db: i128, delta: i128, d: i128) -> (i128, i128) {
+        (db * delta).euclid(d)
     }
     fn is_odd(self) -> bool {
         self & 1 == 1
@@ -312,7 +481,7 @@ impl<T: Carry> Carrier<T> {
     fn at(&mut self, at: i64) -> i64 {
         let (at, d) = (T::from(at), self.d);
         let (q, r) = match self.last {
-            None => (self.db * (at - self.a0)).euclid(d),
+            None => T::product_euclid(self.db, at - self.a0, d),
             Some((last, q, r)) => {
                 let db = self.db;
                 let (dq, dr) = *self
@@ -333,10 +502,13 @@ impl<T: Carry> Carrier<T> {
 }
 
 /// The carrier in i64 of the segment from (a0, b0) to (a1, b1), if its
-/// values stay within i64: with |db| ≤ 2^54 and d ≤ 2^61, the products of
-/// the first crossing (within 256 of a0) and of the step (256) are at most
-/// 2^62 in size, the quotient at most |db|, and the remainders below 2d;
-/// the rounded b is between b0 and b1 (docs/adr/0020).
+/// values stay within i64: with |db| ≤ 2^54 and d ≤ 2^61, the product of
+/// the step (256) is at most 2^62 in size, the quotient at most |db|, and
+/// the remainders below 2d; the rounded b is between b0 and b1
+/// (docs/adr/0020). The first crossing is within 256 of a0 for a whole
+/// segment, but may be anywhere between a0 and a1 for the rows of a
+/// canvas, so its product is taken in i128 when it passes i64
+/// (docs/adr/0022).
 fn narrow_carrier(a0: i64, a1: i64, b0: i64, b1: i64) -> Option<Carrier<i64>> {
     let (db, d) = if a1 < a0 {
         (b0.checked_sub(b1)?, a0.checked_sub(a1)?)
@@ -391,7 +563,18 @@ fn interpolations(
 /// each piece at the columns, with x exact and y interpolated within the
 /// row. This is the innermost loop of filling, so the pieces are walked
 /// with plain loops (docs/adr/0014).
-pub(crate) fn render_line(add: &mut impl FnMut(i32, i32, i64, i64), p0: Point, p1: Point) {
+///
+/// Only the crossings with the rows of the canvas are walked
+/// (docs/adr/0022): a piece with an end above or below them is in a row
+/// beyond the canvas, where the cells change no pixel, and
+/// [`render_row_piece`] drops it by its row. The loop is the one of a whole
+/// segment, so that the crossings are carried as fast.
+pub(crate) fn render_line(
+    add: &mut impl FnMut(i32, i32, i64, i64),
+    p0: Point,
+    p1: Point,
+    area: Area,
+) {
     let (x0, y0, x1, y1) = (
         i64::from(p0.0),
         i64::from(p0.1),
@@ -402,34 +585,84 @@ pub(crate) fn render_line(add: &mut impl FnMut(i32, i32, i64, i64), p0: Point, p
         return;
     }
     let mut last = (x0, y0);
-    for (y, x) in interpolations(y0, y1, x0, x1, crossings(y0, y1)) {
+    for (y, x) in interpolations(y0, y1, x0, x1, crossings_within(y0, y1, 0, area.height)) {
         let p = (x, y);
-        render_row_piece(add, last, p);
+        render_row_piece(add, last, p, area);
         last = p;
     }
-    render_row_piece(add, last, (x1, y1));
+    render_row_piece(add, last, (x1, y1), area);
 }
 
-/// Adds the piece of a segment within one row.
-fn render_row_piece(add: &mut impl FnMut(i32, i32, i64, i64), a: (i64, i64), b: (i64, i64)) {
+/// Adds the piece of a segment within one row of a canvas (docs/adr/0022).
+/// A piece in a row beyond the canvas changes no pixel and is dropped.
+/// Only the columns of the canvas are walked: a cell right of them (x ≥ W)
+/// changes no pixel and is dropped; the cells left of them (x < 0) only
+/// add their cover to the row, so the part of the piece there, which is at
+/// most the first or the last cell, is one cell of column −1 without area,
+/// with the height of the part.
+fn render_row_piece(
+    add: &mut impl FnMut(i32, i32, i64, i64),
+    a: (i64, i64),
+    b: (i64, i64),
+    area: Area,
+) {
     let ((ax, ay), (bx, by)) = (a, b);
-    let row = ay.min(by).div_euclid(ONE64) as i32;
+    let row = ay.min(by).div_euclid(ONE64);
+    if !(0..area.height).contains(&row) {
+        return;
+    }
+    let row = row as i32;
     let (ylo, yhi) = (ay.min(by), ay.max(by));
-    let mut cell = |(cx, cy): (i64, i64), (dx, dy): (i64, i64)| {
-        let col = cx.min(dx).div_euclid(ONE64);
-        let (fx0, fx1) = (cx - col * ONE64, dx - col * ONE64);
-        let height = dy - cy;
-        add(row, col as i32, height, (fx0 + fx1) * height);
+    let width = area.width;
+    let wu = width * ONE64;
+    let (xlo, xhi) = (ax.min(bx), ax.max(bx));
+    if xlo >= 0 && xhi < wu {
+        // Within the columns of the canvas, as most pieces are.
+        let mut last = (ax, ay);
+        if ax != bx {
+            for (x, y) in interpolations(ax, bx, ay, by, crossings(ax, bx)) {
+                let p = (x, y.clamp(ylo, yhi));
+                cell(add, row, last, p);
+                last = p;
+            }
+        }
+        cell(add, row, last, (bx, by));
+        return;
+    }
+    // A cell with x < 0 is left of the canvas, one with x ≥ W right of it.
+    let mut cell_within = |c: (i64, i64), d: (i64, i64)| {
+        let x = c.0.min(d.0);
+        if x < 0 {
+            count_add();
+            add(row, -1, d.1 - c.1, 0);
+        } else if x < wu {
+            cell(add, row, c, d);
+        }
     };
     let mut last = (ax, ay);
     if ax != bx {
-        for (x, y) in interpolations(ax, bx, ay, by, crossings(ax, bx)) {
+        for (x, y) in interpolations(ax, bx, ay, by, crossings_within(ax, bx, 0, width)) {
             let p = (x, y.clamp(ylo, yhi));
-            cell(last, p);
+            cell_within(last, p);
             last = p;
         }
     }
-    cell(last, (bx, by));
+    cell_within(last, (bx, by));
+}
+
+/// Adds the cell of the piece from `c` to `d` within one column of `row`.
+#[inline]
+fn cell(
+    add: &mut impl FnMut(i32, i32, i64, i64),
+    row: i32,
+    (cx, cy): (i64, i64),
+    (dx, dy): (i64, i64),
+) {
+    let col = cx.min(dx).div_euclid(ONE64);
+    let (fx0, fx1) = (cx - col * ONE64, dx - col * ONE64);
+    let height = dy - cy;
+    count_add();
+    add(row, col as i32, height, (fx0 + fx1) * height);
 }
 
 /// The opacity of a pixel from its signed coverage.
@@ -587,7 +820,8 @@ fn visit_rows(
                 *span = (span.0.min(j), span.1.max(j));
             }
         };
-        for_each_edge(path, |a, b| render_line(&mut add, a, b));
+        let area = Area::new(width, height);
+        for_each_edge(path, |a, b| render_line(&mut add, a, b, area));
         // Each row is swept from the left over the slots between the first
         // and the last added to: a slot of 0 gives the pixel of the span it
         // is in (docs/adr/0015), so the slots before the first give no
@@ -630,7 +864,8 @@ fn visit_rows(
     } else {
         cells.clear();
         let mut add = |row, col, cover, area| cells.push((row, col, cover, area));
-        for_each_edge(path, |a, b| render_line(&mut add, a, b));
+        let area = Area::new(width, height);
+        for_each_edge(path, |a, b| render_line(&mut add, a, b, area));
         merge(cells);
         pixels.clear();
         sweep_into(cells, rule, width, height, pixels);
@@ -951,3 +1186,6 @@ mod reference_tests;
 
 #[cfg(test)]
 mod miter_tests;
+
+#[cfg(test)]
+mod outside_tests;

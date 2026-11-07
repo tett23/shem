@@ -7,7 +7,7 @@ use crate::fixed::{Fixed, Matrix, round_shift};
 use crate::font::{Font, FontCache, Segment};
 use crate::pdf::Object;
 use crate::pdf::{Dict, Document, Page};
-use crate::raster::{Canvas, FillRule, Path, Point, Scratch, signed_area, stroke_into};
+use crate::raster::{Canvas, FillRule, Frame, Path, Point, Scratch, signed_area, stroke_into};
 
 /// The fill and the lines of the box of an image or a form (docs/adr/0006).
 const BOX_FILL: [u8; 3] = [192, 192, 192];
@@ -96,7 +96,17 @@ pub fn fits_in_device(m: &Matrix, segments: &[Segment]) -> bool {
 }
 
 /// [`fits_in_device`] from the largest absolute values of the coordinates.
-fn fits_with_extent(m: &Matrix, (mx, my): (u64, u64)) -> bool {
+fn fits_with_extent(m: &Matrix, extent: (u64, u64)) -> bool {
+    fits_within(m, extent, i64::from(i32::MAX))
+}
+
+/// [`fits_with_extent`] with every unit at most `reach` in size: the
+/// points of a glyph of Tr 2 leave room for the margin of its stroke
+/// (docs/adr/0022).
+fn fits_within(m: &Matrix, (mx, my): (u64, u64), reach: i64) -> bool {
+    if reach < 2 {
+        return false;
+    }
     // The bound of |p x + q y + t| in units of 2^-64.
     let bound = |p: Fixed, q: Fixed, t: Fixed| -> Option<u128> {
         let px = u128::from(p.raw().unsigned_abs()).checked_mul(u128::from(mx))?;
@@ -104,11 +114,19 @@ fn fits_with_extent(m: &Matrix, (mx, my): (u64, u64)) -> bool {
         px.checked_add(qy)?
             .checked_add(u128::from(t.raw().unsigned_abs()) << 32)
     };
-    // raw ≤ S / 2^32 + 1 and units ≤ raw / 2^24 + 1 ≤ 2^31 − 1.
-    let limit: u128 = ((((1u128 << 31) - 2) << 24) - 1) << 32;
+    // raw ≤ S / 2^32 + 1 and units ≤ raw / 2^24 + 1 ≤ reach.
+    let limit: u128 = (((reach as u128 - 1) << 24) - 1) << 32;
     [bound(m.a, m.c, m.e), bound(m.b, m.d, m.f)]
         .iter()
         .all(|b| b.is_some_and(|b| b <= limit))
+}
+
+/// The margin around the points of a glyph of Tr 2 that holds the polygons
+/// of its stroke: the quadrilaterals reach `half` from the segments, the
+/// miters at most 10 · half from the vertices, and the rounding a few units
+/// (docs/adr/0022).
+fn stroke_margin(half: i64) -> i64 {
+    16 * half + 16
 }
 
 /// Half the width of a stroke in device space, in units of 1/256 pixel. The
@@ -149,6 +167,11 @@ struct Renderer<'a> {
     cache: &'a FontCache,
     resources: &'a Dict,
     canvas: Canvas,
+    // The size of the image, and its frame, beyond which a curve is one
+    // segment (docs/adr/0022).
+    width: usize,
+    height: usize,
+    frame: Frame,
     state: GraphicsState,
     stack: Vec<GraphicsState>,
     path: Path,
@@ -266,13 +289,30 @@ impl Renderer<'_> {
         // map them, and the rendering maps them without the checks
         // (docs/adr/0015).
         let fits = fits_with_extent(&m, extent);
-        if paint || !fits {
+        // In mode 2, the glyph is stroked, and the points with the margin
+        // of the stroke around them must stay within the device
+        // (docs/adr/0022). An error of the width is reported after the
+        // points, as before.
+        let half = (self.state.render_mode == 2)
+            .then(|| stroke_half_width(&self.state.ctm, self.state.line_width));
+        let margin = match half {
+            Some(Ok(half)) => stroke_margin(half),
+            _ => 0,
+        };
+        let reach = i64::from(i32::MAX) - margin;
+        let within = margin == 0 || fits_within(&m, extent, reach);
+        let frame = Frame::around(self.width, self.height, margin);
+        if paint || !fits || !within {
             let point = |x: Fixed, y: Fixed| {
-                if fits {
-                    Ok(to_device_fitting(&m, x, y))
+                let p = if fits {
+                    to_device_fitting(&m, x, y)
                 } else {
-                    to_device(&m, x, y)
+                    to_device(&m, x, y)?
+                };
+                if !within && (i64::from(p.0).abs() > reach || i64::from(p.1).abs() > reach) {
+                    return Err(Error::new("glyph stroke outside the range of coordinates"));
                 }
+                Ok(p)
             };
             outline.iter().try_for_each(|s| {
                 match *s {
@@ -291,7 +331,7 @@ impl Renderer<'_> {
                     Segment::Curve([x1, y1, x2, y2, x3, y3]) => {
                         let (c1, c2, p) = (point(x1, y1)?, point(x2, y2)?, point(x3, y3)?);
                         if paint {
-                            path.curve_to(c1, c2, p);
+                            path.curve_to_within(c1, c2, p, &frame);
                         }
                     }
                     Segment::Close => path.close(),
@@ -302,14 +342,15 @@ impl Renderer<'_> {
         // Each glyph is filled, then stroked in mode 2 (9.3.6).
         let fill = self.state.fill;
         self.fill(&path, fill);
-        let stroked = if self.state.render_mode == 2 {
+        let stroked = match half {
             // The line width is in user space, so the CTM decides the width.
-            stroke_half_width(&self.state.ctm, self.state.line_width).map(|half| {
+            Some(Ok(half)) => {
                 let rgb = self.state.stroke;
                 self.fill_stroke(&path, half, rgb);
-            })
-        } else {
-            Ok(())
+                Ok(())
+            }
+            Some(Err(e)) => Err(e),
+            None => Ok(()),
         };
         self.glyph = path;
         stroked?;
@@ -416,7 +457,7 @@ impl Renderer<'_> {
                     self.point(*x2, *y2)?,
                     self.point(*x3, *y3)?,
                 );
-                self.path.curve_to(c1, c2, p);
+                self.path.curve_to_within(c1, c2, p, &self.frame);
             }
             Operator::ClosePath => self.path.close(),
             Operator::Rect([x, y, w, h]) => {
@@ -577,6 +618,9 @@ fn interpret_ops<'c>(
         cache,
         resources: &page.resources,
         canvas,
+        width,
+        height,
+        frame: Frame::around(width, height, 0),
         paint,
         glyph: std::mem::take(&mut ws.glyph),
         outline: std::mem::take(&mut ws.outline),
