@@ -157,7 +157,7 @@ fn a_copy_may_overlap_its_own_output() {
 fn rejects_a_wrong_adler32() {
     let mut z = include_bytes!("../../tests/fixtures/flate/dynamic.zz").to_vec();
     *z.last_mut().unwrap() ^= 1;
-    assert!(inflate_zlib(&z).unwrap_err().message.contains("Adler-32"));
+    assert!(inflate_zlib(&z).unwrap_err().message().contains("Adler-32"));
 }
 
 #[test]

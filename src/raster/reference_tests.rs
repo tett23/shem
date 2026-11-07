@@ -278,3 +278,105 @@ fn filling_a_canvas_paints_the_coverage() {
             });
         });
 }
+
+fn interpolations_equal_interpolate(a0: i64, a1: i64, b0: i64, b1: i64) {
+    let carried: Vec<(i64, i64)> = interpolations(a0, a1, b0, b1, crossings(a0, a1)).collect();
+    let each: Vec<(i64, i64)> = crossings(a0, a1)
+        .map(|at| (at, interpolate(a0, a1, b0, b1, at)))
+        .collect();
+    assert_eq!(carried, each, "{a0} {a1} {b0} {b1}");
+}
+
+#[test]
+fn carried_crossings_equal_the_divided_ones() {
+    // docs/adr/0019: the quotient and the remainder are carried from one
+    // crossing to the next, with the same rounding as one division each.
+    let mut rng = Rng(0x0019_0005);
+    let extreme = [i64::from(i32::MIN), i64::from(i32::MAX), 0, 1, -1];
+    (0..200_000).for_each(|k| {
+        let span = [256, 1 << 16, 1 << 31][k % 3];
+        let mut v = |span: i64| match k % 7 {
+            0 => extreme[rng.range(0, 5) as usize],
+            _ => rng.range(-span, span),
+        };
+        let (a0, b0, b1) = (v(1 << 31), v(span), v(span));
+        // Up to 40 crossings, one, or none; both directions.
+        let a1 =
+            (a0 + rng.range(-40 * 256, 40 * 256)).clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+        if a0 != a1 {
+            interpolations_equal_interpolate(a0, a1, b0, b1);
+        }
+    });
+    // Products past i64: every crossing of the whole range of i32.
+    let (lo, hi) = (i64::from(i32::MIN), i64::from(i32::MAX));
+    interpolations_equal_interpolate(lo, hi, lo, hi);
+    interpolations_equal_interpolate(hi, lo, lo, hi);
+}
+
+#[test]
+fn filling_paths_cut_at_the_edges_paints_the_coverage() {
+    // docs/adr/0019: only the touched span of a row of the grid is swept;
+    // paths cut at the left and the right edges, and cells of column −1.
+    let mut rng = Rng(0x0019_0006);
+    [
+        (40, 30, -5000, 15000),
+        (40, 30, 8000, 30000),
+        (12, 9, -3000, 1000),
+        (600, 500, -60000, 200000),
+    ]
+    .iter()
+    .for_each(|&(w, h, lo, hi)| {
+        let mut scratch = Scratch::default();
+        let mut filled = Canvas::new(w, h);
+        let mut painted = Canvas::new(w, h);
+        (0..60).for_each(|k| {
+            let path = build(&random_cmds(&mut rng, true, lo, hi));
+            let rule = [FillRule::NonZero, FillRule::EvenOdd][k % 2];
+            let rgb = match k % 3 {
+                0 => [0, 0, 0],
+                _ => [rng.range(0, 256) as u8, rng.range(0, 256) as u8, k as u8],
+            };
+            filled.fill(&path, rule, rgb, &mut scratch);
+            painted.paint(&coverage(&path, rule, w, h), rgb);
+            assert!(filled == painted, "{k}");
+        });
+    });
+}
+
+#[test]
+fn the_grid_is_zero_between_fills() {
+    // docs/adr/0019: the swept slots are zeroed after each fill, and fills
+    // with one scratch give the image of fills with new ones.
+    let mut rng = Rng(0x0019_0007);
+    let (w, h) = (40, 30);
+    let mut scratch = Scratch::default();
+    let mut kept = Canvas::new(w, h);
+    let mut fresh = Canvas::new(w, h);
+    (0..200).for_each(|k| {
+        let hi = [3000, 12800, 30000][k % 3];
+        let path = build(&random_cmds(&mut rng, true, -2560, hi));
+        let rule = [FillRule::NonZero, FillRule::EvenOdd][k % 2];
+        let rgb = [k as u8, 0, 255 - k as u8];
+        kept.fill(&path, rule, rgb, &mut scratch);
+        fresh.fill(&path, rule, rgb, &mut Scratch::default());
+        assert!(kept == fresh, "{k}");
+        assert!(scratch.grid.iter().all(|&s| s == (0, 0)), "{k}");
+    });
+}
+
+#[test]
+fn painting_black_is_compositing_black() {
+    // docs/adr/0019: black has no products of its own.
+    (0..=255u8).for_each(|a| {
+        (0..=255u8).for_each(|p| {
+            let mut px = [p, p, 255 - p];
+            paint_black(&mut px, a);
+            let expected = [
+                composite(0, a, p),
+                composite(0, a, p),
+                composite(0, a, 255 - p),
+            ];
+            assert_eq!(px, expected, "{a} {p}");
+        })
+    });
+}

@@ -84,6 +84,29 @@ mod tests {
     #[test]
     fn inner_place_wins() {
         let e = Error::new("x").at_page(1).at_page(2);
-        assert_eq!(e.page, Some(1));
+        assert_eq!(e.page(), Some(1));
+    }
+
+    #[test]
+    fn a_result_of_a_number_is_small() {
+        // docs/adr/0019: the fields are behind a Box.
+        assert!(std::mem::size_of::<Result<crate::fixed::Fixed>>() <= 16);
+    }
+
+    #[test]
+    fn places_stack_as_before() {
+        let e = Error::new("bad")
+            .at_offset(7)
+            .at_object(4)
+            .at_page(2)
+            .at_offset(9)
+            .at_object(5)
+            .at_page(3);
+        assert_eq!(e.to_string(), "page 2: object 4: offset 7: bad");
+        assert_eq!(
+            (e.page(), e.object(), e.offset()),
+            (Some(2), Some(4), Some(7))
+        );
+        assert_eq!(e.message(), "bad");
     }
 }
