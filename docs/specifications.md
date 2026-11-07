@@ -72,7 +72,7 @@ shem --help
 
 ブラウザ（Web Worker）と Deno で動かすために、ライブラリを `wasm32-unknown-unknown` で `shem.wasm` にビルドする（[ADR 0018](adr/0018-wasm-module-for-the-browser.md)）。
 
-- import はない。`WebAssembly.instantiate(module, {})` で読み込める。エクスポートは下の関数と `memory` で、ほかに rustc のリンカーが入れる二つのグローバル（`__data_end` と `__heap_base`）がある。グローバルは受け渡しに使わない。
+- import はない。`WebAssembly.instantiate(module, {})` で読み込める。エクスポートは下の関数と `memory` だけである。ビルドには stable の Rust を使う（古い nightly のリンカーは、ほかに二つのグローバルをエクスポートする）。
 - 関数は C の ABI で、引数と戻り値は 32 ビットの整数（線形メモリの中のポインタ、長さ、番号）である。
 
 | 関数 | 引数 | 戻り値 | 意味 |

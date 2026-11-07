@@ -90,16 +90,10 @@ Deno.test("the module has no imports and exports the functions", () => {
     WebAssembly.Module.imports(module).length === 0,
     JSON.stringify(WebAssembly.Module.imports(module)),
   );
-  // The linker of rustc also exports two globals, which are not used.
-  const exports = WebAssembly.Module.exports(module);
-  const used = exports.filter((e) => e.kind !== "global").map((e) => e.name)
-    .sort();
-  assert(JSON.stringify(used) === JSON.stringify(names), used.join(" "));
-  const globals = exports.filter((e) => e.kind === "global").map((e) => e.name)
-    .sort();
+  const exported = WebAssembly.Module.exports(module).map((e) => e.name).sort();
   assert(
-    JSON.stringify(globals) === JSON.stringify(["__data_end", "__heap_base"]),
-    globals.join(" "),
+    JSON.stringify(exported) === JSON.stringify(names),
+    exported.join(" "),
   );
 });
 

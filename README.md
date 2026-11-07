@@ -150,8 +150,8 @@ Run the tests with `cargo test`.
 To test `shem.wasm`, build it and run the tests of Deno:
 
 ```sh
-rustup target add wasm32-unknown-unknown
-sh scripts/ci/build-wasm.sh target/shem.wasm
+rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+rustup run stable sh scripts/ci/build-wasm.sh target/shem.wasm
 SHEM_WASM=target/shem.wasm deno test --allow-read --allow-env wasm/test.ts
 ```
 

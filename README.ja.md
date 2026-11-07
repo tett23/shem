@@ -150,8 +150,8 @@ git config core.hooksPath .githooks
 `shem.wasm` を確かめるには、ビルドして Deno のテストを実行する。
 
 ```sh
-rustup target add wasm32-unknown-unknown
-sh scripts/ci/build-wasm.sh target/shem.wasm
+rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+rustup run stable sh scripts/ci/build-wasm.sh target/shem.wasm
 SHEM_WASM=target/shem.wasm deno test --allow-read --allow-env wasm/test.ts
 ```
 
