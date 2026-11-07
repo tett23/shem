@@ -50,6 +50,7 @@ Download the archive for your platform and `SHA256SUMS` from [Releases](https://
 | `shem-<tag>-x86_64-unknown-linux-musl.tar.gz` | Linux x86-64 (statically linked) |
 | `shem-<tag>-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 (statically linked) |
 | `shem-<tag>-aarch64-apple-darwin.tar.gz` | macOS on Apple Silicon |
+| `shem.wasm` | WebAssembly, for browsers and Deno (the same name in every release) |
 
 ```sh
 tag=v0.1.0-rc4
@@ -97,6 +98,45 @@ The exit status is 0 if nothing differs, 1 if something does, and 2 on an error.
 
 The library of the crate (`shem::render::Session`, `shem::parallel::run`) may change without a new version while shem is at v0.x.
 
+### In the browser
+
+`shem.wasm` renders pages to RGBA in a browser (a Web Worker) or in Deno.
+It has no imports: `WebAssembly.instantiate(module, {})` loads it.
+Its functions take and return 32-bit integers: pointers into its memory, lengths and numbers.
+
+| Function | Arguments | Returns |
+|---|---|---|
+| `shem_alloc` | `len` | a pointer to `len` bytes of 0, to write the PDF to |
+| `shem_free` | `ptr` | nothing; frees what `shem_alloc` gave |
+| `shem_open` | `ptr`, `len`, `dpi` | the number of a document (from 1), or 0 |
+| `shem_page_count` | `doc` | the number of pages, or 0 for no such document |
+| `shem_render` | `doc`, `page` | 1, or 0; renders page `page` (from 0) of the document |
+| `shem_image_ptr`, `shem_image_width`, `shem_image_height` | `doc` | the RGBA of the last rendered page, and its size |
+| `shem_close` | `doc` | nothing; frees the document and its image |
+| `shem_error_ptr`, `shem_error_len` | none | the UTF-8 message of the last error |
+
+```js
+const { exports: shem } = await WebAssembly.instantiate(module, {});
+const ptr = shem.shem_alloc(pdf.length);
+new Uint8Array(shem.memory.buffer, ptr, pdf.length).set(pdf);
+const doc = shem.shem_open(ptr, pdf.length, 144);
+shem.shem_free(ptr);
+if (doc === 0) throw new Error(message(shem));
+for (let page = 0; page < shem.shem_page_count(doc); page++) {
+  if (shem.shem_render(doc, page) === 0) throw new Error(message(shem));
+  const width = shem.shem_image_width(doc), height = shem.shem_image_height(doc);
+  const rgba = new Uint8ClampedArray(shem.memory.buffer, shem.shem_image_ptr(doc), width * height * 4);
+  show(new ImageData(rgba.slice(), width, height));
+}
+shem.shem_close(doc);
+```
+
+Here `message` reads `shem_error_len()` bytes at `shem_error_ptr()`.
+`shem_render` checks only the page it renders, so the first page can be shown before the others are read.
+The messages of errors are those that `shem render` prints.
+The image stays valid until the next `shem_render` or `shem_close` of the document.
+A panic would be a trap (`WebAssembly.RuntimeError`); then load a new instance.
+
 ## Development
 
 Install [adr-guard](https://github.com/tett23/adr-guard) v0.10.0 or later, and enable the git hooks in each clone.
@@ -107,6 +147,14 @@ git config core.hooksPath .githooks
 ```
 
 Run the tests with `cargo test`.
+To test `shem.wasm`, build it and run the tests of Deno:
+
+```sh
+rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+rustup run stable sh scripts/ci/build-wasm.sh target/shem.wasm
+SHEM_WASM=target/shem.wasm deno test --allow-read --allow-env wasm/test.ts
+```
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how changes are made.
 
 ## License

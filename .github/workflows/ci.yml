@@ -45,6 +45,40 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
+  # The module for the browser (docs/adr/0018): built for
+  # wasm32-unknown-unknown and loaded by Deno with no imports, it renders
+  # kanikosen at 144 dpi to the pixels of the native shem
+  wasm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-wasm-cargo-${{ hashFiles('Cargo.lock') }}
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.x
+      - run: sh scripts/ci/build-wasm.sh "$RUNNER_TEMP/shem.wasm"
+      - name: Render kanikosen natively
+        run: |
+          cargo build --release --locked
+          target/release/shem render --dpi 144 --format ppm tests/fixtures/golem/kanikosen.pdf "$RUNNER_TEMP/ppm"
+      - run: deno fmt --check wasm/
+      - run: deno lint wasm/
+      - run: deno check wasm/test.ts
+      - name: Test the module
+        run: SHEM_WASM="$RUNNER_TEMP/shem.wasm" SHEM_PPM="$RUNNER_TEMP/ppm" deno test --allow-read --allow-env wasm/test.ts
+
   # Committed ADRs change only in their status lines and links
   adr:
     runs-on: ubuntu-24.04

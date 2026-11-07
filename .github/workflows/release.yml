@@ -99,8 +99,28 @@ jobs:
           path: shem-*.tar.gz
           if-no-files-found: error
 
+  # The module for the browser, under a name that does not change with the
+  # version (docs/adr/0018)
+  wasm:
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          rustup default stable
+      - run: sh scripts/ci/build-wasm.sh shem.wasm
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wasm
+          path: shem.wasm
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, wasm]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -111,7 +131,7 @@ jobs:
           merge-multiple: true
       - name: Create checksums
         working-directory: dist
-        run: sha256sum shem-*.tar.gz > SHA256SUMS
+        run: sha256sum shem-*.tar.gz shem.wasm > SHA256SUMS
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
