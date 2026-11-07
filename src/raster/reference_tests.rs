@@ -777,3 +777,184 @@ fn painting_a_color_is_compositing_it() {
             });
         });
 }
+
+/// The crossing of `at` divided in i128 on its own (docs/adr/0020): unlike
+/// `interpolate`, the differences of any two i64 are taken in i128.
+fn divided_in_i128(a0: i64, a1: i64, b0: i64, b1: i64, at: i64) -> i64 {
+    let w = i128::from;
+    (w(b0) + crate::fixed::div_round((w(b1) - w(b0)) * (w(at) - w(a0)), w(a1) - w(a0))) as i64
+}
+
+fn carried_equal_divided_in_i128(a0: i64, a1: i64, b0: i64, b1: i64) {
+    // Compared as they come, without collecting the crossings of a long
+    // segment.
+    let each = crossings(a0, a1).map(|at| (at, divided_in_i128(a0, a1, b0, b1, at)));
+    let differ = interpolations(a0, a1, b0, b1, crossings(a0, a1))
+        .zip(each)
+        .find(|(carried, each)| carried != each);
+    assert_eq!(differ, None, "{a0} {a1} {b0} {b1}");
+    assert_eq!(
+        interpolations(a0, a1, b0, b1, crossings(a0, a1)).count(),
+        crossings(a0, a1).count()
+    );
+}
+
+#[test]
+fn carried_crossings_are_right_for_every_i64() {
+    // docs/adr/0020: any a0, a1, b0, b1 of i64, with a1 within 40 rows of
+    // a0, give the crossings divided one by one in i128.
+    let mut rng = Rng(0x0020_0001);
+    let near = [
+        i64::MIN,
+        i64::MAX,
+        0,
+        1,
+        -1,
+        1 << 31,
+        -(1 << 31),
+        1 << 54,
+        -(1 << 54),
+        1 << 61,
+        -(1 << 61),
+    ];
+    (0..200_000).for_each(|k| {
+        let mut v = || match rng.next() % 4 {
+            0 => near[(rng.next() % near.len() as u64) as usize]
+                .saturating_add((rng.next() % 513) as i64 - 256),
+            1 => (rng.next() as i64) >> (rng.next() % 64),
+            _ => rng.next() as i64,
+        };
+        let (a0, b0, b1) = (v(), v(), v());
+        let a1 = a0.saturating_add(rng.range(-40 * 256, 40 * 256));
+        if a0 != a1 {
+            carried_equal_divided_in_i128(a0, a1, b0, b1);
+        }
+        // Both directions of the same segment.
+        if k % 2 == 0 && a0 != a1 {
+            carried_equal_divided_in_i128(a1, a0, b1, b0);
+        }
+    });
+}
+
+#[test]
+fn the_two_paths_of_the_crossings_meet_at_their_bounds() {
+    // docs/adr/0020: i64 while |db| ≤ 2^54 and d ≤ 2^61, i128 past them;
+    // both give the same crossings at the bounds, ties included.
+    let (db_max, d_max) = (1i64 << 54, 1i64 << 61);
+    [db_max - 1, db_max, db_max + 1].iter().for_each(|&db| {
+        [-1i64, 1].iter().for_each(|&sign| {
+            // A short segment: a few crossings, b over db.
+            let (a0, a1) = (-1000, 3 * 256 + 17);
+            carried_equal_divided_in_i128(a0, a1, 7, 7 + sign * db);
+            carried_equal_divided_in_i128(a1, a0, 7 + sign * db, 7);
+            let expected = if db <= db_max { "i64" } else { "i128" };
+            assert_eq!(crossing_path(a0, a1, 7, 7 + sign * db), expected, "{db}");
+        })
+    });
+    [d_max - 1, d_max, d_max + 1].iter().for_each(|&d| {
+        // A long segment: its first and last crossings, and ties of the
+        // rounding when db is half of d.
+        let (a0, a1) = (-5, d - 5);
+        [1, d / 2, -(d / 2), 1 << 54].iter().for_each(|&db| {
+            let firsts: Vec<(i64, i64)> = interpolations(a0, a1, 3, 3 + db, crossings(a0, a1))
+                .take(40)
+                .collect();
+            let each: Vec<(i64, i64)> = crossings(a0, a1)
+                .take(40)
+                .map(|at| (at, divided_in_i128(a0, a1, 3, 3 + db, at)))
+                .collect();
+            assert_eq!(firsts, each, "{d} {db}");
+            let expected = if d <= d_max && db.abs() <= db_max {
+                "i64"
+            } else {
+                "i128"
+            };
+            assert_eq!(crossing_path(a0, a1, 3, 3 + db), expected, "{d} {db}");
+        });
+    });
+    // Differences that do not fit in i64 at all.
+    assert_eq!(
+        crossing_path(i64::MIN, i64::MIN + 600, i64::MIN, i64::MAX),
+        "i128"
+    );
+    carried_equal_divided_in_i128(i64::MIN, i64::MIN + 600, i64::MIN, i64::MAX);
+    carried_equal_divided_in_i128(i64::MAX, i64::MAX - 600, i64::MAX, i64::MIN);
+}
+
+fn cells_equal_the_divided_ones(p0: Point, p1: Point) {
+    let mut carried = Vec::new();
+    render_line(
+        &mut |r, c, cover, area| carried.push((r, c, cover, area)),
+        p0,
+        p1,
+    );
+    let mut each = Vec::new();
+    render_line_divided(
+        &mut |r, c, cover, area| each.push((r, c, cover, area)),
+        p0,
+        p1,
+    );
+    assert!(carried == each, "{p0:?} {p1:?}");
+}
+
+#[test]
+fn segments_near_the_ends_of_i32_are_cut_as_before() {
+    // docs/adr/0020: the segments between points near the ends of i32 and
+    // near 0, short enough to walk, give the cells of the division at each
+    // row; a few cross the whole range.
+    let ends = [
+        i32::MIN,
+        i32::MIN + 1,
+        i32::MIN + 300,
+        -1,
+        0,
+        1,
+        i32::MAX - 300,
+        i32::MAX - 1,
+        i32::MAX,
+    ];
+    let short = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs() <= 1 << 16;
+    ends.iter().for_each(|&x0| {
+        ends.iter().for_each(|&y0| {
+            ends.iter().filter(|&&x1| short(x0, x1)).for_each(|&x1| {
+                ends.iter()
+                    .filter(|&&y1| y1 != y0 && short(y0, y1))
+                    .for_each(|&y1| cells_equal_the_divided_ones((x0, y0), (x1, y1)))
+            })
+        })
+    });
+    let (lo, hi) = (i32::MIN, i32::MAX);
+    cells_equal_the_divided_ones((lo, hi), (hi, lo));
+    cells_equal_the_divided_ones((lo, 0), (hi, 1));
+}
+
+#[test]
+fn pieces_of_a_row_between_the_ends_of_i32_are_divided_as_before() {
+    // docs/adr/0020: the column crossings of a piece within one row, with x
+    // at the ends of i32 and the row near the ends too.
+    let xs = [
+        i64::from(i32::MIN),
+        i64::from(i32::MIN) + 300,
+        -1,
+        0,
+        1,
+        i64::from(i32::MAX) - 300,
+        i64::from(i32::MAX),
+    ];
+    let rows = [i64::from(i32::MIN), -256, 0, i64::from(i32::MAX) - 256];
+    xs.iter().for_each(|&ax| {
+        xs.iter()
+            .filter(|&&bx| bx != ax && (bx - ax).abs() <= 1 << 16)
+            .for_each(|&bx| {
+                rows.iter().for_each(|&row| {
+                    [0, 1, 128, 255, 256].iter().for_each(|&dy| {
+                        carried_equal_divided_in_i128(ax, bx, row, row + dy);
+                        interpolations_equal_interpolate(ax, bx, row, row + dy);
+                    })
+                })
+            })
+    });
+    // A piece across the whole range of i32.
+    let (lo, hi) = (i64::from(i32::MIN), i64::from(i32::MAX));
+    carried_equal_divided_in_i128(lo, hi, i64::from(i32::MAX) - 256, i64::from(i32::MAX));
+}

@@ -213,7 +213,9 @@ fn crossings(a: i64, b: i64) -> impl Iterator<Item = i64> {
 
 /// b at the point where a is `at`, on the line from (a0, b0) to (a1, b1).
 /// The product fits in i64 for most segments, whose division is faster
-/// and gives the same quotient (docs/adr/0015).
+/// and gives the same quotient (docs/adr/0015). Only the tests compare with
+/// it now, since [`interpolations`] carries the crossings (docs/adr/0020).
+#[cfg(test)]
 fn interpolate(a0: i64, a1: i64, b0: i64, b1: i64, at: i64) -> i64 {
     // With a negative divisor, both are negated; a product that does not
     // fit, or whose negation does not, goes through i128.
@@ -235,23 +237,134 @@ fn interpolate(a0: i64, a1: i64, b0: i64, b1: i64, at: i64) -> i64 {
     }
 }
 
-/// What [`interpolations`] carries from one crossing to the next: the last
-/// `at`, the Euclidean quotient and remainder of its product, and those of
-/// the step between two crossings, once known.
-#[derive(Clone, Copy)]
-struct Carried {
-    at: i64,
-    q: i64,
-    r: i64,
-    step: Option<(i64, i64)>,
+/// The integers the crossings are carried in: i64 for the segments within
+/// its bounds, i128 for the others (docs/adr/0020).
+trait Carry:
+    Copy
+    + Ord
+    + From<i64>
+    + std::ops::Add<Output = Self>
+    + std::ops::Sub<Output = Self>
+    + std::ops::Mul<Output = Self>
+{
+    /// The Euclidean quotient and remainder by a positive `d`.
+    fn euclid(self, d: Self) -> (Self, Self);
+    fn is_odd(self) -> bool;
+    /// The value, which the caller knows to be within i64.
+    fn narrow(self) -> i64;
 }
 
-/// `(at, b)` for each `at` of `ats`, with b as [`interpolate`] gives it. The
-/// `ats` differ by the same step, as [`crossings`] does, so when the products
-/// fit in i64, the quotient and the remainder are carried from one to the
-/// next with one division for the first and one for the step: the Euclidean
-/// quotient and remainder of n + Δ are those of n, plus those of Δ, with one
-/// carry; they are the same values, so the rounding is the same.
+impl Carry for i64 {
+    fn euclid(self, d: i64) -> (i64, i64) {
+        (self.div_euclid(d), self.rem_euclid(d))
+    }
+    fn is_odd(self) -> bool {
+        self & 1 == 1
+    }
+    fn narrow(self) -> i64 {
+        self
+    }
+}
+
+impl Carry for i128 {
+    fn euclid(self, d: i128) -> (i128, i128) {
+        (self.div_euclid(d), self.rem_euclid(d))
+    }
+    fn is_odd(self) -> bool {
+        self & 1 == 1
+    }
+    fn narrow(self) -> i64 {
+        self as i64
+    }
+}
+
+/// The crossings of one segment, carried in `T`: the products are taken
+/// to a positive divisor `d`; after the first crossing, the Euclidean
+/// quotient and remainder of the last one and those of the step.
+struct Carrier<T> {
+    a0: T,
+    b0: T,
+    db: T,
+    d: T,
+    last: Option<(T, T, T)>,
+    step: Option<(T, T)>,
+}
+
+impl<T: Carry> Carrier<T> {
+    fn new(a0: T, a1: T, b0: T, b1: T) -> Carrier<T> {
+        let (db, d) = if a1 < a0 {
+            (b0 - b1, a0 - a1)
+        } else {
+            (b1 - b0, a1 - a0)
+        };
+        Carrier {
+            a0,
+            b0,
+            db,
+            d,
+            last: None,
+            step: None,
+        }
+    }
+
+    /// b at the crossing `at`, rounded to the nearest, ties to even, as
+    /// `div_round` of its own product gives it.
+    fn at(&mut self, at: i64) -> i64 {
+        let (at, d) = (T::from(at), self.d);
+        let (q, r) = match self.last {
+            None => (self.db * (at - self.a0)).euclid(d),
+            Some((last, q, r)) => {
+                let db = self.db;
+                let (dq, dr) = *self
+                    .step
+                    .get_or_insert_with(|| (db * (at - last)).euclid(d));
+                let (q, r) = (q + dq, r + dr);
+                if r >= d {
+                    (q + T::from(1), r - d)
+                } else {
+                    (q, r)
+                }
+            }
+        };
+        self.last = Some((at, q, r));
+        let up = r > d - r || (r == d - r && q.is_odd());
+        (self.b0 + q + T::from(i64::from(up))).narrow()
+    }
+}
+
+/// The carrier in i64 of the segment from (a0, b0) to (a1, b1), if its
+/// values stay within i64: with |db| ≤ 2^54 and d ≤ 2^61, the products of
+/// the first crossing (within 256 of a0) and of the step (256) are at most
+/// 2^62 in size, the quotient at most |db|, and the remainders below 2d;
+/// the rounded b is between b0 and b1 (docs/adr/0020).
+fn narrow_carrier(a0: i64, a1: i64, b0: i64, b1: i64) -> Option<Carrier<i64>> {
+    let (db, d) = if a1 < a0 {
+        (b0.checked_sub(b1)?, a0.checked_sub(a1)?)
+    } else {
+        (b1.checked_sub(b0)?, a1.checked_sub(a0)?)
+    };
+    (db.unsigned_abs() <= 1 << 54 && d <= 1 << 61).then(|| Carrier::new(a0, a1, b0, b1))
+}
+
+/// The path [`interpolations`] takes for a segment, for the tests.
+#[cfg(test)]
+fn crossing_path(a0: i64, a1: i64, b0: i64, b1: i64) -> &'static str {
+    narrow_carrier(a0, a1, b0, b1).map_or("i128", |_| "i64")
+}
+
+/// The carrier of a segment: in i64 within its bounds, or in i128.
+enum Carriers {
+    Narrow(Carrier<i64>),
+    Wide(Carrier<i128>),
+}
+
+/// `(at, b)` for each `at` of `ats`, with b at `at` on the line from
+/// (a0, b0) to (a1, b1), rounded as one division in i128 would. The `ats`
+/// are `crossings(a0, a1)`: the first within 256 of a0, then 256 apart, so
+/// the quotient and the remainder are carried from one to the next with
+/// one division for the first and one for the step: the Euclidean quotient
+/// and remainder of n + Δ are those of n plus those of Δ, with one carry
+/// (docs/adr/0019). Any i64 is taken, in i64 or in i128 (docs/adr/0020).
 fn interpolations(
     a0: i64,
     a1: i64,
@@ -259,43 +372,17 @@ fn interpolations(
     b1: i64,
     ats: impl Iterator<Item = i64>,
 ) -> impl Iterator<Item = (i64, i64)> {
-    // The products are normalized to a positive divisor, as interpolate does.
-    let (db, d) = if a1 < a0 {
-        (b0 - b1, a0 - a1)
-    } else {
-        (b1 - b0, a1 - a0)
-    };
-    // Every |at − a0| is less than d, so the products fit if db · d does.
-    let fits = db.checked_mul(d).is_some();
-    let mut carried: Option<Carried> = None;
+    let w = i128::from;
+    let mut carrier = narrow_carrier(a0, a1, b0, b1).map_or_else(
+        || Carriers::Wide(Carrier::new(w(a0), w(a1), w(b0), w(b1))),
+        Carriers::Narrow,
+    );
     ats.map(move |at| {
-        if !fits {
-            return (at, interpolate(a0, a1, b0, b1, at));
-        }
-        let (q, r, step) = match carried {
-            None => {
-                let n = db * (at - a0);
-                (n.div_euclid(d), n.rem_euclid(d), None)
-            }
-            Some(Carried {
-                at: last,
-                q,
-                r,
-                step,
-            }) => {
-                let (dq, dr) = step.unwrap_or_else(|| {
-                    let delta = db * (at - last);
-                    (delta.div_euclid(d), delta.rem_euclid(d))
-                });
-                let (q, r) = (q + dq, r + dr);
-                let (q, r) = if r >= d { (q + 1, r - d) } else { (q, r) };
-                (q, r, Some((dq, dr)))
-            }
+        let b = match &mut carrier {
+            Carriers::Narrow(c) => c.at(at),
+            Carriers::Wide(c) => c.at(at),
         };
-        carried = Some(Carried { at, q, r, step });
-        // Rounded to the nearest, ties to even, as div_round_i64.
-        let up = r > d - r || (r == d - r && q & 1 == 1);
-        (at, b0 + q + i64::from(up))
+        (at, b)
     })
 }
 
