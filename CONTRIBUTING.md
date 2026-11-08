@@ -7,7 +7,7 @@ CONTRIBUTING.ja.md is a machine translation of it.
 
 ## Development environment
 
-Use the stable Rust toolchain.
+Use the Rust toolchain of `rust-toolchain.toml`; rustup picks it in the repository, and `rustup toolchain install` installs it.
 Install [adr-guard](https://github.com/tett23/adr-guard) v0.10.0 or later, and enable the git hooks after cloning.
 The setting is not stored in the repository, so run it in every clone.
 

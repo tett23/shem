@@ -73,7 +73,7 @@ shem --help
 
 ブラウザ（Web Worker）と Deno で動かすために、ライブラリを `wasm32-unknown-unknown` で `shem.wasm` にビルドする（[ADR 0018](adr/0018-wasm-module-for-the-browser.md)）。
 
-- import はない。`WebAssembly.instantiate(module, {})` で読み込める。エクスポートは下の関数と `memory` だけである。ビルドには stable の Rust を使う（古い nightly のリンカーは、ほかに二つのグローバルをエクスポートする）。
+- import はない。`WebAssembly.instantiate(module, {})` で読み込める。エクスポートは下の関数と `memory` だけである。ビルドには `rust-toolchain.toml` の版の stable の Rust を使う（古い nightly のリンカーは、ほかに二つのグローバルをエクスポートする）。
 - 関数は C の ABI で、引数と戻り値は 32 ビットの整数（線形メモリの中のポインタ、長さ、番号）である。
 
 | 関数 | 引数 | 戻り値 | 意味 |
@@ -240,7 +240,17 @@ musl のメモリ割り当ては一つの錠で守られ、割り当てのたび
 
 `v` で始まるタグを push すると、Linux の x86-64 と aarch64（musl で静的にリンク）と macOS の aarch64 のアーカイブ `shem-<タグ>-<ターゲット>.tar.gz` と `SHA256SUMS` を、GitHub の Releases に置く（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)）。
 同じリリースに、wasm のモジュール `shem.wasm` も置く。名前は版によらず同じで、`SHA256SUMS` にも入る（[ADR 0018](adr/0018-wasm-module-for-the-browser.md)）。
-タグと `Cargo.toml` の版が合わなければ、リリースは失敗する。
+タグと `Cargo.toml` の版が合わないか、タグのコミットが main の祖先でなければ、リリースは失敗する（[ADR 0024](adr/0024-provenance-and-pinning-for-ci-and-releases.md)）。
+
+リリースの成果物（三つのアーカイブと `shem.wasm`）には、リリースのワークフローで、ビルドの出自の attestation を付ける。
+`gh attestation verify <ファイル> -R tett23/shem` で確かめられる。
+`SHA256SUMS` は同じリリースに置くので、取得の破損を確かめるものであり、リリースの書き換えは防がない。
+リポジトリの immutable releases を有効にしているので、公開したリリースの資産とタグは変えられない。
+`v` で始まるタグには ruleset があり、付け替えと削除を禁じる（bypass できる者はいない）。
+
+CI、リリース、benchmark のワークフローは、`rust-toolchain.toml` の版の Rust（1.99.1）でビルドする。
+benchmark は、比べるすべての ref を、ワークフローを動かしたコミットの `rust-toolchain.toml` の版でビルドする。
+ワークフローの action はコミットの SHA で参照し、リポジトリの設定でもそれを強制する。
 
 ## 文書の翻訳
 
