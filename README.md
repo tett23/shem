@@ -37,7 +37,7 @@ The plan is in [docs/roadmap.md](docs/roadmap.md).
 ## Status
 
 The scope of v0.1 is implemented.
-The latest release candidate, v0.1.0-rc6, is on [Releases](https://github.com/tett23/shem/releases).
+The latest release candidate, v0.1.0-rc7, is on [Releases](https://github.com/tett23/shem/releases).
 The design is decided in ADRs (Architecture Decision Records) under [docs/adr/](docs/adr/).
 The specification is in [docs/specifications.md](docs/specifications.md).
 
@@ -53,7 +53,7 @@ Download the archive for your platform and `SHA256SUMS` from [Releases](https://
 | `shem.wasm` | WebAssembly, for browsers and Deno (the same name in every release) |
 
 ```sh
-tag=v0.1.0-rc6
+tag=v0.1.0-rc7
 target=x86_64-unknown-linux-musl
 curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/shem-$tag-$target.tar.gz"
 curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/SHA256SUMS"
@@ -64,7 +64,7 @@ tar -xzf "shem-$tag-$target.tar.gz"
 On macOS, use `shasum -a 256 -c check` in place of `sha256sum -c check`.
 `SHA256SUMS` sits in the same release as the archives, so it finds a broken download, not a release whose files were replaced.
 
-The releases after v0.1.0-rc6 carry attestations of build provenance.
+The releases from v0.1.0-rc7 on carry attestations of build provenance.
 With the [GitHub CLI](https://cli.github.com/), check that a file was built by the release workflow of this repository:
 
 ```sh
