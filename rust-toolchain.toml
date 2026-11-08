@@ -1,0 +1,6 @@
+# The Rust of CI, the releases and the benchmark (docs/adr/0024). A new
+# stable comes in by a pull request that changes this version.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

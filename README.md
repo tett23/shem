@@ -57,11 +57,21 @@ tag=v0.1.0-rc6
 target=x86_64-unknown-linux-musl
 curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/shem-$tag-$target.tar.gz"
 curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/SHA256SUMS"
-sha256sum --ignore-missing -c SHA256SUMS
+grep -F " shem-$tag-$target.tar.gz" SHA256SUMS > check && sha256sum -c check
 tar -xzf "shem-$tag-$target.tar.gz"
 ```
 
-On macOS, use `shasum -a 256 --ignore-missing -c SHA256SUMS`.
+On macOS, use `shasum -a 256 -c check` in place of `sha256sum -c check`.
+`SHA256SUMS` sits in the same release as the archives, so it finds a broken download, not a release whose files were replaced.
+
+The releases after v0.1.0-rc6 carry attestations of build provenance.
+With the [GitHub CLI](https://cli.github.com/), check that a file was built by the release workflow of this repository:
+
+```sh
+gh attestation verify "shem-$tag-$target.tar.gz" -R tett23/shem
+```
+
+These releases are immutable: their files and their tag cannot be changed after they are published.
 The macOS binary is not signed or notarized; an archive downloaded with `curl` or `gh` carries no quarantine attribute.
 
 To build from source instead, use Cargo:
@@ -148,11 +158,12 @@ git config core.hooksPath .githooks
 ```
 
 Run the tests with `cargo test`.
-To test `shem.wasm`, build it and run the tests of Deno:
+To test `shem.wasm`, build it with the Rust of `rust-toolchain.toml` and run the tests of Deno:
 
 ```sh
-rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
-rustup run stable sh scripts/ci/build-wasm.sh target/shem.wasm
+rustup toolchain install
+rustup target add wasm32-unknown-unknown
+sh scripts/ci/build-wasm.sh target/shem.wasm
 SHEM_WASM=target/shem.wasm deno test --allow-read --allow-env wasm/test.ts
 ```
 

@@ -57,11 +57,21 @@ tag=v0.1.0-rc6
 target=x86_64-unknown-linux-musl
 curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/shem-$tag-$target.tar.gz"
 curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/SHA256SUMS"
-sha256sum --ignore-missing -c SHA256SUMS
+grep -F " shem-$tag-$target.tar.gz" SHA256SUMS > check && sha256sum -c check
 tar -xzf "shem-$tag-$target.tar.gz"
 ```
 
-macOS では `shasum -a 256 --ignore-missing -c SHA256SUMS` を使う。
+macOS では、`sha256sum -c check` の代わりに `shasum -a 256 -c check` を使う。
+`SHA256SUMS` はアーカイブと同じリリースに置いているので、取得の破損は見つけられるが、ファイルを差し替えられたリリースは見つけられない。
+
+v0.1.0-rc6 より後のリリースには、ビルドの出自の attestation が付いている。
+[GitHub CLI](https://cli.github.com/) で、ファイルがこのリポジトリのリリースのワークフローでビルドされたことを確かめる。
+
+```sh
+gh attestation verify "shem-$tag-$target.tar.gz" -R tett23/shem
+```
+
+これらのリリースは immutable で、公開した後は、ファイルもタグも変えられない。
 macOS のバイナリは署名と公証をしていない。`curl` や `gh` で取得したアーカイブには検疫の属性が付かない。
 
 ソースからビルドする場合は、Cargo を使う。
@@ -148,11 +158,12 @@ git config core.hooksPath .githooks
 ```
 
 テストは `cargo test` で実行する。
-`shem.wasm` を確かめるには、ビルドして Deno のテストを実行する。
+`shem.wasm` を確かめるには、`rust-toolchain.toml` の版の Rust でビルドして、Deno のテストを実行する。
 
 ```sh
-rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
-rustup run stable sh scripts/ci/build-wasm.sh target/shem.wasm
+rustup toolchain install
+rustup target add wasm32-unknown-unknown
+sh scripts/ci/build-wasm.sh target/shem.wasm
 SHEM_WASM=target/shem.wasm deno test --allow-read --allow-env wasm/test.ts
 ```
 

@@ -30,17 +30,38 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+      # Every ref is built by the version of rust-toolchain.toml of the
+      # commit of the run, older refs too (docs/adr/0024)
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
-          rustup default stable
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
+          toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+      - name: Check the refs
+        env:
+          REFS: ${{ inputs.refs }}
+        run: |
+          set -- $REFS
+          if [ $# -eq 0 ]; then
+            echo "::error::No refs are given"
+            exit 64
+          fi
+          for ref in "$@"; do
+            case "$ref" in
+              -*)
+                echo "::error::The ref $ref starts with -"
+                exit 64
+                ;;
+            esac
+          done
       - name: Build
         env:
           REFS: ${{ inputs.refs }}
         run: |
           mkdir -p "$RUNNER_TEMP/bin"
           for ref in $REFS; do
-            commit=$(git rev-parse --verify "$ref^{commit}")
+            commit=$(git rev-parse --verify --end-of-options "$ref^{commit}")
             git worktree add --detach "$RUNNER_TEMP/src-$commit" "$commit"
             (cd "$RUNNER_TEMP/src-$commit" && cargo build --release --locked --target x86_64-unknown-linux-musl)
             cp "$RUNNER_TEMP/src-$commit/target/x86_64-unknown-linux-musl/release/shem" "$RUNNER_TEMP/bin/$commit"
@@ -60,12 +81,12 @@ jobs:
             echo "- PDF: tests/fixtures/golem/kanikosen.pdf, $(sha256sum tests/fixtures/golem/kanikosen.pdf | cut -d ' ' -f 1)"
             echo "- Images: $DPI dpi, $FORMAT"
             for ref in $REFS; do
-              echo "- $ref: $(git rev-parse --verify "$ref^{commit}")"
+              echo "- $ref: $(git rev-parse --verify --end-of-options "$ref^{commit}")"
             done
             echo
           } | tee -a "$GITHUB_STEP_SUMMARY"
           set --
           for ref in $REFS; do
-            set -- "$@" "$ref=$RUNNER_TEMP/bin/$(git rev-parse --verify "$ref^{commit}")"
+            set -- "$@" "$ref=$RUNNER_TEMP/bin/$(git rev-parse --verify --end-of-options "$ref^{commit}")"
           done
           sh scripts/ci/benchmark.sh tests/fixtures/golem/kanikosen.pdf "$@" | tee -a "$GITHUB_STEP_SUMMARY"

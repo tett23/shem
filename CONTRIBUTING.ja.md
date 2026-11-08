@@ -7,7 +7,7 @@
 
 ## 開発環境
 
-Rust の stable のツールチェーンを使う。
+`rust-toolchain.toml` の版の Rust のツールチェーンを使う。リポジトリの中では rustup がその版を選び、`rustup toolchain install` でインストールできる。
 [adr-guard](https://github.com/tett23/adr-guard) の v0.10.0 以降をインストールし、クローンしたら git の hook を有効にする。
 この設定はリポジトリに保存されないため、クローンのたびに実行する。
 
