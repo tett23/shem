@@ -37,7 +37,7 @@ shem は変化を見つけるものであり、描いた結果が正しいこと
 ## 状態
 
 v0.1 の範囲を実装した。
-最新のリリース候補 v0.1.0-rc6 を [Releases](https://github.com/tett23/shem/releases) に置いている。
+最新のリリース候補 v0.1.0-rc7 を [Releases](https://github.com/tett23/shem/releases) に置いている。
 設計は [docs/adr/](docs/adr/) の ADR（Architecture Decision Record）で決めている。
 仕様は [docs/specifications.md](docs/specifications.md) にある。
 
@@ -53,7 +53,7 @@ v0.1 の範囲を実装した。
 | `shem.wasm` | WebAssembly。ブラウザと Deno 用（どのリリースでも同じ名前） |
 
 ```sh
-tag=v0.1.0-rc6
+tag=v0.1.0-rc7
 target=x86_64-unknown-linux-musl
 curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/shem-$tag-$target.tar.gz"
 curl -fsSLO "https://github.com/tett23/shem/releases/download/$tag/SHA256SUMS"
@@ -64,7 +64,7 @@ tar -xzf "shem-$tag-$target.tar.gz"
 macOS では、`sha256sum -c check` の代わりに `shasum -a 256 -c check` を使う。
 `SHA256SUMS` はアーカイブと同じリリースに置いているので、取得の破損は見つけられるが、ファイルを差し替えられたリリースは見つけられない。
 
-v0.1.0-rc6 より後のリリースには、ビルドの出自の attestation が付いている。
+v0.1.0-rc7 以降のリリースには、ビルドの出自の attestation が付いている。
 [GitHub CLI](https://cli.github.com/) で、ファイルがこのリポジトリのリリースのワークフローでビルドされたことを確かめる。
 
 ```sh
