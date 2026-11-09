@@ -12,6 +12,8 @@ PDFs written by Golem, for the tests of the subset of PDF that shem reads
 | `figures.pdf` | Golem's `figures` fixture: an SVG, a PDF and a JPEG figure, as the golden `pdf-figures.txt` makes it |
 | `truetype.pdf` | the `figures` fixture with the TrueType Source Serif (variable) as the Latin font, for `CIDFontType2` and `FontFile2` |
 | `kanikosen.pdf` | Golem's `kanikosen` fixture as it is (129 pages, vertical), for the measurements of speed and the bytes of many pages (docs/adr/0013) |
+| `boxes.pdf` | a one-chapter book of paragraph boxes with round corners (Golem's docs/adr/0271), set horizontally: borders solid, dashed and dotted, and borders broken by `border-sides`, which Golem strokes with `l`, `S`, `1 J` and `d` (docs/adr/0025) |
+| `boxes-vertical.pdf` | the same set vertically |
 
 Two lists record what shem read and wrote before the changes of docs/adr/0013:
 
@@ -31,6 +33,13 @@ sh tests/fixtures/golem/make.sh <tree> "$(cd <tree> && cabal list-bin golem)" te
 ```
 
 Running `make.sh` twice gives the same bytes.
+
+`boxes.pdf` and `boxes-vertical.pdf` were added later (docs/adr/0025) by the
+same `make.sh` with Golem at commit
+`9187426cb25d00311102904b3b21100be71030ac` (`golem 0.1.0-rc4`, the
+origin/main of 2026-11-10, which has the strokes of docs/adr/0271 that
+docs/adr/0025 surveyed at `7e8fe7d3`). The five PDFs above were not made
+again, so they stay as the commit `1254092a` wrote them.
 
 The PDFs embed subsets of these fonts, all under the SIL Open Font License
 1.1, whose texts are in `golem/licenses/`:

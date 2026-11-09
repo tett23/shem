@@ -253,20 +253,10 @@ pub fn div_round_i64(n: i64, d: i64) -> i64 {
     }
 }
 
-/// The integer square root, rounded down.
+/// The integer square root, rounded down: the one of the standard library,
+/// which is exact and faster than Newton's method in u128 (docs/adr/0025).
 pub fn isqrt(v: u128) -> u128 {
-    if v < 2 {
-        return v;
-    }
-    // Newton's method from an upper bound; the sequence decreases to the floor.
-    let bits = 128 - v.leading_zeros();
-    let start = 1u128 << bits.div_ceil(2);
-    std::iter::successors(Some(start), |&x| {
-        let next = (x + v / x) / 2;
-        (next < x).then_some(next)
-    })
-    .last()
-    .unwrap_or(start)
+    v.isqrt()
 }
 
 /// An affine matrix `[a b c d e f]` of PDF (ISO 32000-1 8.3.4): a point

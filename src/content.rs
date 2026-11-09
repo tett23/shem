@@ -21,10 +21,16 @@ pub enum Operator<'a> {
     Concat(Matrix),
     LineWidth(Fixed),
     MoveTo(Fixed, Fixed),
+    LineTo(Fixed, Fixed),
     CurveTo([Fixed; 6]),
     ClosePath,
     Rect([Fixed; 4]),
     Fill,
+    Stroke,
+    /// `J`: 0 for butt caps, 1 for round caps (docs/adr/0025).
+    LineCap(i64),
+    /// `d`: the dash array and the phase, in user space (docs/adr/0025).
+    Dash(std::sync::Arc<[Fixed]>, Fixed),
     FillCmyk([Fixed; 4]),
     StrokeCmyk([Fixed; 4]),
     FillSpace(Cow<'a, [u8]>),
@@ -113,9 +119,9 @@ enum Place {
     Anywhere,
     /// Text objects only: Tm Tj ET.
     Text,
-    /// The construction of a path: c h, which need a current point.
+    /// The construction of a path: l c h, which need a current point.
     Path,
-    /// The painting of a path: f.
+    /// The painting of a path: f S.
     Paint,
 }
 
@@ -151,10 +157,24 @@ fn operator<'a>(
             .filter(|[v]| *v >= Fixed::ZERO)
             .map(|[v]| (LineWidth(v), Place::Anywhere)),
         b"m" => numbers::<2>(operands).map(|[x, y]| (MoveTo(x, y), Place::Page)),
+        b"l" => numbers::<2>(operands).map(|[x, y]| (LineTo(x, y), Place::Path)),
         b"c" => numbers::<6>(operands).map(|v| (CurveTo(v), Place::Path)),
         b"h" => return none(ClosePath, Place::Path),
         b"re" => numbers::<4>(operands).map(|v| (Rect(v), Place::Page)),
         b"f" => return none(Fill, Place::Paint),
+        b"S" => return none(Stroke, Place::Paint),
+        b"J" => match operands {
+            [Operand::Int(cap)] => Some((LineCap(*cap), Place::Anywhere)),
+            _ => None,
+        },
+        b"d" => match operands {
+            [Operand::Object(Object::Array(array)), phase] => dash_array(array)
+                .zip(phase.number())
+                .and_then(|(array, phase)| {
+                    (phase >= Fixed::ZERO).then_some((Dash(array, phase), Place::Anywhere))
+                }),
+            _ => None,
+        },
         b"k" => numbers::<4>(operands).map(|v| (FillCmyk(v), Place::Anywhere)),
         b"K" => numbers::<4>(operands).map(|v| (StrokeCmyk(v), Place::Anywhere)),
         b"cs" => match operands {
@@ -199,6 +219,14 @@ fn operator<'a>(
     })
 }
 
+/// The dash array of `d`: numbers, none negative (docs/adr/0025).
+fn dash_array(array: &[Object]) -> Option<std::sync::Arc<[Fixed]>> {
+    array
+        .iter()
+        .map(|o| o.as_number()?.ok().filter(|v| *v >= Fixed::ZERO))
+        .collect()
+}
+
 fn keyword_name(k: &[u8]) -> String {
     String::from_utf8_lossy(k).into_owned()
 }
@@ -221,10 +249,12 @@ impl State {
             && !matches!(
                 op,
                 Operator::MoveTo(..)
+                    | Operator::LineTo(..)
                     | Operator::CurveTo(_)
                     | Operator::ClosePath
                     | Operator::Rect(_)
                     | Operator::Fill
+                    | Operator::Stroke
             )
         {
             return Err(format!("{} inside a path", k()));
@@ -244,13 +274,24 @@ impl State {
             Operator::BeginText => self.in_text = true,
             Operator::EndText => self.in_text = false,
             Operator::MoveTo(..) | Operator::Rect(_) => self.in_path = true,
-            Operator::Fill => self.in_path = false,
+            Operator::Fill | Operator::Stroke => self.in_path = false,
             Operator::BeginMarked => self.marked += 1,
             Operator::EndMarked => {
                 self.marked = self.marked.checked_sub(1).ok_or("EMC without BDC")?;
             }
             Operator::RenderMode(m) if *m != 0 && *m != 2 => {
                 return Err(format!("unsupported Tr {m}"));
+            }
+            // Square caps (2 J) are not written by Golem (docs/adr/0025).
+            Operator::LineCap(2) => return Err("unsupported J 2".into()),
+            Operator::LineCap(c) if !(0..=2).contains(c) => {
+                return Err(format!("malformed J {c}"));
+            }
+            // A dash array of zeros only is malformed (ISO 32000-1 8.4.3.6).
+            Operator::Dash(array, _)
+                if !array.is_empty() && array.iter().all(|v| *v == Fixed::ZERO) =>
+            {
+                return Err("malformed d".into());
             }
             _ => {}
         }

@@ -7,7 +7,10 @@ use crate::fixed::{Fixed, Matrix, round_shift};
 use crate::font::{Font, FontCache, Segment};
 use crate::pdf::Object;
 use crate::pdf::{Dict, Document, Page};
-use crate::raster::{Canvas, FillRule, Frame, Path, Point, Scratch, signed_area, stroke_into};
+use crate::raster::{
+    Canvas, DASH_UNIT, FillRule, Frame, Path, Point, Scratch, Stroke, StrokeScratch, signed_area,
+    stroke_into, stroke_styled_into,
+};
 
 /// The fill and the lines of the box of an image or a form (docs/adr/0006).
 const BOX_FILL: [u8; 3] = [192, 192, 192];
@@ -129,9 +132,10 @@ fn stroke_margin(half: i64) -> i64 {
     16 * half + 16
 }
 
-/// Half the width of a stroke in device space, in units of 1/256 pixel. The
-/// CTM keeps angles; a line width of 0 is one pixel (ISO 32000-1 8.4.3.2).
-pub fn stroke_half_width(ctm: &Matrix, width: Fixed) -> Result<i64> {
+/// The scale of a stroke: `sqrt(|det CTM|)`, by which the widths and the
+/// dashes of user space go to device space. The CTM keeps angles; another
+/// is an error (docs/adr/0003).
+fn stroke_scale(ctm: &Matrix) -> Result<Fixed> {
     let keeps_angles = (ctm.a == ctm.d && ctm.b.checked_neg()? == ctm.c)
         || (ctm.a.checked_neg()? == ctm.d && ctm.b == ctm.c);
     if !keeps_angles {
@@ -139,18 +143,45 @@ pub fn stroke_half_width(ctm: &Matrix, width: Fixed) -> Result<i64> {
             "unsupported stroke with a CTM that does not keep angles",
         ));
     }
+    ctm.det()?.abs()?.sqrt()
+}
+
+/// Half the width of a stroke in device space, in units of 1/256 pixel. The
+/// CTM keeps angles; a line width of 0 is one pixel (ISO 32000-1 8.4.3.2).
+pub fn stroke_half_width(ctm: &Matrix, width: Fixed) -> Result<i64> {
+    half_width(width, stroke_scale(ctm)?)
+}
+
+/// [`stroke_half_width`] from the scale of the stroke.
+fn half_width(width: Fixed, scale: Fixed) -> Result<i64> {
     if width == Fixed::ZERO {
         return Ok(128);
     }
-    let scale = ctm.det()?.abs()?.sqrt()?;
     // The width in pixels, in units of 2^-7, is half of it in units of 1/256.
     Ok(width.checked_mul(scale)?.to_units(7).max(1))
 }
+
+/// A length of a dash array or its phase in device space, in units of
+/// 2^−16 device units, rounded to the nearest, ties to even
+/// (docs/adr/0025).
+fn dash_length(value: Fixed, scale: Fixed) -> Result<i64> {
+    Ok(value.checked_mul(scale)?.to_units(8 + 16))
+}
+
+/// The least period of a dash array in device space: 1/16 pixel
+/// (docs/adr/0025).
+const MIN_DASH_PERIOD: i128 = 16 * DASH_UNIT as i128;
 
 #[derive(Clone)]
 struct GraphicsState {
     ctm: Matrix,
     line_width: Fixed,
+    // Round caps (1 J) and the dash array with its phase (d), in user
+    // space (docs/adr/0025). The array is shared, so that saving the state
+    // allocates nothing.
+    round_cap: bool,
+    dash: Arc<[Fixed]>,
+    dash_phase: Fixed,
     fill: [u8; 3],
     fill_space: FillSpace,
     stroke: [u8; 3],
@@ -189,6 +220,10 @@ struct Renderer<'a> {
     outline: Path,
     scratch: Scratch,
     segments: Vec<Segment>,
+    // The disc and the dash of the strokes of the page's paths, and the
+    // dash array in device space (docs/adr/0025).
+    strokes: StrokeScratch,
+    dash: Vec<i64>,
 }
 
 impl Renderer<'_> {
@@ -214,6 +249,75 @@ impl Renderer<'_> {
         stroke_into(path, half, &mut outline);
         self.fill(&outline, rgb);
         self.outline = outline;
+    }
+
+    /// The frame of the flattening of a curve of the page's path
+    /// (docs/adr/0025): with a dash array, none, since the dashes are
+    /// measured along the flattened curve; with a solid line and a CTM
+    /// that keeps angles, the margin of the stroke; otherwise the canvas
+    /// alone, since a stroke would be an error and a fill does not depend
+    /// on the margin (docs/adr/0022).
+    fn curve_frame(&self) -> Frame {
+        if !self.state.dash.is_empty() {
+            return Frame::NONE;
+        }
+        match stroke_half_width(&self.state.ctm, self.state.line_width) {
+            Ok(half) => Frame::around(self.width, self.height, stroke_margin(half)),
+            Err(_) => self.frame,
+        }
+    }
+
+    /// Strokes the page's path (`S`) with the line color, after the checks
+    /// that find its errors without drawing (docs/adr/0025): the CTM keeps
+    /// angles, the period of the dash array is at least 1/16 pixel, and
+    /// the points with the margin of the stroke are within i32.
+    fn stroke_path(&mut self, path: &Path) -> Result<()> {
+        let scale = stroke_scale(&self.state.ctm)?;
+        let half = half_width(self.state.line_width, scale)?;
+        let mut dash = std::mem::take(&mut self.dash);
+        dash.clear();
+        let lengths = self
+            .state
+            .dash
+            .iter()
+            .try_for_each(|&v| dash_length(v, scale).map(|l| dash.push(l)));
+        let result = lengths.and_then(|()| {
+            // An odd array is its double (docs/adr/0025).
+            let doubled = if dash.len() % 2 == 1 { 2 } else { 1 };
+            let period: i128 = dash.iter().map(|&l| i128::from(l)).sum::<i128>() * doubled;
+            if !dash.is_empty() && period < MIN_DASH_PERIOD {
+                return Err(Error::new("dash pattern shorter than 1/16 pixel"));
+            }
+            let phase = if dash.is_empty() {
+                0
+            } else {
+                (i128::from(dash_length(self.state.dash_phase, scale)?) % period) as i64
+            };
+            let margin = stroke_margin(half);
+            let reach = i64::from(i32::MAX) - margin;
+            let beyond = |v: i32| i64::from(v).abs() > reach;
+            if path.points().iter().any(|&(x, y)| beyond(x) || beyond(y)) {
+                return Err(Error::new("stroke outside the range of coordinates"));
+            }
+            if self.paint {
+                let style = Stroke {
+                    half,
+                    round_cap: self.state.round_cap,
+                    dash: &dash,
+                    phase,
+                };
+                let frame = Frame::around(self.width, self.height, margin);
+                let mut outline = std::mem::take(&mut self.outline);
+                outline.clear();
+                stroke_styled_into(path, &style, &frame, &mut self.strokes, &mut outline);
+                let rgb = self.state.stroke;
+                self.fill(&outline, rgb);
+                self.outline = outline;
+            }
+            Ok(())
+        });
+        self.dash = dash;
+        result
     }
 
     /// The font of a name of the resources, read at its first use.
@@ -451,13 +555,18 @@ impl Renderer<'_> {
                 let p = self.point(*x, *y)?;
                 self.path.move_to(p);
             }
+            Operator::LineTo(x, y) => {
+                let p = self.point(*x, *y)?;
+                self.path.line_to(p);
+            }
             Operator::CurveTo([x1, y1, x2, y2, x3, y3]) => {
                 let (c1, c2, p) = (
                     self.point(*x1, *y1)?,
                     self.point(*x2, *y2)?,
                     self.point(*x3, *y3)?,
                 );
-                self.path.curve_to_within(c1, c2, p, &self.frame);
+                let frame = self.curve_frame();
+                self.path.curve_to_within(c1, c2, p, &frame);
             }
             Operator::ClosePath => self.path.close(),
             Operator::Rect([x, y, w, h]) => {
@@ -479,6 +588,18 @@ impl Renderer<'_> {
                 self.fill(&path, rgb);
                 path.clear();
                 self.path = path;
+            }
+            Operator::Stroke => {
+                let mut path = std::mem::take(&mut self.path);
+                let result = self.stroke_path(&path);
+                path.clear();
+                self.path = path;
+                result?;
+            }
+            Operator::LineCap(cap) => self.state.round_cap = *cap == 1,
+            Operator::Dash(array, phase) => {
+                self.state.dash = array.clone();
+                self.state.dash_phase = *phase;
             }
             Operator::FillCmyk(v) => {
                 self.state.fill_space = FillSpace::Device(Device::Cmyk);
@@ -567,6 +688,8 @@ pub struct Workspace {
     path: Path,
     canvas: Canvas,
     segments: Vec<Segment>,
+    strokes: StrokeScratch,
+    dash: Vec<i64>,
 }
 
 /// An empty `Vec` of operators of another content, in the allocation of
@@ -626,9 +749,14 @@ fn interpret_ops<'c>(
         outline: std::mem::take(&mut ws.outline),
         scratch: std::mem::take(&mut ws.scratch),
         segments: std::mem::take(&mut ws.segments),
+        strokes: std::mem::take(&mut ws.strokes),
+        dash: std::mem::take(&mut ws.dash),
         state: GraphicsState {
             ctm: device_matrix(&page.media_box, dpi)?,
             line_width: Fixed::ONE,
+            round_cap: false,
+            dash: Arc::from([]),
+            dash_phase: Fixed::ZERO,
             fill: [0, 0, 0],
             fill_space: FillSpace::Device(Device::Gray),
             stroke: [0, 0, 0],
@@ -659,6 +787,8 @@ fn interpret_ops<'c>(
     ws.stack = renderer.stack;
     ws.path = renderer.path;
     ws.segments = renderer.segments;
+    ws.strokes = renderer.strokes;
+    ws.dash = renderer.dash;
     result
 }
 
@@ -864,6 +994,9 @@ pub(crate) mod tests;
 
 #[cfg(test)]
 mod box_tests;
+
+#[cfg(test)]
+mod stroke_tests;
 
 #[cfg(test)]
 mod session_tests;

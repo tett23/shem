@@ -57,6 +57,39 @@ fn goldens() {
     );
 }
 
+/// The paragraph boxes with round corners, whose borders are strokes with
+/// round caps and dashes (docs/adr/0025), at 72, 150 and 300 dpi.
+#[test]
+fn goldens_of_the_strokes() {
+    let mismatches: Vec<String> = ["boxes", "boxes-vertical"]
+        .iter()
+        .flat_map(|name| {
+            let data =
+                std::fs::read(format!("{}/tests/fixtures/golem/{name}.pdf", root())).unwrap();
+            let doc = Document::parse(&data).unwrap();
+            let pages = doc.pages().unwrap();
+            [72u32, 150, 300]
+                .iter()
+                .flat_map(|&dpi| {
+                    pages
+                        .iter()
+                        .filter_map(|page| {
+                            let canvas = render_page(&doc, page, dpi).unwrap();
+                            let png = encode_png(&canvas);
+                            assert_eq!(decode(&png).unwrap(), canvas);
+                            check(&format!("{name}-{dpi}-{}", page.index + 1), &png)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "differ from the goldens: {mismatches:?}"
+    );
+}
+
 /// The diff image of the first pages of sample and sample-marks, which also
 /// differ in size (docs/adr/0010).
 #[test]

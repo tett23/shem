@@ -9,7 +9,7 @@ use super::*;
 const LO: i64 = i32::MIN as i64;
 const HI: i64 = i32::MAX as i64;
 
-fn build_within(cmds: &[Cmd], frame: &Frame) -> Path {
+pub(super) fn build_within(cmds: &[Cmd], frame: &Frame) -> Path {
     let mut path = Path::new();
     cmds.iter().for_each(|&c| match c {
         Cmd::Move(p) => path.move_to(p),
@@ -23,7 +23,7 @@ fn build_within(cmds: &[Cmd], frame: &Frame) -> Path {
 /// A point of a path on a `w` × `h` canvas: far from it (within 2^22
 /// units, as the reference walks every row of a segment), near it (within
 /// 4 pixels), on its edges, or inside it.
-fn mixed_point(rng: &mut Rng, w: usize, h: usize) -> Point {
+pub(super) fn mixed_point(rng: &mut Rng, w: usize, h: usize) -> Point {
     let (wu, hu) = (w as i64 * ONE64, h as i64 * ONE64);
     let near = |rng: &mut Rng, end: i64| rng.range(-4 * ONE64, end + 4 * ONE64 + 1);
     let on_edge = |rng: &mut Rng, end: i64| [0, end][rng.range(0, 2) as usize];
