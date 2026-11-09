@@ -184,7 +184,7 @@ fn dash_arrays() {
         "[[3]] 0 d",
     ] {
         let e = err(src);
-        assert!(e.contains("operands of d"), "{src}: {e}");
+        assert!(e.ends_with("wrong operands of d"), "{src}: {e}");
     }
 }
 

@@ -271,3 +271,28 @@ fn far_dashed_curves_are_drawn_within_a_second() {
     let elapsed = start.elapsed();
     assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
 }
+
+#[test]
+fn a_dotted_line_has_no_dot_at_its_end() {
+    // docs/adr/0026: 4 w 1 J [0 12] 0 d on an open line of 36 points
+    // draws dots at x = 10, 22 and 34, and none at its end, x = 46, as
+    // pdftoppm does.
+    let canvas = render("0 0 60 40", "4 w 1 J [0 12] 0 d 10 20 m 46 20 l S", 72);
+    let dots: String = row(&canvas, 20)
+        .iter()
+        .map(|&v| if dark(v) { '#' } else { '.' })
+        .collect();
+    assert_eq!(
+        dots,
+        "........####........####........####........................"
+    );
+}
+
+#[test]
+fn an_odd_dash_array_has_the_doubled_period() {
+    // docs/adr/0026: the period of [3] is 6; the phase 7 is the phase 1.
+    assert_eq!(
+        render("0 0 10 10", "[3] 7 d 2 w 0 5 m 10 5 l S", 72),
+        render("0 0 10 10", "[3] 1 d 2 w 0 5 m 10 5 l S", 72)
+    );
+}

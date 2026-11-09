@@ -572,3 +572,46 @@ fn far_segments_only_move_along_the_dashes() {
         coverage(&whole, FillRule::NonZero, w, h)
     );
 }
+
+#[test]
+fn a_dot_at_the_end_of_an_open_polyline_is_not_drawn() {
+    // docs/adr/0026: [0 12] on an open line of 36 pixels makes dots at 0,
+    // 12 and 24, and none at its end, as pdftoppm does.
+    let line = [(0, 0), (36 * ONE, 0)];
+    let dash = [0, 12 * PX];
+    let dots = dashes_of(&line, false, &dash, 0);
+    assert_eq!(
+        dots.iter().map(|d| d[0].0).collect::<Vec<_>>(),
+        vec![0, 12 * ONE, 24 * ONE]
+    );
+    // The dots at the vertices of an open polyline are drawn; the one at
+    // its end is not.
+    let corner = [(0, 0), (12 * ONE, 0), (12 * ONE, 12 * ONE)];
+    let dots = dashes_of(&corner, false, &dash, 0);
+    assert_eq!(
+        dots.iter().map(|d| d[0]).collect::<Vec<_>>(),
+        vec![(0, 0), (12 * ONE, 0)]
+    );
+    // Closed, the dots are those of the four corners: none is drawn again
+    // where the square comes back to its start.
+    let square = [(0, 0), (12 * ONE, 0), (12 * ONE, 12 * ONE), (0, 12 * ONE)];
+    let dots = dashes_of(&square, true, &dash, 0);
+    assert_eq!(
+        dots.iter().map(|d| d[0]).collect::<Vec<_>>(),
+        square.to_vec()
+    );
+}
+
+#[test]
+fn the_period_of_an_odd_dash_array_is_doubled() {
+    // docs/adr/0026: the period of [3] is 6, so the phase 7 is the phase 1.
+    let line = [(0, 0), (20 * ONE, 0)];
+    assert_eq!(
+        dashes_of(&line, false, &[3 * PX], 7 * PX),
+        dashes_of(&line, false, &[3 * PX], PX)
+    );
+    assert_ne!(
+        dashes_of(&line, false, &[3 * PX], 4 * PX),
+        dashes_of(&line, false, &[3 * PX], PX)
+    );
+}
