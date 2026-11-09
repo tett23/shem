@@ -389,6 +389,35 @@ fn a_stroked_glyph_beyond_the_device_writes_nothing() {
 }
 
 #[test]
+fn a_stroke_beyond_the_device_on_a_later_page_writes_nothing() {
+    // docs/adr/0025: a path stroked where its points with the margin of
+    // the stroke pass i32 in device space fails the check of its page, so
+    // no file is written, even when it is on the third page.
+    let dir = scratch("path-stroke-range");
+    let input = write_pdf(
+        &dir,
+        "beyond.pdf",
+        &pdf(
+            &[
+                "0 0 1 1 re f",
+                "1 w 0 5 m 5 5 l S",
+                "2 w 8388590 5 m 8388600 5 l S",
+            ],
+            "0 0 40 40",
+        ),
+    );
+    let out = dir.join("out");
+    let (code, stdout, stderr) = shem(&["render", "--dpi", "72", &input, out.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        format!("shem: {input}: page 3: offset 28: stroke outside the range of coordinates\n")
+    );
+    assert!(files(&out).is_empty());
+}
+
+#[test]
 fn errors_of_the_input() {
     let dir = scratch("input");
     let o = dir.join("out");

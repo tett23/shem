@@ -112,13 +112,109 @@ fn wrong_operands_are_errors() {
 #[test]
 fn unsupported_operators_are_errors() {
     for op in [
-        "TJ", "Td", "TD", "T*", "'", "\"", "Tc", "Tw", "TL", "Ts", "l", "v", "y", "S", "s", "f*",
-        "B", "b", "W", "W*", "n", "J", "j", "M", "d", "gs", "sh", "BI", "d0", "d1", "g", "G", "rg",
-        "RG", "sc", "SC", "SCN", "CS", "BX", "EX", "MP", "DP", "BMC", "ri", "i", "F", "B*", "b*",
-        "Tk",
+        "TJ", "Td", "TD", "T*", "'", "\"", "Tc", "Tw", "TL", "Ts", "v", "y", "s", "f*", "B", "b",
+        "W", "W*", "n", "j", "M", "gs", "sh", "BI", "d0", "d1", "g", "G", "rg", "RG", "sc", "SC",
+        "SCN", "CS", "BX", "EX", "MP", "DP", "BMC", "ri", "i", "F", "B*", "b*", "Tk",
     ] {
         let e = err(&format!("q {op} Q"));
         assert_eq!(e, format!("offset 2: unsupported operator {op}"), "{op}");
+    }
+}
+
+// --- the strokes of the paths of a page: l, S, J and d (docs/adr/0025)
+
+#[test]
+fn the_operators_of_a_stroke() {
+    assert_eq!(
+        ops("1 J [3 2] 0 d 1 2 m 3 4 l S [] 0 d 0 J"),
+        vec![
+            Operator::LineCap(1),
+            Operator::Dash([n("3"), n("2")].into(), n("0")),
+            Operator::MoveTo(n("1"), n("2")),
+            Operator::LineTo(n("3"), n("4")),
+            Operator::Stroke,
+            Operator::Dash([].into(), n("0")),
+            Operator::LineCap(0),
+        ]
+    );
+    for (src, op) in [
+        ("1 2 m 1 l S", "l"),
+        ("1 2 m /A 1 l S", "l"),
+        ("1 2 m 3 4 l 1 S", "S"),
+        ("1.0 J", "J"),
+        ("/A J", "J"),
+        ("J", "J"),
+        ("3 d", "d"),
+        ("[3] d", "d"),
+        ("[3] /A d", "d"),
+        ("[3] 1 2 d", "d"),
+    ] {
+        let e = err(src);
+        assert!(e.contains(&format!("operands of {op}")), "{src}: {e}");
+    }
+}
+
+#[test]
+fn line_caps_other_than_butt_and_round() {
+    assert!(parse(b"0 J").is_ok());
+    assert!(parse(b"1 J").is_ok());
+    assert_eq!(err("2 J"), "offset 2: unsupported J 2");
+    assert_eq!(err("3 J"), "offset 2: malformed J 3");
+    assert_eq!(err("-1 J"), "offset 3: malformed J -1");
+}
+
+#[test]
+fn dash_arrays() {
+    for src in [
+        "[] 0 d",
+        "[3 2] 0 d",
+        "[0 3] 0 d",
+        "[3] 1.5 d",
+        "[0 0.5] 2 d",
+    ] {
+        assert!(parse(src.as_bytes()).is_ok(), "{src}");
+    }
+    assert_eq!(err("[0 0] 0 d"), "offset 8: malformed d");
+    assert_eq!(err("[0] 0 d"), "offset 6: malformed d");
+    for src in [
+        "[-1 2] 0 d",
+        "[3 2] -1 d",
+        "[/a] 0 d",
+        "[3 (x)] 0 d",
+        "[[3]] 0 d",
+    ] {
+        let e = err(src);
+        assert!(e.contains("operands of d"), "{src}: {e}");
+    }
+}
+
+#[test]
+fn where_the_operators_of_a_stroke_may_appear() {
+    assert!(err("1 2 l").contains("l without a current point"));
+    assert!(err("1 2 m 1 J").contains("J inside a path"));
+    assert!(err("1 2 m [3] 0 d").contains("d inside a path"));
+    assert!(err("BT 1 2 l ET").contains("l without a current point"));
+    assert!(err("BT S ET").contains("S inside a text object"));
+    assert!(err("1 2 m 3 4 l").contains("path not painted"));
+    // the caps and the dash are allowed in a text object, as w is
+    assert!(parse(b"BT 1 J [3 2] 0 d ET").is_ok());
+    // S ends the path; after h, l starts a new subpath
+    assert!(parse(b"1 2 m 3 4 l h 5 6 l S q Q").is_ok());
+    assert!(parse(b"0 0 1 1 re S").is_ok());
+    assert!(parse(b"1 2 m 1 2 3 4 5 6 c 7 8 l S").is_ok());
+    // S with no path paints nothing
+    assert!(parse(b"S").is_ok());
+}
+
+#[test]
+fn the_strokes_that_golem_writes() {
+    // The three outputs of the test of Golem's Writer (docs/adr/0025).
+    for src in [
+        "0.5 w\n0 0 m\n1 0 l\nS\n",
+        "1 w [3 2] 0 d\n0 0 m\n1 0 l\n1 1 l\nh S\n",
+        "1 w 1 J [0 3] 0 d\n0 0 m\n1 0 l\nS\n",
+    ] {
+        assert!(parse(src.as_bytes()).is_ok(), "{src}");
     }
 }
 
@@ -230,10 +326,14 @@ fn show(ops: &[Op]) -> String {
         Concat(m) => format!("cm({})", matrix(m)),
         LineWidth(v) => format!("w({v})"),
         MoveTo(x, y) => format!("m({x},{y})"),
+        LineTo(x, y) => format!("l({x},{y})"),
         CurveTo(v) => format!("c({})", nums(v)),
         ClosePath => "h".into(),
         Rect(v) => format!("re({})", nums(v)),
         Fill => "f".into(),
+        Stroke => "S".into(),
+        LineCap(c) => format!("J({c})"),
+        Dash(a, p) => format!("d([{}],{p})", nums(a)),
         FillCmyk(v) => format!("k({})", nums(v)),
         StrokeCmyk(v) => format!("K({})", nums(v)),
         FillSpace(n) => format!("cs({})", name(n)),

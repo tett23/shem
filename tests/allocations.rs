@@ -140,6 +140,25 @@ fn the_allocations_do_not_grow_with_the_curves_of_a_path() {
     assert_not_per_item("20 20 300 30 40 10 c\n", |s| format!("40 10 m\n{s}h f\n"));
 }
 
+#[test]
+fn the_allocations_do_not_grow_with_the_strokes() {
+    // docs/adr/0025: the polygons of the strokes of a page go into one
+    // path, with round caps and dashes.
+    assert_not_per_item("10 10 m 50 50 l 60 20 l S\n", |s| s);
+    assert_not_per_item("10 10 m 50 50 l 60 20 l S\n", |s| {
+        format!("1 J [3 2] 0 d\n{s}")
+    });
+}
+
+#[test]
+fn the_allocations_do_not_grow_with_the_dashes() {
+    // A zigzag of two segments of 1.4 points per item, dashed every half
+    // point: about 6 dashes and 12 discs per item.
+    assert_not_per_item("1 0 l 0 1 l\n", |s| {
+        format!("1 J [0.5 0.5] 0 d 1 0 0 1 10 10 cm 0 0 m\n{s}S\n")
+    });
+}
+
 /// The distinct CIDs of the `Tj` of a page, as two-byte hexadecimal strings.
 fn distinct_cids(page: &Page) -> Vec<String> {
     let ops = shem::content::parse(&page.contents).unwrap();

@@ -13,12 +13,14 @@ fn fixture(name: &str) -> Vec<u8> {
     .unwrap()
 }
 
-const FIXTURES: [(&str, usize); 5] = [
+const FIXTURES: [(&str, usize); 7] = [
     ("sample", 3),
     ("sample-marks", 3),
     ("figures", 2),
     ("truetype", 2),
     ("kanikosen", 129),
+    ("boxes", 2),
+    ("boxes-vertical", 2),
 ];
 
 #[test]

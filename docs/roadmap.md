@@ -11,7 +11,7 @@ v0.1 は、今の Golem の Writer が書く PDF の部分集合に合ってい�
 部分集合は、Golem の origin/main の 1254092a（https://github.com/tett23/golem/tree/1254092a2ed5a7fd29bb6f1affb53806cf76c694 ）の出力を調べて決める。
 
 - ファイルの構造：古典的な xref の表、`FlateDecode` のストリーム、ページの木
-- ページの内容の演算子：`BT ET Tf Tz Tm Tj Tr w re f m c h q Q cm Do k K cs scn BDC EMC`
+- ページの内容の演算子：`BT ET Tf Tz Tm Tj Tr w re f m c h q Q cm Do k K cs scn BDC EMC` と、角丸の囲みの枠の `l S J d`（[ADR 0025](adr/0025-strokes-of-paths-with-round-caps-and-dashes.md)）
 - 文字：CFF（`CIDFontType0C`）と TrueType（`FontFile2`）の CIDFont、`Identity-H` と `Identity-V`、縦組みの位置ベクトル、合成の斜体と太字
 - 色：DeviceGray、DeviceCMYK、トンボの Separation
 - 画像と図版（Form XObject）：中身を描かず、バツ印の付いた灰色の箱で描く
@@ -37,7 +37,7 @@ v1 の範囲は、まだ決めていない。
 
 - ファイルの構造：xref のストリーム、オブジェクトのストリーム、増分更新
 - フィルタ：`LZWDecode`、`RunLengthDecode`、`ASCIIHexDecode`、`ASCII85Decode`、予測子
-- 内容のストリーム：すべての演算子（切り抜き、破線、線端と角、インライン画像、Type 3 のフォントの `d0` と `d1` を含む）
+- 内容のストリーム：すべての演算子（切り抜き、square の線端 `2 J`、角の種類 `j`、miter の上限 `M`、インライン画像、Type 3 のフォントの `d0` と `d1` を含む）
 - 文字：単純なフォント（Type 1、TrueType、Type 3）、埋め込みの CMap
 - 色：DeviceRGB、ICCBased、CalGray、CalRGB、Lab、Indexed、DeviceN、パターン、シェーディング
 - 透明：透明のグループ、ソフトマスク、ブレンドのモード、`ExtGState`
@@ -52,6 +52,7 @@ shem の描いた結果が正しいことは、shem 自身のテストでは示�
 - **文字**：Golem の fixture（和文の縦組みと横組み、縦組みの中の欧文、合成の太字と斜体）を、shem と pdftoppm で描いて並べる。字の抜け、字の取り違え、位置のずれ、回転の向きの誤りがないこと。
 - **画像と図版の箱**：Golem の `figures` の fixture で、箱の位置と大きさが、pdftoppm が描く画像と図版の位置と大きさに合うこと。
 - **色とトンボ**：CMYK の塗りとトンボが、pdftoppm と同じ場所に出ること。色の値は CMYK から RGB への式が違うので一致しなくてよい。
+- **線と破線**：Golem の `boxes` と `boxes-vertical` の fixture で、角丸の囲みの枠の角の丸み、破線の位置、点の形と間隔、`border-sides` で途切れた辺の端が、pdftoppm と合うこと（[ADR 0025](adr/0025-strokes-of-paths-with-round-caps-and-dashes.md)）。
 - **差分の画像**：Golem の fixture の一字を変えた PDF を作って前と後を描き、`shem diff` のディレクトリの比較の差分の画像で、変わった字の場所がすぐにわかること（[ADR 0010](adr/0010-diff-images.md)）。
 
 ## 未決事項

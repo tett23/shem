@@ -107,6 +107,11 @@ impl Path {
         self.starts.is_empty()
     }
 
+    /// The points of every subpath.
+    pub fn points(&self) -> &[Point] {
+        &self.points
+    }
+
     pub fn subpaths(&self) -> impl Iterator<Item = Subpath<'_>> {
         let ends = self
             .starts
@@ -223,6 +228,11 @@ impl Frame {
     fn holds(&self, a: Point, b: Point, c: Point, d: Point) -> bool {
         let (xlo, xhi, ylo, yhi) = Frame::bounds(a, b, c, d);
         yhi <= self.top || ylo >= self.bottom || xlo >= self.right || xhi <= self.left
+    }
+
+    /// Whether both ends of a segment are in one region beyond the frame.
+    fn holds_segment(&self, a: Point, b: Point) -> bool {
+        self.holds(a, b, a, b)
     }
 
     /// Whether some point of the bounds of the four points is in a region
@@ -1043,31 +1053,352 @@ pub fn stroke(path: &Path, half: i64) -> Path {
 
 /// Adds the polygons of [`stroke`] to `out`.
 pub fn stroke_into(path: &Path, half: i64, out: &mut Path) {
+    path.subpaths()
+        .for_each(|s| stroke_polyline(s.points, s.closed, half, None, (false, false), out));
+}
+
+/// Adds the polygons of the stroke of one polyline to `out`: the
+/// quadrilateral of each segment, then the joins between the segments
+/// (and, when it is closed, the join at its start), then, when it is open
+/// and `disc` is the disc of round caps, the disc at each end that `caps`
+/// asks for. Repeated points make no segment; a polyline with no segment
+/// adds nothing.
+fn stroke_polyline(
+    points: &[Point],
+    closed: bool,
+    half: i64,
+    disc: Option<&[Point]>,
+    caps: (bool, bool),
+    out: &mut Path,
+) {
+    // The segments between the points, without the repeated points,
+    // and the segment back to the start of a closed subpath.
+    let open = points
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .filter(|(a, b)| a != b);
+    if open.clone().next().is_none() {
+        return;
+    }
+    let (first, last) = (points[0], points[points.len() - 1]);
+    let closing = (closed && first != last).then_some((last, first));
+    let segments = open.chain(closing);
+    segments.clone().for_each(|(a, b)| {
+        let n = normal(direction(a, b), half);
+        out.push_positive(&[add(a, n), add(b, n), add(b, neg(n)), add(a, neg(n))]);
+    });
+    let joins = segments.clone().zip(segments.clone().skip(1));
+    let around = segments
+        .clone()
+        .nth(1)
+        .and(closed.then_some(()))
+        .and_then(|()| segments.clone().last().zip(segments.clone().next()));
+    joins
+        .chain(around)
+        .for_each(|(p, q)| join(out, p.1, direction(p.0, p.1), direction(q.0, q.1), half));
+    if let Some(disc) = disc
+        && !closed
+    {
+        if caps.0 {
+            push_disc(out, disc, first);
+        }
+        if caps.1 {
+            push_disc(out, disc, last);
+        }
+    }
+}
+
+/// Adds the disc, a positive polygon around the origin, moved to `center`.
+fn push_disc(out: &mut Path, disc: &[Point], center: Point) {
+    out.starts.push((out.points.len(), true));
+    out.points.extend(
+        disc.iter()
+            .map(|&(x, y)| add(center, (i64::from(x), i64::from(y)))),
+    );
+}
+
+/// The style of the stroke of a page's path (docs/adr/0025): half the
+/// width in device units, the caps, and the dash array in units of
+/// 2^−16 device units with its phase, both scaled to the device already,
+/// the phase within the period. An empty array is a solid line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stroke<'a> {
+    pub half: i64,
+    pub round_cap: bool,
+    pub dash: &'a [i64],
+    pub phase: i64,
+}
+
+/// The units of the lengths of the dashes in one device unit (1/256 pixel).
+pub const DASH_UNIT: i64 = 1 << 16;
+
+/// The buffers of the strokes of a page, kept between them (docs/adr/0013):
+/// the disc of the round caps, and the points of one dash.
+#[derive(Clone, Debug, Default)]
+pub struct StrokeScratch {
+    disc: Vec<Point>,
+    piece: Vec<Point>,
+}
+
+/// The factor of the distance of the control points of a quarter circle
+/// from its ends, `4 (√2 − 1) / 3 ≈ 0.552285`, times 2^16.
+const QUARTER_CONTROL: i128 = 36195;
+
+/// The polygon of the disc of a round cap, `half` units around the origin,
+/// as a positive polygon (docs/adr/0025): the quarter from (half, 0) to
+/// (0, half), a cubic Bézier curve with its control points
+/// `half · 36195 / 65536` from its ends, flattened as the curves of a path
+/// are, then its reflections in the axes, so that the disc is symmetric
+/// in the axes and the diagonals. `half` is below 2^31.
+pub fn disc_into(half: i64, out: &mut Vec<Point>) {
+    out.clear();
+    let h = half as i32;
+    let k = div_round(i128::from(half) * QUARTER_CONTROL, 65536) as i32;
+    out.push((h, 0));
+    flatten_curve_into((h, 0), (h, k), (k, h), (0, h), &Frame::NONE, |p| {
+        out.push(p)
+    });
+    let n = out.len();
+    // From (0, half) to (−half, 0), to (0, −half), and back to (half, 0).
+    (0..n - 1).rev().for_each(|i| {
+        let (x, y) = out[i];
+        out.push((-x, y));
+    });
+    (1..n).for_each(|i| {
+        let (x, y) = out[i];
+        out.push((-x, -y));
+    });
+    (1..n - 1).rev().for_each(|i| {
+        let (x, y) = out[i];
+        out.push((x, -y));
+    });
+}
+
+/// [`disc_into`] as a new polygon.
+pub fn disc(half: i64) -> Vec<Point> {
+    let mut out = Vec::new();
+    disc_into(half, &mut out);
+    out
+}
+
+/// The length of a segment in units of 2^−16 device units, rounded down:
+/// `isqrt((dx² + dy²) · 2^32)` (docs/adr/0025).
+pub fn segment_length(a: Point, b: Point) -> i64 {
+    let (dx, dy) = direction(a, b);
+    let d2 = (i128::from(dx) * i128::from(dx) + i128::from(dy) * i128::from(dy)) as u128;
+    // Most segments are shorter than 256 pixels, where the product fits
+    // in u64, whose square root is faster.
+    match u32::try_from(d2) {
+        Ok(d2) => (u64::from(d2) << 32).isqrt() as i64,
+        Err(_) => isqrt(d2 << 32) as i64,
+    }
+}
+
+/// The point `at` units of 2^−16 device units from `a` on the segment to
+/// `b` of `length`: `a + div_round((b − a) · at, length)`, by component.
+fn point_at(a: Point, b: Point, at: i64, length: i64) -> Point {
+    let (dx, dy) = direction(a, b);
+    let part = |d: i64| div_round(i128::from(d) * i128::from(at), i128::from(length)) as i64;
+    add(a, (part(dx), part(dy)))
+}
+
+/// Where a dash array is in its cycle: the element and the length left in
+/// it. An array of an odd number of elements is its double
+/// (docs/adr/0025); the elements at even indices are drawn.
+struct Dashes<'a> {
+    dash: &'a [i64],
+    cycle: usize,
+    /// The sum of the elements of the cycle.
+    period: i128,
+    index: usize,
+    left: i64,
+}
+
+impl<'a> Dashes<'a> {
+    /// The dash array `phase` into its cycle; the phase is within the
+    /// period, and the array has an element above 0.
+    fn start(dash: &'a [i64], phase: i64) -> Dashes<'a> {
+        let cycle = if dash.len() % 2 == 1 {
+            2 * dash.len()
+        } else {
+            dash.len()
+        };
+        let period =
+            dash.iter().map(|&l| i128::from(l)).sum::<i128>() * (cycle / dash.len()) as i128;
+        let mut dashes = Dashes {
+            dash,
+            cycle,
+            period,
+            index: 0,
+            left: dash[0],
+        };
+        // Elements the phase passes whole are skipped; a phase of 0 starts
+        // at the first, even one of length 0.
+        if phase > 0 {
+            dashes.advance(phase);
+        }
+        dashes
+    }
+
+    fn on(&self) -> bool {
+        self.index.is_multiple_of(2)
+    }
+
+    fn next(&mut self) {
+        self.index = (self.index + 1) % self.cycle;
+        self.left = self.dash[self.index % self.dash.len()];
+    }
+
+    /// Moves `length` along the cycle: an element that ends within it, or
+    /// exactly at its end, is passed. Whole cycles come back to the same
+    /// place, so only the rest of the length is walked, within one cycle.
+    fn advance(&mut self, length: i64) {
+        let mut length = (i128::from(length) % self.period) as i64;
+        while length >= self.left {
+            length -= self.left;
+            self.next();
+        }
+        self.left -= length;
+    }
+}
+
+/// Cuts a polyline by the dash array of `style`, from the array's start
+/// moved by the phase, and calls `emit(points, caps)` with each dash that
+/// is drawn: its ends and the vertices between them, and whether its
+/// start and its end get a cap (docs/adr/0025). A dash of no length is
+/// two equal points. A segment whose ends are in one region beyond
+/// `frame` only moves along the array: the dash through its start ends
+/// there without a cap, and the dash through its end starts there without
+/// one; both are in the region, where no pixel changes. In a closed
+/// polyline the segment back to the start is dashed as the others, and the
+/// last dash is not joined with the first.
+fn for_each_dash(
+    points: &[Point],
+    closed: bool,
+    style: &Stroke,
+    frame: &Frame,
+    piece: &mut Vec<Point>,
+    mut emit: impl FnMut(&[Point], (bool, bool)),
+) {
+    let (first, last) = (points[0], points[points.len() - 1]);
+    let closing = (closed && first != last).then_some((last, first));
+    let segments = points.windows(2).map(|w| (w[0], w[1])).chain(closing);
+    let mut dashes = Dashes::start(style.dash, style.phase);
+    piece.clear();
+    let mut capped = true;
+    if dashes.on() {
+        piece.push(first);
+    }
+    segments.for_each(|(a, b)| {
+        let length = segment_length(a, b);
+        if frame.holds_segment(a, b) {
+            if dashes.on() && !piece.is_empty() {
+                emit(piece, (capped, false));
+            }
+            piece.clear();
+            dashes.advance(length);
+            capped = false;
+            if dashes.on() {
+                piece.push(b);
+            }
+            return;
+        }
+        let mut at = 0;
+        loop {
+            if dashes.left > length - at {
+                // The element goes on past b, a vertex of its dash.
+                dashes.left -= length - at;
+                if dashes.on() {
+                    piece.push(b);
+                }
+                break;
+            }
+            at += dashes.left;
+            let p = if at == length {
+                b
+            } else {
+                point_at(a, b, at, length)
+            };
+            if dashes.on() {
+                piece.push(p);
+                emit(piece, (capped, true));
+                piece.clear();
+            }
+            dashes.next();
+            capped = true;
+            if dashes.on() {
+                piece.push(p);
+            }
+            if at == length {
+                break;
+            }
+        }
+    });
+    // The dash that is on at the end, if it has a length: one of no length
+    // that starts exactly at the end is not drawn.
+    if dashes.on() && piece.len() > 1 {
+        emit(piece, (capped, true));
+    }
+}
+
+/// The outline of the stroke of a page's path in the style, as positive
+/// polygons to fill with the nonzero rule (docs/adr/0025), as
+/// [`stroke_styled_into`] gives it.
+pub fn stroke_styled(path: &Path, style: &Stroke, frame: &Frame) -> Path {
+    let mut out = Path::new();
+    stroke_styled_into(path, style, frame, &mut StrokeScratch::default(), &mut out);
+    out
+}
+
+/// Adds the polygons of the stroke of a page's path to `out`: those of
+/// [`stroke_into`], with the disc of a round cap at the ends of each open
+/// subpath, and each subpath cut by the dash array into dashes stroked as
+/// open subpaths (docs/adr/0025). The disc is made once and moved to each
+/// end. A subpath of one point draws nothing; a closed one, or one whose
+/// points are all the same, draws the disc with round caps when the dash
+/// array is on at its start (ISO 32000-1 8.5.3.2). The frame is the one
+/// of the margin of the stroke, beyond which a dashed segment only moves
+/// along the array.
+pub fn stroke_styled_into(
+    path: &Path,
+    style: &Stroke,
+    frame: &Frame,
+    scratch: &mut StrokeScratch,
+    out: &mut Path,
+) {
+    let StrokeScratch { disc, piece } = scratch;
+    let round = style.round_cap.then(|| {
+        disc_into(style.half, disc);
+        disc.as_slice()
+    });
+    let half = style.half;
     path.subpaths().for_each(|s| {
-        // The segments between the points, without the repeated points,
-        // and the segment back to the start of a closed subpath.
         let points = s.points;
-        let open = points
-            .windows(2)
-            .map(|w| (w[0], w[1]))
-            .filter(|(a, b)| a != b);
-        let (first, last) = (points[0], points[points.len() - 1]);
-        let closing =
-            (s.closed && open.clone().next().is_some() && first != last).then_some((last, first));
-        let segments = open.chain(closing);
-        segments.clone().for_each(|(a, b)| {
-            let n = normal(direction(a, b), half);
-            out.push_positive(&[add(a, n), add(b, n), add(b, neg(n)), add(a, neg(n))]);
-        });
-        let joins = segments.clone().zip(segments.clone().skip(1));
-        let around = segments
-            .clone()
-            .nth(1)
-            .and(s.closed.then_some(()))
-            .and_then(|()| segments.clone().last().zip(segments.clone().next()));
-        joins
-            .chain(around)
-            .for_each(|(p, q)| join(out, p.1, direction(p.0, p.1), direction(q.0, q.1), half));
+        if points.iter().all(|&p| p == points[0]) {
+            let on = style.dash.is_empty() || Dashes::start(style.dash, style.phase).on();
+            if let Some(disc) = round
+                && (s.closed || points.len() > 1)
+                && on
+            {
+                push_disc(out, disc, points[0]);
+            }
+        } else if style.dash.is_empty() {
+            stroke_polyline(points, s.closed, half, round, (true, true), out);
+        } else {
+            for_each_dash(points, s.closed, style, frame, piece, |dash, caps| {
+                if dash.iter().all(|&p| p == dash[0]) {
+                    // A dash of no length is a disc with round caps.
+                    if let Some(disc) = round
+                        && caps.0
+                        && caps.1
+                    {
+                        push_disc(out, disc, dash[0]);
+                    }
+                } else {
+                    stroke_polyline(dash, false, half, round, caps, out);
+                }
+            });
+        }
     });
 }
 
@@ -1189,3 +1520,6 @@ mod miter_tests;
 
 #[cfg(test)]
 mod outside_tests;
+
+#[cfg(test)]
+mod stroke_tests;

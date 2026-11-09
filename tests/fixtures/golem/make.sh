@@ -60,3 +60,132 @@ build "$work/truetype" truetype
 # the measurements of speed (docs/adr/0013)
 cp -R "$driver/test/fixtures/kanikosen" "$work/kanikosen"
 build "$work/kanikosen" kanikosen
+
+# boxes_project <directory> <writing mode> <binding>: a one-chapter book
+# of paragraph boxes with round corners (Golem's docs/adr/0271), whose
+# borders are strokes of paths: solid, dashed and dotted, and one broken
+# by border-sides (docs/adr/0025)
+boxes_project() {
+  mkdir -p "$1/chapters"
+  copy_fonts "$1"
+  cat > "$1/manifest.toml" <<EOF
+chapters = ["chapters/01-boxes.gm"]
+
+[metadata]
+id = "urn:uuid:00000000-0000-4000-8000-000000000025"
+title = "角丸の囲みの見本"
+language = "ja"
+date = 2026-11-10
+publisher = "shem"
+
+[[metadata.creators]]
+name = "shem"
+role = "author"
+
+[source]
+paragraph-separator = "blank-line"
+
+[targets.pdf]
+EOF
+  cat > "$1/style.toml" <<EOF
+[page]
+size = "A5"
+binding = "$3"
+writing-mode = "$2"
+
+[page.grid]
+font-size = "12Q"
+characters = 26
+lines = 20
+line-pitch = "20H"
+position = { top = "20mm", gutter = "18mm" }
+
+[fonts.body]
+ja = "fonts/ja.otf"
+latin = "fonts/latin.otf"
+
+[color.swatches]
+red = { cmyk = [0, 100, 100, 0] }
+blue = { cmyk = [100, 60, 0, 0] }
+pale = { cmyk = [8, 0, 0, 0] }
+
+[paragraph-styles.body]
+first-line-indent = "1zw"
+
+[paragraph-styles.solid]
+first-line-indent = "0zw"
+background = "pale"
+padding = "0.5zw"
+border = "blue"
+border-width = "1pt"
+border-radius = "1zw"
+
+[paragraph-styles.dashed]
+first-line-indent = "0zw"
+padding = "0.5zw"
+border = "red"
+border-width = "1pt"
+border-style = "dashed"
+border-radius = "1.5zw"
+
+[paragraph-styles.dotted]
+first-line-indent = "0zw"
+padding = "0.5zw"
+border = "blue"
+border-width = "1.5pt"
+border-style = "dotted"
+border-radius = "1zw"
+
+[paragraph-styles.sides]
+first-line-indent = "0zw"
+padding = "0.5zw"
+border = "red"
+border-width = "1pt"
+border-sides = ["before", "start"]
+border-radius = "1zw"
+
+[paragraph-styles.sides-dotted]
+first-line-indent = "0zw"
+padding = "0.5zw"
+border = "blue"
+border-width = "1.5pt"
+border-style = "dotted"
+border-sides = ["after", "start", "end"]
+border-radius = "2zw"
+EOF
+  cat > "$1/chapters/01-boxes.gm" <<EOF
+# 角丸の囲み
+
+囲みの枠は、角を丸めると線で描かれる。
+
+@style solid
+実線の枠と背景を持つ囲みである。
+四つの角が丸い。
+
+@style dashed
+破線の枠を持つ囲みである。
+破線は辺と四分円の上で切れる。
+
+@style dotted
+点線の枠を持つ囲みである。
+点は丸い線端の長さ 0 の破線である。
+
+@style sides
+前の辺と行の始まりの辺だけの枠である。
+二つの辺のあいだの角だけが丸い。
+
+@style sides-dotted
+後の辺と行の両端の辺の点線の枠である。
+途切れた辺の端は開いたパスの線端になる。
+
+囲みの後の本文。
+EOF
+}
+
+# boxes: the paragraph boxes with round corners set horizontally
+boxes_project "$work/boxes" horizontal left
+build "$work/boxes" boxes
+
+# boxes-vertical: the same set vertically
+boxes_project "$work/boxes-vertical" vertical right
+build "$work/boxes-vertical" boxes-vertical
