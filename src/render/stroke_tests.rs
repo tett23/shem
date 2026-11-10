@@ -255,17 +255,21 @@ fn a_stroke_beyond_the_range_of_coordinates_is_an_error() {
 }
 
 #[test]
-fn far_dashed_curves_are_drawn_within_a_second() {
-    // 100 curves with far control points, dashed with [1 1]: the curves
-    // are flattened to 2^16 points each, and the segments beyond the
-    // canvas only advance the dash (docs/adr/0025).
+fn far_dashed_curves_are_drawn_in_seconds_not_minutes() {
+    // 100 curves with far control points, dashed with [1 1]: the segments
+    // beyond the canvas only advance the dash (docs/adr/0025). The work is
+    // counted by `far_curves_make_polygons_only_near_the_canvas`
+    // (src/raster/stroke_tests.rs); this test only guards the whole path
+    // through the renderer. It takes 0.07 s; with a polygon for every
+    // segment it takes 80 s. The bound of 20 s leaves 280 times for a loaded
+    // machine, and is 4 times under the slow one.
     let curve = "-2000000 -2000000 2000000 -2000000 -2000000 2000000 c\n";
     let content = format!("[1 1] 0 d 1 w 0 0 m\n{}S\n", curve.repeat(100));
     let pdf = page_pdf("0 0 100 100", "", &content, &[]);
     let start = std::time::Instant::now();
     render_pdf(&pdf, 72).unwrap();
     let elapsed = start.elapsed();
-    assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+    assert!(elapsed < std::time::Duration::from_secs(20), "{elapsed:?}");
 }
 
 #[test]

@@ -566,6 +566,28 @@ fn far_segments_only_move_along_the_dashes() {
 }
 
 #[test]
+fn far_curves_make_polygons_only_near_the_canvas() {
+    // The count of the work, in place of a clock (docs/adr/0025): a curve
+    // with far control points flattens to thousands of points, dashed with
+    // [1 1] it has one dash for each pair of points, and the dashes beyond
+    // the margin make no polygon. The polygons are those near the canvas, a
+    // handful of the thousands.
+    let (w, h) = (100, 100);
+    let style = styled(128, false, &[PX, PX], 0);
+    let frame = Frame::around(w, h, 16 * style.half + 16);
+    let far = 2_000_000 * ONE;
+    let mut path = Path::new();
+    path.move_to((0, 0));
+    (0..3).for_each(|_| path.curve_to((-far, -far), (far, -far), (-far, far)));
+    let points = path.points().len();
+    assert!(points > 10_000, "{points}");
+    let pruned = stroke_styled(&path, &style, &frame);
+    let count = pruned.subpaths().count();
+    assert!(count > 0, "the dashes near the canvas are drawn");
+    assert!(count < 1000, "{count} polygons for {points} points");
+}
+
+#[test]
 fn a_dot_at_the_end_of_an_open_polyline_is_not_drawn() {
     // docs/adr/0026: [0 12] on an open line of 36 pixels makes dots at 0,
     // 12 and 24, and none at its end, as pdftoppm does.
