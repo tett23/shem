@@ -13,15 +13,24 @@ fn fixture(name: &str) -> Vec<u8> {
     .unwrap()
 }
 
-const FIXTURES: [(&str, usize); 7] = [
+const FIXTURES: [(&str, usize); 9] = [
     ("sample", 3),
     ("sample-marks", 3),
-    ("figures", 2),
+    ("figures", 9),
     ("truetype", 2),
     ("kanikosen", 129),
     ("boxes", 2),
     ("boxes-vertical", 2),
+    ("complex-horizontal", 18),
+    ("complex-vertical", 26),
 ];
+
+/// The two books that combine the features leave versos blank before a
+/// chapter that opens on a recto (docs/adr/0027); every other fixture has
+/// ink on every page.
+fn may_have_blank_pages(name: &str) -> bool {
+    name.starts_with("complex-")
+}
 
 #[test]
 fn every_page_parses_and_its_resources_exist() {
@@ -32,7 +41,7 @@ fn every_page_parses_and_its_resources_exist() {
         pages.iter().for_each(|page| {
             let ops = content::parse(&page.contents)
                 .unwrap_or_else(|e| panic!("{name}: page {}: {e}", page.index + 1));
-            assert!(!ops.is_empty());
+            assert!(!ops.is_empty() || may_have_blank_pages(name));
             content::check_resources(&doc, &page.resources, &ops).unwrap();
         });
     });
@@ -97,15 +106,23 @@ fn every_flate_stream_inflates() {
 fn every_page_renders() {
     FIXTURES.iter().for_each(|&(name, _)| {
         let doc = Document::parse(&fixture(name)).unwrap();
-        doc.pages().unwrap().iter().for_each(|page| {
-            let canvas =
-                shem::render::render_page(&doc, page, 72).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert!(
-                canvas.pixels.iter().any(|&v| v != 255),
-                "{name}: page {} is blank",
-                page.index + 1
-            );
-        });
+        let inked = doc
+            .pages()
+            .unwrap()
+            .iter()
+            .filter(|page| {
+                let canvas = shem::render::render_page(&doc, page, 72)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                let inked = canvas.pixels.iter().any(|&v| v != 255);
+                assert!(
+                    inked || may_have_blank_pages(name),
+                    "{name}: page {} is blank",
+                    page.index + 1
+                );
+                inked
+            })
+            .count();
+        assert!(inked > 0, "{name}: every page is blank");
     });
 }
 

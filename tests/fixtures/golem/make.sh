@@ -189,3 +189,13 @@ build "$work/boxes" boxes
 # boxes-vertical: the same set vertically
 boxes_project "$work/boxes-vertical" vertical right
 build "$work/boxes-vertical" boxes-vertical
+
+# complex-horizontal and complex-vertical: the two books that combine the
+# features (Golem's docs/adr/0175), with a JPEG and SVG figures, as the
+# goldens pdf-complex-horizontal.txt and pdf-complex-vertical.txt make
+# them (docs/adr/0027)
+for name in complex-horizontal complex-vertical; do
+  cp -R "$driver/test/fixtures/$name" "$work/$name"
+  copy_fonts "$work/$name"
+  build "$work/$name" "$name"
+done

@@ -653,3 +653,77 @@ fn wrong_jobs_are_usage_errors() {
     }
     assert!(shem(&["--help"]).1.contains("--jobs"));
 }
+
+/// A three-page PDF whose third page places the image XObject of the
+/// given dictionary and raw data (docs/adr/0027).
+fn pdf_with_an_image_on_the_third_page(dict: &str, data: &[u8]) -> Vec<u8> {
+    let mut objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>".to_string(),
+    ];
+    ["0 0 1 1 re f", "", "q 10 0 0 10 0 0 cm /Im1 Do Q"]
+        .iter()
+        .enumerate()
+        .for_each(|(i, c)| {
+            objects.push(format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /Im1 9 0 R >> >> /Contents {} 0 R >>",
+                4 + 2 * i
+            ));
+            objects.push(format!("<< /Length {} >>\nstream\n{c}\nendstream", c.len()));
+        });
+    objects.push(format!(
+        "<< /Type /XObject /Subtype /Image {dict} /Length {} >>\nstream\n{}\nendstream",
+        data.len(),
+        String::from_utf8_lossy(data)
+    ));
+    pdf_of_objects(&objects)
+}
+
+#[test]
+fn nothing_is_written_when_an_image_of_a_later_page_is_broken() {
+    // docs/adr/0027: the check decodes the images, so a corrupt one on
+    // the third page stops the rendering before any file is written.
+    let dir = scratch("broken-image");
+    let cases: [(&str, &[u8], &str); 4] = [
+        (
+            "/Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+            b"xyz",
+            "page 3: object 9",
+        ),
+        (
+            "/Width 2 /Height 2 /ColorSpace [/Indexed /DeviceGray 1 <40c0>] /BitsPerComponent 8",
+            b"\x00\x01\x02\x00",
+            "out of range",
+        ),
+        (
+            "/Width 8192 /Height 8193 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            b"",
+            "image larger than 67108864 samples",
+        ),
+        (
+            "/Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /ImageMask true",
+            b"abcd",
+            "unsupported ImageMask",
+        ),
+    ];
+    cases
+        .iter()
+        .enumerate()
+        .for_each(|(i, (dict, data, text))| {
+            let input = write_pdf(
+                &dir,
+                &format!("bad-{i}.pdf"),
+                &pdf_with_an_image_on_the_third_page(dict, data),
+            );
+            let out = dir.join(format!("out-{i}"));
+            let (code, stdout, stderr) = shem(&["render", &input, out.to_str().unwrap()]);
+            assert_eq!(code, 1, "{stderr}");
+            assert_eq!(stdout, "");
+            assert!(
+                stderr.starts_with(&format!("shem: {input}: page 3: ")),
+                "{stderr}"
+            );
+            assert!(stderr.contains(text), "{stderr}");
+            assert!(files(&out).is_empty());
+        });
+}
