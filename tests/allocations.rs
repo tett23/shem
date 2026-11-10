@@ -159,6 +159,30 @@ fn the_allocations_do_not_grow_with_the_dashes() {
     });
 }
 
+#[test]
+fn the_allocations_do_not_grow_with_the_clips() {
+    // docs/adr/0027: the masks of the clips are kept in the workspace,
+    // whether the clips nest in q Q or follow each other.
+    assert_not_per_item("q 10 10 50 50 re W n 0 0 100 100 re f Q\n", |s| s);
+    assert_not_per_item("10 10 50 50 re W n 0 0 100 100 re f\n", |s| s);
+    assert_not_per_item("q 10 10 50 50 re W* n 4 w 0 0 m 100 100 l S Q\n", |s| s);
+}
+
+#[test]
+fn the_allocations_do_not_grow_with_the_strokes_under_a_general_ctm() {
+    // docs/adr/0027: the polygons of user space and their images go into
+    // the paths of the workspace.
+    assert_not_per_item("10 10 m 50 50 l 60 20 l S\n", |s| {
+        format!("2 0 0 1 0 0 cm\n{s}")
+    });
+    assert_not_per_item("10 10 m 20 60 40 10 50 50 c S\n", |s| {
+        format!("1 0 0.5 1 0 0 cm 1 j 1 J [3 2] 0 d\n{s}")
+    });
+    assert_not_per_item("10 10 m 50 50 l 60 20 l 10 10 l h B\n", |s| {
+        format!("2 0 0 1 0 0 cm 2 J\n{s}")
+    });
+}
+
 /// The distinct CIDs of the `Tj` of a page, as two-byte hexadecimal strings.
 fn distinct_cids(page: &Page) -> Vec<String> {
     let ops = shem::content::parse(&page.contents).unwrap();
@@ -209,5 +233,85 @@ fn a_glyph_interpreted_for_the_first_time_allocates_a_few_times() {
     assert!(
         cold <= warm + n * 4,
         "{n} glyphs: {cold} allocations at the first check, {warm} at the second"
+    );
+}
+
+/// A one-page PDF with a 2 × 2 gray image `/Im1` with an SMask, and the
+/// given content (docs/adr/0027).
+fn pdf_with_an_image(content: &str) -> Vec<u8> {
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 500] /Resources << /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        "<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 6 0 R /Length 4 >>\nstream\nABCD\nendstream".to_string(),
+        "<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 4 >>\nstream\nabcd\nendstream".to_string(),
+    ];
+    let mut out = b"%PDF-1.6\n".to_vec();
+    let offsets: Vec<usize> = objects
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let at = out.len();
+            out.extend(format!("{} 0 obj\n{o}\nendobj\n", i + 1).into_bytes());
+            at
+        })
+        .collect();
+    let xref = out.len();
+    out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).into_bytes());
+    offsets
+        .iter()
+        .for_each(|o| out.extend(format!("{o:010} 00000 n \n").into_bytes()));
+    out.extend(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .into_bytes(),
+    );
+    out
+}
+
+/// The allocations of a page of the image document with `content`.
+fn of_image_page(content: &str) -> u64 {
+    let doc = Document::parse(&pdf_with_an_image(content)).unwrap();
+    let page = doc.pages().unwrap().remove(0);
+    allocations(&doc, &page, &FontCache::new())
+}
+
+#[test]
+fn the_allocations_do_not_grow_with_the_images() {
+    // docs/adr/0027: an image is decoded once per page, and placing it
+    // allocates nothing.
+    let item = "q 10 0 0 10 10 10 cm /Im1 Do Q\n";
+    let few = of_image_page(&item.repeat(10));
+    let many = of_image_page(&item.repeat(100));
+    assert!(
+        many < few + 9,
+        "10 images: {few} allocations, 100 images: {many}"
+    );
+}
+
+#[test]
+fn the_allocations_do_not_grow_with_the_pixels_of_an_image() {
+    // The same image on 10 × 10, 400 × 400 and 480 × 480 pixels, with its
+    // SMask: the sampling allocates nothing per pixel or per row. The
+    // cells of the coverage of the large ones, beyond the dense grid, are
+    // in a buffer that doubles (docs/adr/0014), as for a fill.
+    let small = of_image_page("q 10 0 0 10 10 10 cm /Im1 Do Q\n");
+    let large = of_image_page("q 400 0 0 400 10 10 cm /Im1 Do Q\n");
+    let larger = of_image_page("q 480 0 0 480 10 10 cm /Im1 Do Q\n");
+    assert!(
+        large < small + 40,
+        "10 × 10: {small} allocations, 400 × 400: {large}"
+    );
+    assert!(
+        larger < large + 9,
+        "400 × 400: {large} allocations, 480 × 480: {larger}"
+    );
+    let rotated = of_image_page("q 0 400 -400 0 450 10 cm /Im1 Do Q\n");
+    assert!(
+        rotated < large + 9,
+        "400 × 400: {large} allocations, rotated: {rotated}"
     );
 }

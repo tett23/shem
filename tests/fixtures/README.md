@@ -9,7 +9,9 @@ PDFs written by Golem, for the tests of the subset of PDF that shem reads
 |---|---|
 | `sample.pdf` | Golem's `sample` fixture, set vertically on B6 with the page style of Golem's `scripts/determinism/pdf-style.toml`, as Golem's output golden `pdf-sample.txt` makes it |
 | `sample-marks.pdf` | the same with the Japanese crop marks (`--marks japanese`, with `bleed = "3mm"`), for the Separation `/Reg` |
-| `figures.pdf` | Golem's `figures` fixture: an SVG, a PDF and a JPEG figure, as the golden `pdf-figures.txt` makes it |
+| `figures.pdf` | Golem's `figures` fixture: an SVG, a PDF and a JPEG figure, and PNGs of every kind golem-pdf writes (gray, RGB with an SMask, Indexed, ICCBased gray, and four with tRNS), as the golden `pdf-figures.txt` makes it (docs/adr/0027) |
+| `complex-horizontal.pdf` | Golem's `complex-horizontal` fixture (A5, horizontal, two columns, 18 pages), with a JPEG and SVG figures (docs/adr/0027) |
+| `complex-vertical.pdf` | Golem's `complex-vertical` fixture (B6, vertical, 26 pages), with images turned for vertical writing and SVG figures (docs/adr/0027) |
 | `truetype.pdf` | the `figures` fixture with the TrueType Source Serif (variable) as the Latin font, for `CIDFontType2` and `FontFile2` |
 | `kanikosen.pdf` | Golem's `kanikosen` fixture as it is (129 pages, vertical), for the measurements of speed and the bytes of many pages (docs/adr/0013) |
 | `boxes.pdf` | a one-chapter book of paragraph boxes with round corners (Golem's docs/adr/0271), set horizontally: borders solid, dashed and dotted, and borders broken by `border-sides`, which Golem strokes with `l`, `S`, `1 J` and `d` (docs/adr/0025) |
@@ -19,6 +21,10 @@ Two lists record what shem read and wrote before the changes of docs/adr/0013:
 
 - `kanikosen.sha256`: the SHA-256 of every file of `shem render --dpi <72|150> --format <png|ppm>` of `kanikosen.pdf`, made with v0.1.0-rc2. `tests/kanikosen.rs` checks it.
 - `operators.sha256`: the SHA-256 of the `Debug` form of the operators of every page of every PDF here. `tests/golem_fixtures.rs` checks it.
+
+Two more record the images and figures of docs/adr/0027:
+
+- `complex-horizontal.sha256` and `complex-vertical.sha256`: the SHA-256 of every file of `shem render --dpi <72|150|300> --format <png|ppm>` of the two books. `tests/golden.rs` checks them.
 
 To write them again after an intended change, run the tests with `SHEM_UPDATE_GOLDEN=1`.
 
@@ -38,8 +44,16 @@ Running `make.sh` twice gives the same bytes.
 same `make.sh` with Golem at commit
 `9187426cb25d00311102904b3b21100be71030ac` (`golem 0.1.0-rc4`, the
 origin/main of 2026-11-10, which has the strokes of docs/adr/0271 that
-docs/adr/0025 surveyed at `7e8fe7d3`). The five PDFs above were not made
-again, so they stay as the commit `1254092a` wrote them.
+docs/adr/0025 surveyed at `7e8fe7d3`).
+
+`figures.pdf` was made again, and `complex-horizontal.pdf` and
+`complex-vertical.pdf` were added, for docs/adr/0027 by the same `make.sh`
+with Golem at commit `ef6a9d8ca78d8ff876726a4057310349cee7a6ca` (`golem
+0.1.0-rc4`, the origin/main of 2026-11-10 after `b35fd7b9`, which
+docs/adr/0027 surveyed; the `figures` fixture has the PNGs with tRNS from
+there). `sample.pdf`, `sample-marks.pdf`, `truetype.pdf` and
+`kanikosen.pdf` were not made again, so they stay as the commit
+`1254092a` wrote them.
 
 The PDFs embed subsets of these fonts, all under the SIL Open Font License
 1.1, whose texts are in `golem/licenses/`:

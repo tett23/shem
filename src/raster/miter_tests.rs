@@ -3,6 +3,9 @@
 
 use super::*;
 
+/// The miter limit of 10 as `miter` takes it (docs/adr/0027).
+const TEN: i64 = 10 << 32;
+
 /// A xorshift64* generator, for inputs that are the same on every run.
 struct Rng(u64);
 
@@ -63,7 +66,7 @@ fn miter_points_are_within_16_half_widths_of_the_vertex() {
         if d1 == (0, 0) || d2 == (0, 0) {
             return;
         }
-        if let Some(m) = miter(d1, d2, half) {
+        if let Some(m) = miter(d1, d2, half, TEN) {
             miters += 1;
             assert!(within_16_half(m, half), "{d1:?} {d2:?} {half}: {m:?}");
         }
@@ -74,7 +77,7 @@ fn miter_points_are_within_16_half_widths_of_the_vertex() {
 #[test]
 fn the_join_that_jumped_stays_near_its_vertex() {
     // The join of docs/adr/0023: 5,461 units from its vertex before.
-    let m = miter((60, 62), (59, 61), 128).unwrap();
+    let m = miter((60, 62), (59, 61), 128, TEN).unwrap();
     assert!(within_16_half(m, 128), "{m:?}");
 }
 
@@ -120,7 +123,7 @@ fn miter_points_are_those_of_the_directions() {
         if d1 == (0, 0) || d2 == (0, 0) {
             return;
         }
-        if let Some(m) = miter(d1, d2, half) {
+        if let Some(m) = miter(d1, d2, half, TEN) {
             miters += 1;
             let p = precise_miter(d1, d2, half);
             assert!(
@@ -134,7 +137,7 @@ fn miter_points_are_those_of_the_directions() {
 
 #[test]
 fn a_right_angle_has_its_miter_at_the_corner() {
-    let m = miter((256, 0), (0, 256), 128).unwrap();
+    let m = miter((256, 0), (0, 256), 128, TEN).unwrap();
     assert_eq!((m.0.abs(), m.1.abs()), (128, 128));
 }
 
@@ -166,7 +169,7 @@ fn miters_and_bevels_are_chosen_as_before() {
             return;
         }
         assert_eq!(
-            miter(d1, d2, half).is_some(),
+            miter(d1, d2, half, TEN).is_some(),
             mitered_before(d1, d2, half),
             "{d1:?} {d2:?} {half}"
         );

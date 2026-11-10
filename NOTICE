@@ -1,0 +1,7 @@
+shem is licensed under the MIT License (see LICENSE).
+
+The JPEG decoder (src/jpeg.rs) computes its inverse DCT, chroma upsampling
+and colour conversion with the integer formulas of the Independent JPEG
+Group's libjpeg (jidctint.c, jdsample.c and jdcolor.c), written again in
+Rust. No source code of libjpeg is included. In the words the IJG asks for:
+this software is based in part on the work of the Independent JPEG Group.

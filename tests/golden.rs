@@ -3,6 +3,9 @@
 //! macOS aarch64. To make the goldens again after an intended change of
 //! the pixels or of the PNG, run it with SHEM_UPDATE_GOLDEN=1.
 
+mod common;
+
+use common::sha256_hex;
 use shem::image::decode;
 use shem::pdf::Document;
 use shem::png::encode_png;
@@ -88,6 +91,85 @@ fn goldens_of_the_strokes() {
         mismatches.is_empty(),
         "differ from the goldens: {mismatches:?}"
     );
+}
+
+/// The figures fixture, whose images and figures are drawn (docs/adr/0027),
+/// at 72, 150 and 300 dpi.
+#[test]
+fn goldens_of_the_figures() {
+    let data = std::fs::read(format!("{}/tests/fixtures/golem/figures.pdf", root())).unwrap();
+    let doc = Document::parse(&data).unwrap();
+    let pages = doc.pages().unwrap();
+    let mismatches: Vec<String> = [72u32, 150, 300]
+        .iter()
+        .flat_map(|&dpi| {
+            pages
+                .iter()
+                .filter_map(|page| {
+                    let canvas = render_page(&doc, page, dpi).unwrap();
+                    let png = encode_png(&canvas);
+                    assert_eq!(decode(&png).unwrap(), canvas);
+                    check(&format!("figures-{dpi}-{}", page.index + 1), &png)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "differ from the goldens: {mismatches:?}"
+    );
+}
+
+/// The two books that combine the features, with a JPEG and SVG figures
+/// (docs/adr/0027): the SHA-256 of every image at 72, 150 and 300 dpi is
+/// in tests/fixtures/golem/<name>.sha256, as for kanikosen.
+#[test]
+fn complex_fixtures_are_the_same_bytes() {
+    use shem::png::encode_ppm;
+    use shem::render::Session;
+    use std::num::NonZeroUsize;
+    use std::sync::Mutex;
+    let jobs = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
+    ["complex-horizontal", "complex-vertical"]
+        .iter()
+        .for_each(|name| {
+            let data =
+                std::fs::read(format!("{}/tests/fixtures/golem/{name}.pdf", root())).unwrap();
+            let doc = Document::parse(&data).unwrap();
+            let lines = Mutex::new(Vec::new());
+            [72u32, 150, 300].iter().for_each(|&dpi| {
+                let session = Session::new(&doc, dpi).unwrap();
+                let pages: Vec<usize> = (0..session.page_count()).collect();
+                session
+                    .render_pages(&pages, jobs, |page, canvas| {
+                        let n = page + 1;
+                        let png = sha256_hex(&encode_png(canvas));
+                        let ppm = sha256_hex(&encode_ppm(canvas));
+                        let mut lines = lines.lock().unwrap();
+                        lines.push(format!("{png}  {dpi}-png/page-{n:04}.png"));
+                        lines.push(format!("{ppm}  {dpi}-ppm/page-{n:04}.ppm"));
+                        Ok::<(), ()>(())
+                    })
+                    .unwrap();
+            });
+            let mut lines = lines.into_inner().unwrap();
+            lines.sort_by(|a, b| a[66..].cmp(&b[66..]));
+            let actual = lines.join("\n") + "\n";
+            let path = format!("{}/tests/fixtures/golem/{name}.sha256", root());
+            if update() {
+                std::fs::write(&path, &actual).unwrap();
+                return;
+            }
+            let expected = std::fs::read_to_string(&path).unwrap_or_default();
+            let differ: Vec<&str> = actual
+                .lines()
+                .zip(expected.lines())
+                .filter(|(a, e)| a != e)
+                .map(|(a, _)| &a[66..])
+                .collect();
+            assert!(differ.is_empty(), "{name}: the images differ: {differ:?}");
+            assert_eq!(actual.lines().count(), expected.lines().count(), "{name}");
+        });
 }
 
 /// The diff image of the first pages of sample and sample-marks, which also

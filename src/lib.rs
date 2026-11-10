@@ -6,6 +6,7 @@
 //! machine.
 
 pub mod cli;
+pub mod clip;
 pub mod color;
 pub mod content;
 pub mod diff;
@@ -14,8 +15,10 @@ pub mod fixed;
 pub mod flate;
 pub mod font;
 pub mod image;
+pub mod jpeg;
 pub mod parallel;
 pub mod pdf;
+pub mod picture;
 pub mod png;
 pub mod raster;
 pub mod render;

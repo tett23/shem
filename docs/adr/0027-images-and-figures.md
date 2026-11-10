@@ -1,6 +1,6 @@
 # ADR 0027: 画像と図版の中身を描く
 
-ステータス: 採択（未実装）
+ステータス: 採択→決めていなかった細部は[ADR 0028](0028-details-left-open-by-images-and-figures.md)、[ADR 0029](0029-details-left-open-by-images-and-forms.md)
 
 ## 文脈
 

@@ -26,17 +26,23 @@ fn every_image_is_the_same_bytes_as_before() {
     let doc = Document::parse(&data).unwrap();
     let jobs = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
     let lines = Mutex::new(Vec::new());
-    [72u32, 150].iter().for_each(|&dpi| {
+    // 97 dpi is in the list as PPM only: its lines were made with the shem
+    // of main before docs/adr/0025 (6f0e183), `shem render --dpi 97 --format
+    // ppm`, so they are the bytes that docs/adr/0025 and 0027 must not
+    // change (the list has no 97-png).
+    [72u32, 150, 97].iter().for_each(|&dpi| {
         let session = Session::new(&doc, dpi).unwrap();
         let pages: Vec<usize> = (0..session.page_count()).collect();
         assert_eq!(pages.len(), 129);
         session
             .render_pages(&pages, jobs, |page, canvas| {
                 let n = page + 1;
-                let png = common::sha256_hex(&encode_png(canvas));
-                let ppm = common::sha256_hex(&encode_ppm(canvas));
                 let mut lines = lines.lock().unwrap();
-                lines.push(format!("{png}  {dpi}-png/page-{n:04}.png"));
+                if dpi != 97 {
+                    let png = common::sha256_hex(&encode_png(canvas));
+                    lines.push(format!("{png}  {dpi}-png/page-{n:04}.png"));
+                }
+                let ppm = common::sha256_hex(&encode_ppm(canvas));
                 lines.push(format!("{ppm}  {dpi}-ppm/page-{n:04}.ppm"));
                 Ok::<(), ()>(())
             })

@@ -1,26 +1,36 @@
 //! Interpreting a page's content into an image (docs/adr/0003).
 
-use crate::color::{self, Device, FillSpace, Separation};
+use crate::clip::ClipStack;
+use crate::color::{self, ColorSpace, Device};
 use crate::content::{self, Op, Operator, Text};
 use crate::error::{Error, Result};
-use crate::fixed::{Fixed, Matrix, round_shift};
+use crate::fixed::{Fixed, Matrix, div_round_i64, isqrt, round_shift};
 use crate::font::{Font, FontCache, Segment};
 use crate::pdf::Object;
-use crate::pdf::{Dict, Document, Page};
+use crate::pdf::{Dict, Document, Page, Stream};
+use crate::picture::{self, Mapping, Picture, PictureCache};
 use crate::raster::{
-    Canvas, DASH_UNIT, FillRule, Frame, Path, Point, Scratch, Stroke, StrokeScratch, signed_area,
-    stroke_into, stroke_styled_into,
+    Canvas, Cap, DASH_UNIT, FillRule, Frame, Join, Path, PathOf, Point, Scratch, Stroke,
+    StrokeScratch, StrokeScratchOf, signed_area, stroke_into, stroke_styled_into,
 };
-
-/// The fill and the lines of the box of an image or a form (docs/adr/0006).
-const BOX_FILL: [u8; 3] = [192, 192, 192];
-const BOX_LINE: [u8; 3] = [96, 96, 96];
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 /// The largest number of pixels of a page (docs/adr/0007).
 const MAX_PIXELS: u128 = 1 << 28;
+
+/// The most levels of forms within forms, the page being level 0
+/// (docs/adr/0027).
+const MAX_FORM_DEPTH: usize = 8;
+// The limits on the forms placed in a page, the bytes of their contents,
+// the nesting of q (the q of a form included) and the clips that are
+// alive at once (docs/adr/0030).
+const MAX_FORMS_IN_PAGE: usize = 4096;
+const MAX_FORM_BYTES_IN_PAGE: usize = 1 << 26;
+const MAX_Q_DEPTH: usize = 64;
+const MAX_CLIPS: usize = 16;
 
 /// The size of the image of a page: the size of the MediaBox times dpi / 72,
 /// rounded up, computed exactly from the Q32.32 values.
@@ -132,19 +142,56 @@ fn stroke_margin(half: i64) -> i64 {
     16 * half + 16
 }
 
+/// Whether a CTM keeps angles: a rotation or a reflection with one scale
+/// (docs/adr/0003). The strokes under one are scaled in device space;
+/// the others are built in user space (docs/adr/0027).
+fn keeps_angles(ctm: &Matrix) -> Result<bool> {
+    Ok((ctm.a == ctm.d && ctm.b.checked_neg()? == ctm.c)
+        || (ctm.a.checked_neg()? == ctm.d && ctm.b == ctm.c))
+}
+
 /// The scale of a stroke: `sqrt(|det CTM|)`, by which the widths and the
 /// dashes of user space go to device space. The CTM keeps angles; another
 /// is an error (docs/adr/0003).
 fn stroke_scale(ctm: &Matrix) -> Result<Fixed> {
-    let keeps_angles = (ctm.a == ctm.d && ctm.b.checked_neg()? == ctm.c)
-        || (ctm.a.checked_neg()? == ctm.d && ctm.b == ctm.c);
-    if !keeps_angles {
+    if !keeps_angles(ctm)? {
         return Err(Error::new(
             "unsupported stroke with a CTM that does not keep angles",
         ));
     }
     ctm.det()?.abs()?.sqrt()
 }
+
+/// An upper bound of the scale of a CTM, `sqrt(a² + b² + c² + d²)`, as a
+/// Q32.32 raw value: the integer square root of the sum, which is at most
+/// it, plus 1 (docs/adr/0027). By it, a length of user space is at most
+/// that many pixels per unit, whatever its direction.
+fn scale_bound(ctm: &Matrix) -> u128 {
+    let sq = |v: Fixed| u128::from(v.raw().unsigned_abs()).pow(2);
+    let sum = [ctm.a, ctm.b, ctm.c, ctm.d]
+        .iter()
+        .fold(0u128, |sum, &v| sum.saturating_add(sq(v)));
+    isqrt(sum) + 1
+}
+
+/// The flatness of the curves of user space under a CTM: the largest
+/// second difference, in units of 2^−32, that the bound of the scale maps
+/// to 1/16 pixel or less: `2^60 / bound` (docs/adr/0027).
+fn user_flatness(bound: u128) -> i64 {
+    ((1u128 << 60) / bound).min(i64::MAX as u128) as i64
+}
+
+/// The least period of a dash array in user space under a CTM: the one
+/// that the bound of the scale maps to 1/16 pixel, so `period · bound ≥
+/// 2^60` (docs/adr/0027).
+fn user_period_is_long_enough(period: i128, bound: u128) -> bool {
+    period >= 0 && (period as u128).saturating_mul(bound) >= 1 << 60
+}
+
+/// The largest absolute value of the coordinates of the points of a path
+/// of user space that the stroke's arithmetic takes: below 2^62, so that
+/// the differences of two coordinates fit in i64 (docs/adr/0027).
+const USER_REACH: i64 = (1 << 62) - 1;
 
 /// Half the width of a stroke in device space, in units of 1/256 pixel. The
 /// CTM keeps angles; a line width of 0 is one pixel (ISO 32000-1 8.4.3.2).
@@ -176,15 +223,26 @@ const MIN_DASH_PERIOD: i128 = 16 * DASH_UNIT as i128;
 struct GraphicsState {
     ctm: Matrix,
     line_width: Fixed,
-    // Round caps (1 J) and the dash array with its phase (d), in user
-    // space (docs/adr/0025). The array is shared, so that saving the state
-    // allocates nothing.
-    round_cap: bool,
+    // The caps (J), the joins (j) with the miter limit (M), and the dash
+    // array with its phase (d), in user space (docs/adr/0025, 0027). The
+    // array is shared, so that saving the state allocates nothing.
+    cap: Cap,
+    line_join: i64,
+    miter_limit: Fixed,
     dash: Arc<[Fixed]>,
     dash_phase: Fixed,
     fill: [u8; 3],
-    fill_space: FillSpace,
+    fill_space: ColorSpace,
     stroke: [u8; 3],
+    stroke_space: ColorSpace,
+    // The index of the clip's mask in the workspace's stack, or none
+    // (docs/adr/0027).
+    clip: Option<usize>,
+    // How many clips are alive in this state, counted also when the masks
+    // are not made, and whether this state made its own: a clip of the
+    // same state replaces its mask (docs/adr/0030).
+    clips: usize,
+    own_clip: bool,
     // The text state (ISO 32000-1 9.3): the font and its size, the
     // horizontal scaling (Tz / 100) and the rendering mode.
     font: Option<Arc<Font>>,
@@ -196,7 +254,10 @@ struct GraphicsState {
 struct Renderer<'a> {
     doc: &'a Document,
     cache: &'a FontCache,
-    resources: &'a Dict,
+    pictures: &'a PictureCache,
+    // The resources of the page, or of the form being drawn
+    // (docs/adr/0027).
+    resources: Cow<'a, Dict>,
     canvas: Canvas,
     // The size of the image, and its frame, beyond which a curve is one
     // segment (docs/adr/0022).
@@ -210,8 +271,12 @@ struct Renderer<'a> {
     text_matrix: Matrix,
     // The fonts of the resources, read once per page.
     fonts: BTreeMap<Vec<u8>, Arc<Font>>,
-    // Half of 1 point in device space, in units of 1/256 pixel.
-    point_half_width: i64,
+    // How many forms the content being drawn is within (docs/adr/0027).
+    form_depth: usize,
+    // The forms placed in the page so far and the bytes of their contents
+    // (docs/adr/0030).
+    forms: usize,
+    form_bytes: usize,
     // Whether pixels are drawn; without it, the page is only interpreted.
     paint: bool,
     // The buffers that the glyphs, the strokes and the fills of the page
@@ -224,6 +289,18 @@ struct Renderer<'a> {
     // dash array in device space (docs/adr/0025).
     strokes: StrokeScratch,
     dash: Vec<i64>,
+    // The page's path in user space, built beside the device path under
+    // a CTM that does not keep angles, the outline of its stroke, and the
+    // disc and the dash of those strokes (docs/adr/0027).
+    user_path: PathOf<i64>,
+    user_outline: PathOf<i64>,
+    user_strokes: StrokeScratchOf<i64>,
+    // The masks of the clips, and the rule of a W or W* waiting for the
+    // operator that ends the path (docs/adr/0027).
+    clips: ClipStack,
+    pending_clip: Option<FillRule>,
+    // The parallelogram of an image or the BBox of a form (docs/adr/0027).
+    quad: Path,
 }
 
 impl Renderer<'_> {
@@ -232,11 +309,59 @@ impl Renderer<'_> {
     }
 
     fn fill(&mut self, path: &Path, rgb: [u8; 3]) {
+        self.fill_with(path, FillRule::NonZero, rgb);
+    }
+
+    /// Fills a path under a rule with a color, within the clip if there is
+    /// one (docs/adr/0027).
+    fn fill_with(&mut self, path: &Path, rule: FillRule, rgb: [u8; 3]) {
         if !self.paint {
             return;
         }
-        self.canvas
-            .fill(path, FillRule::NonZero, rgb, &mut self.scratch);
+        match self.state.clip {
+            None => self.canvas.fill(path, rule, rgb, &mut self.scratch),
+            Some(i) => {
+                self.canvas
+                    .fill_within(path, rule, rgb, &mut self.scratch, self.clips.get(i))
+            }
+        }
+    }
+
+    /// Whether the user path is built beside the device path: the CTM
+    /// does not keep angles, so a stroke would be built in user space
+    /// (docs/adr/0027).
+    fn builds_user_path(&self) -> Result<bool> {
+        Ok(!keeps_angles(&self.state.ctm)?)
+    }
+
+    /// Narrows the clip to the path under the rule (docs/adr/0027): the
+    /// new mask goes right after the mask of the state below, whose masks
+    /// the state keeps; the masks above it are free.
+    fn clip_to(&mut self, path: &Path, rule: FillRule) -> Result<()> {
+        // Counted before the masks, so that the check finds it
+        // (docs/adr/0030).
+        if !self.state.own_clip {
+            self.state.clips += 1;
+            self.state.own_clip = true;
+        }
+        if self.state.clips > MAX_CLIPS {
+            return Err(Error::new(format!("clips nested deeper than {MAX_CLIPS}")));
+        }
+        if !self.paint {
+            return Ok(());
+        }
+        let keep = self.stack.last().and_then(|s| s.clip).map_or(0, |i| i + 1);
+        let index = self.clips.intersect(
+            keep,
+            self.state.clip,
+            path,
+            rule,
+            self.width,
+            self.height,
+            &mut self.scratch,
+        );
+        self.state.clip = Some(index);
+        Ok(())
     }
 
     /// Fills the stroke of a path, `half` units on each side.
@@ -302,9 +427,11 @@ impl Renderer<'_> {
             if self.paint {
                 let style = Stroke {
                     half,
-                    round_cap: self.state.round_cap,
+                    cap: self.state.cap,
+                    join: self.join(),
                     dash: &dash,
                     phase,
+                    flatness: crate::raster::FLATNESS,
                 };
                 let frame = Frame::around(self.width, self.height, margin);
                 let mut outline = std::mem::take(&mut self.outline);
@@ -320,6 +447,153 @@ impl Renderer<'_> {
         result
     }
 
+    /// The join of the strokes of the state: `j` with the limit `M`
+    /// (docs/adr/0027).
+    fn join(&self) -> Join {
+        match self.state.line_join {
+            1 => Join::Round,
+            2 => Join::Bevel,
+            _ => Join::Miter(self.state.miter_limit.raw()),
+        }
+    }
+
+    /// Strokes the page's path under a CTM that does not keep angles
+    /// (docs/adr/0027): the outline is built in user space, in units of
+    /// 2^−32, with the widths and the dashes as they are, and its points
+    /// are mapped to the device as the points of a path are. The checks
+    /// find the errors without drawing: a width of 0, a dash period too
+    /// short for the bound of the scale, and points beyond the device.
+    fn stroke_user_path(&mut self) -> Result<()> {
+        if self.state.line_width == Fixed::ZERO {
+            return Err(Error::new(
+                "zero-width stroke with a CTM that does not keep angles",
+            ));
+        }
+        let ctm = self.state.ctm;
+        let bound = scale_bound(&ctm);
+        let half = div_round_i64(self.state.line_width.raw(), 2).max(1);
+        let mut dash = std::mem::take(&mut self.dash);
+        dash.clear();
+        dash.extend(self.state.dash.iter().map(|v| v.raw()));
+        let result = (|| {
+            let doubled = if dash.len() % 2 == 1 { 2 } else { 1 };
+            let period: i128 = dash.iter().map(|&l| i128::from(l)).sum::<i128>() * doubled;
+            if !dash.is_empty() && !user_period_is_long_enough(period, bound) {
+                return Err(Error::new("dash pattern shorter than 1/16 pixel"));
+            }
+            let phase = if dash.is_empty() {
+                0
+            } else {
+                (i128::from(self.state.dash_phase.raw()) % period) as i64
+            };
+            let beyond = |v: i64| v.abs() > USER_REACH;
+            if self
+                .user_path
+                .points()
+                .iter()
+                .any(|&(x, y)| beyond(x) || beyond(y))
+            {
+                return Err(Error::new("stroke outside the range of coordinates"));
+            }
+            let style = Stroke {
+                half,
+                cap: self.state.cap,
+                join: self.join(),
+                dash: &dash,
+                phase,
+                flatness: user_flatness(bound),
+            };
+            let mut user_outline = std::mem::take(&mut self.user_outline);
+            user_outline.clear();
+            stroke_styled_into(
+                &self.user_path,
+                &style,
+                &Frame::NONE,
+                &mut self.user_strokes,
+                &mut user_outline,
+            );
+            // The points are mapped without the checks when the bounds
+            // show that they fit (docs/adr/0015).
+            let extent = user_outline
+                .points()
+                .iter()
+                .fold((0, 0), |(mx, my), &(x, y)| {
+                    (mx.max(x.unsigned_abs()), my.max(y.unsigned_abs()))
+                });
+            let fits = fits_with_extent(&ctm, extent);
+            let mut outline = std::mem::take(&mut self.outline);
+            outline.clear();
+            let mapped = user_outline.subpaths().try_for_each(|s| {
+                s.points.iter().enumerate().try_for_each(|(i, &(x, y))| {
+                    let (x, y) = (Fixed::from_raw(x), Fixed::from_raw(y));
+                    let p = if fits {
+                        to_device_fitting(&ctm, x, y)
+                    } else {
+                        to_device(&ctm, x, y)
+                            .map_err(|_| Error::new("stroke outside the range of coordinates"))?
+                    };
+                    if i == 0 {
+                        outline.move_to(p);
+                    } else {
+                        outline.line_to(p);
+                    }
+                    Ok::<_, Error>(())
+                })?;
+                outline.close();
+                Ok(())
+            });
+            if mapped.is_ok() && self.paint {
+                let rgb = self.state.stroke;
+                self.fill(&outline, rgb);
+            }
+            self.outline = outline;
+            self.user_outline = user_outline;
+            mapped
+        })();
+        self.dash = dash;
+        result
+    }
+
+    /// Strokes the page's path (`S`, `B`, `B*`) in the way of its CTM.
+    fn stroke_current_path(&mut self) -> Result<()> {
+        if self.builds_user_path()? {
+            return self.stroke_user_path();
+        }
+        let path = std::mem::take(&mut self.path);
+        let result = self.stroke_path(&path);
+        self.path = path;
+        result
+    }
+
+    /// Ends the page's path with a painting operator: fills it under the
+    /// rule, strokes it, narrows the clip to it if a `W` or `W*` came
+    /// before, and empties it (docs/adr/0027).
+    fn end_path(&mut self, fill: Option<FillRule>, stroke: bool) -> Result<()> {
+        let mut path = std::mem::take(&mut self.path);
+        if let Some(rule) = fill {
+            let rgb = self.state.fill;
+            self.fill_with(&path, rule, rgb);
+        }
+        self.path = std::mem::take(&mut path);
+        let stroked = if stroke {
+            self.stroke_current_path()
+        } else {
+            Ok(())
+        };
+        let stroked = match self.pending_clip.take() {
+            Some(rule) if stroked.is_ok() => {
+                let path = std::mem::take(&mut self.path);
+                let clipped = self.clip_to(&path, rule);
+                self.path = path;
+                clipped
+            }
+            _ => stroked,
+        };
+        self.path.clear();
+        self.user_path.clear();
+        stroked
+    }
+
     /// The font of a name of the resources, read at its first use.
     fn font(&mut self, name: &[u8]) -> Result<Arc<Font>> {
         if let Some(f) = self.fonts.get(name) {
@@ -327,7 +601,7 @@ impl Renderer<'_> {
         }
         let fonts = self
             .doc
-            .get_dict(self.resources, "Font")?
+            .get_dict(&self.resources, "Font")?
             .unwrap_or_default();
         let obj = fonts
             .get(name)
@@ -462,102 +736,252 @@ impl Renderer<'_> {
         Ok(())
     }
 
-    /// Draws an image or a form as a gray box with a cross (docs/adr/0006).
-    /// The contents of the XObject are not read.
-    fn placeholder(&mut self, name: &[u8]) -> Result<()> {
-        let xobjects = self
+    /// Draws the XObject of a name of the resources: an image or a form
+    /// (docs/adr/0027). The errors of the XObject name its object.
+    fn xobject(&mut self, name: &[u8]) -> Result<()> {
+        // The entry is a reference, cloned without an allocation; the
+        // dictionary of the resources is borrowed when it is direct, so
+        // that placing an image allocates nothing (docs/adr/0013).
+        let entry = match self.resources.get(b"XObject".as_slice()) {
+            Some(Object::Dict(d)) => d.get(name).cloned(),
+            _ => self
+                .doc
+                .get_dict(&self.resources, "XObject")?
+                .unwrap_or_default()
+                .get(name)
+                .cloned(),
+        };
+        let entry = entry.ok_or_else(|| Error::new("no such XObject in the resources"))?;
+        let num = match &entry {
+            Object::Ref(r) => Some(r.num),
+            _ => None,
+        };
+        let placed = match num.and_then(|n| self.pictures.cached(n)) {
+            Some(picture) => self.place(&picture),
+            None => self.load_xobject(num, &entry),
+        };
+        placed.map_err(|e| match num {
+            Some(n) => e.at_object(n),
+            None => e,
+        })
+    }
+
+    /// Reads the XObject of `entry` and draws it.
+    fn load_xobject(&mut self, num: Option<u32>, entry: &Object) -> Result<()> {
+        let stream = match self.doc.resolve(entry)? {
+            Object::Stream(s) => s,
+            _ => return Err(Error::new("an XObject is not a stream")),
+        };
+        match self
             .doc
-            .get_dict(self.resources, "XObject")?
-            .unwrap_or_default();
-        let obj = xobjects
-            .get(name)
-            .ok_or_else(|| Error::new("no such XObject in the resources"))?;
-        let dict = self
-            .doc
-            .resolve(obj)?
-            .as_dict()
-            .cloned()
-            .ok_or_else(|| Error::new("an XObject is not a stream"))?;
-        let (rect, matrix) = match self
-            .doc
-            .get(&dict, "Subtype")?
+            .get(&stream.dict, "Subtype")?
             .as_ref()
             .and_then(Object::as_name)
         {
-            // The unit square of image space (ISO 32000-1 8.9.4)
-            Some(b"Image") => (
-                [Fixed::ZERO, Fixed::ZERO, Fixed::ONE, Fixed::ONE],
-                Matrix::IDENTITY,
-            ),
-            // The BBox mapped by the Matrix of the form (8.10.1)
-            Some(b"Form") => {
-                let bbox = self
-                    .doc
-                    .get(&dict, "BBox")?
-                    .ok_or_else(|| Error::new("a form without a BBox"))?;
-                let matrix = match self.doc.get(&dict, "Matrix")? {
-                    None => Matrix::IDENTITY,
-                    Some(Object::Array(a)) if a.len() == 6 => {
-                        let v = a
-                            .iter()
-                            .map(|o| self.doc.number(o))
-                            .collect::<Result<Vec<_>>>()?;
-                        Matrix::new([v[0], v[1], v[2], v[3], v[4], v[5]])
-                    }
-                    Some(other) => {
-                        return Err(Error::new(format!("malformed Matrix {}", other.describe())));
-                    }
+            Some(b"Image") => {
+                let doc = self.doc;
+                let picture = match num {
+                    Some(n) => self.pictures.get(n, || picture::load(doc, &stream))?,
+                    None => Arc::new(picture::load(doc, &stream)?),
                 };
-                (self.doc.rectangle(&bbox)?, matrix)
+                self.place(&picture)
             }
+            Some(b"Form") => self.form(&stream),
             _ => {
                 let subtype = self
                     .doc
-                    .get(&dict, "Subtype")?
+                    .get(&stream.dict, "Subtype")?
                     .map_or("none".into(), |o| o.describe());
-                return Err(Error::new(format!("unsupported XObject Subtype {subtype}")));
+                Err(Error::new(format!("unsupported XObject Subtype {subtype}")))
             }
-        };
-        let m = matrix.concat(&self.state.ctm)?;
-        let [x0, y0, x1, y1] = rect;
+        }
+    }
+
+    /// The path of the rectangle `[x0 y0 x1 y1]` under the CTM, in the
+    /// buffer of the quadrilateral, and its corners.
+    fn quad_of(&mut self, [x0, y0, x1, y1]: [Fixed; 4]) -> Result<[Point; 4]> {
         let corners = [
-            to_device(&m, x0, y0)?,
-            to_device(&m, x1, y0)?,
-            to_device(&m, x1, y1)?,
-            to_device(&m, x0, y1)?,
+            self.point(x0, y0)?,
+            self.point(x1, y0)?,
+            self.point(x1, y1)?,
+            self.point(x0, y1)?,
         ];
+        self.quad.clear();
+        self.quad.move_to(corners[0]);
+        corners[1..].iter().for_each(|&c| self.quad.line_to(c));
+        self.quad.close();
+        Ok(corners)
+    }
+
+    /// Draws a decoded image: the unit square of image space under the
+    /// CTM (ISO 32000-1 8.9.4), filled with the interpolated samples
+    /// (docs/adr/0027). A singular CTM draws nothing.
+    fn place(&mut self, picture: &Picture) -> Result<()> {
+        let corners = self.quad_of([Fixed::ZERO, Fixed::ZERO, Fixed::ONE, Fixed::ONE])?;
         if signed_area(&corners) == 0 {
             return Ok(());
         }
-        let mut box_path = Path::new();
-        box_path.move_to(corners[0]);
-        corners[1..].iter().for_each(|&c| box_path.line_to(c));
-        box_path.close();
-        self.fill(&box_path, BOX_FILL);
-        let mut cross = Path::new();
-        cross.move_to(corners[0]);
-        cross.line_to(corners[2]);
-        cross.move_to(corners[1]);
-        cross.line_to(corners[3]);
-        self.fill_stroke(&cross, self.point_half_width, BOX_LINE);
+        let mask = picture.mask.as_ref().map(|m| (m.width, m.height));
+        let Some(mapping) = Mapping::new(&self.state.ctm, picture.width, picture.height, mask)?
+        else {
+            return Ok(());
+        };
+        if !self.paint {
+            return Ok(());
+        }
+        let quad = std::mem::take(&mut self.quad);
+        let clip = self.state.clip.map(|i| self.clips.get(i));
+        picture::draw(
+            &mut self.canvas,
+            &quad,
+            &mapping,
+            picture,
+            clip,
+            &mut self.scratch,
+        );
+        self.quad = quad;
         Ok(())
+    }
+
+    /// Draws a form: `q`, its `Matrix` on the CTM, the clip of its `BBox`,
+    /// its content with its `Resources`, `Q` (ISO 32000-1 8.10.1,
+    /// docs/adr/0027).
+    fn form(&mut self, stream: &Stream) -> Result<()> {
+        let dict = &stream.dict;
+        ["Group", "Ref", "OC"]
+            .iter()
+            .try_for_each(|key| match dict.get(key.as_bytes()) {
+                Some(v) => Err(Error::new(format!("unsupported {key} {}", v.describe()))),
+                None => Ok(()),
+            })?;
+        if let Some(t) = self.doc.get(dict, "FormType")?
+            && t != Object::Int(1)
+        {
+            return Err(Error::new(format!("unsupported FormType {}", t.describe())));
+        }
+        let bbox = self
+            .doc
+            .get(dict, "BBox")?
+            .ok_or_else(|| Error::new("a form without a BBox"))?;
+        let rect = self.doc.rectangle(&bbox)?;
+        let matrix = match self.doc.get(dict, "Matrix")? {
+            None => Matrix::IDENTITY,
+            Some(Object::Array(a)) if a.len() == 6 => {
+                let v = a
+                    .iter()
+                    .map(|o| self.doc.number(o))
+                    .collect::<Result<Vec<_>>>()?;
+                Matrix::new([v[0], v[1], v[2], v[3], v[4], v[5]])
+            }
+            Some(other) => {
+                return Err(Error::new(format!("malformed Matrix {}", other.describe())));
+            }
+        };
+        let resources = self
+            .doc
+            .get_dict(dict, "Resources")?
+            .ok_or_else(|| Error::new("a form without Resources"))?;
+        if self.form_depth >= MAX_FORM_DEPTH {
+            return Err(Error::new(format!(
+                "forms nested deeper than {MAX_FORM_DEPTH}"
+            )));
+        }
+        self.forms += 1;
+        if self.forms > MAX_FORMS_IN_PAGE {
+            return Err(Error::new(format!(
+                "more than {MAX_FORMS_IN_PAGE} forms in a page"
+            )));
+        }
+        let content = self.doc.stream_data(stream)?;
+        self.form_bytes += content.len();
+        if self.form_bytes > MAX_FORM_BYTES_IN_PAGE {
+            return Err(Error::new(format!(
+                "form contents larger than {MAX_FORM_BYTES_IN_PAGE} bytes in a page"
+            )));
+        }
+        let ops = content::parse(&content)?;
+        content::check_resources(self.doc, &resources, &ops)?;
+        // q
+        self.save()?;
+        let depth = self.stack.len();
+        let result = (|| {
+            self.state.ctm = matrix.concat(&self.state.ctm)?;
+            self.quad_of(rect)?;
+            let quad = std::mem::take(&mut self.quad);
+            let clipped = self.clip_to(&quad, FillRule::NonZero);
+            self.quad = quad;
+            clipped?;
+            let saved = std::mem::replace(&mut self.resources, Cow::Owned(resources));
+            let fonts = std::mem::take(&mut self.fonts);
+            self.form_depth += 1;
+            let drawn = ops.iter().try_for_each(|op| {
+                if matches!(op.operator, Operator::BeginText) {
+                    return Err(Error::new("text in a form").at_offset(op.offset));
+                }
+                self.op(&op.operator).map_err(|e| e.at_offset(op.offset))
+            });
+            self.form_depth -= 1;
+            self.fonts = fonts;
+            self.resources = saved;
+            drawn
+        })();
+        // Q, whatever the content left on the stack
+        self.stack.truncate(depth);
+        self.state = self.stack.pop().expect("the state saved before the form");
+        self.clips.truncate(self.state.clip.map_or(0, |i| i + 1));
+        result
+    }
+
+    /// `q`, within the limit on its nesting (docs/adr/0030).
+    fn save(&mut self) -> Result<()> {
+        if self.stack.len() >= MAX_Q_DEPTH {
+            return Err(Error::new(format!("q nested deeper than {MAX_Q_DEPTH}")));
+        }
+        self.stack.push(self.state.clone());
+        self.state.own_clip = false;
+        Ok(())
+    }
+
+    /// The color space of a name of the resources (`cs`, `CS`).
+    fn color_space(&self, name: &[u8]) -> Result<ColorSpace> {
+        let spaces = self
+            .doc
+            .get_dict(&self.resources, "ColorSpace")?
+            .unwrap_or_default();
+        let space = spaces
+            .get(name)
+            .ok_or_else(|| Error::new("no such color space in the resources"))?;
+        ColorSpace::load(self.doc, space)
+    }
+
+    /// The point of user space as the user path holds it (docs/adr/0027).
+    fn user_point(x: Fixed, y: Fixed) -> (i64, i64) {
+        (x.raw(), y.raw())
     }
 
     fn op(&mut self, op: &Operator) -> Result<()> {
         match op {
-            Operator::Save => self.stack.push(self.state.clone()),
+            Operator::Save => self.save()?,
             Operator::Restore => {
                 self.state = self.stack.pop().ok_or_else(|| Error::new("Q without q"))?;
+                // The masks above the restored state's are free (docs/adr/0027).
+                self.clips.truncate(self.state.clip.map_or(0, |i| i + 1));
             }
             Operator::Concat(m) => self.state.ctm = m.concat(&self.state.ctm)?,
             Operator::LineWidth(w) => self.state.line_width = *w,
             Operator::MoveTo(x, y) => {
                 let p = self.point(*x, *y)?;
                 self.path.move_to(p);
+                if self.builds_user_path()? {
+                    self.user_path.move_to(Self::user_point(*x, *y));
+                }
             }
             Operator::LineTo(x, y) => {
                 let p = self.point(*x, *y)?;
                 self.path.line_to(p);
+                if self.builds_user_path()? {
+                    self.user_path.line_to(Self::user_point(*x, *y));
+                }
             }
             Operator::CurveTo([x1, y1, x2, y2, x3, y3]) => {
                 let (c1, c2, p) = (
@@ -567,8 +991,20 @@ impl Renderer<'_> {
                 );
                 let frame = self.curve_frame();
                 self.path.curve_to_within(c1, c2, p, &frame);
+                if self.builds_user_path()? {
+                    let flatness = user_flatness(scale_bound(&self.state.ctm));
+                    self.user_path.curve_to_flat(
+                        Self::user_point(*x1, *y1),
+                        Self::user_point(*x2, *y2),
+                        Self::user_point(*x3, *y3),
+                        flatness,
+                    );
+                }
             }
-            Operator::ClosePath => self.path.close(),
+            Operator::ClosePath => {
+                self.path.close();
+                self.user_path.close();
+            }
             Operator::Rect([x, y, w, h]) => {
                 // x y m, x+w y l, x+w y+h l, x y+h l, h (ISO 32000-1 8.5.2.1)
                 let (x1, y1) = (x.checked_add(*w)?, y.checked_add(*h)?);
@@ -581,47 +1017,62 @@ impl Renderer<'_> {
                 self.path.move_to(corners[0]);
                 corners[1..].iter().for_each(|&c| self.path.line_to(c));
                 self.path.close();
+                if self.builds_user_path()? {
+                    let corners = [(*x, *y), (x1, *y), (x1, y1), (*x, y1)]
+                        .map(|(x, y)| Self::user_point(x, y));
+                    self.user_path.move_to(corners[0]);
+                    corners[1..].iter().for_each(|&c| self.user_path.line_to(c));
+                    self.user_path.close();
+                }
             }
-            Operator::Fill => {
-                let mut path = std::mem::take(&mut self.path);
-                let rgb = self.state.fill;
-                self.fill(&path, rgb);
-                path.clear();
-                self.path = path;
+            Operator::Fill => self.end_path(Some(FillRule::NonZero), false)?,
+            Operator::FillEvenOdd => self.end_path(Some(FillRule::EvenOdd), false)?,
+            Operator::Stroke => self.end_path(None, true)?,
+            Operator::FillStroke => self.end_path(Some(FillRule::NonZero), true)?,
+            Operator::FillStrokeEvenOdd => self.end_path(Some(FillRule::EvenOdd), true)?,
+            Operator::EndPath => self.end_path(None, false)?,
+            Operator::Clip => self.pending_clip = Some(FillRule::NonZero),
+            Operator::ClipEvenOdd => self.pending_clip = Some(FillRule::EvenOdd),
+            Operator::LineCap(cap) => {
+                self.state.cap = match cap {
+                    1 => Cap::Round,
+                    2 => Cap::Square,
+                    _ => Cap::Butt,
+                }
             }
-            Operator::Stroke => {
-                let mut path = std::mem::take(&mut self.path);
-                let result = self.stroke_path(&path);
-                path.clear();
-                self.path = path;
-                result?;
-            }
-            Operator::LineCap(cap) => self.state.round_cap = *cap == 1,
+            Operator::LineJoin(join) => self.state.line_join = *join,
+            Operator::MiterLimit(limit) => self.state.miter_limit = *limit,
             Operator::Dash(array, phase) => {
                 self.state.dash = array.clone();
                 self.state.dash_phase = *phase;
             }
             Operator::FillCmyk(v) => {
-                self.state.fill_space = FillSpace::Device(Device::Cmyk);
+                self.state.fill_space = ColorSpace::Device(Device::Cmyk);
                 self.state.fill = color::cmyk(*v);
             }
-            Operator::StrokeCmyk(v) => self.state.stroke = color::cmyk(*v),
+            Operator::StrokeCmyk(v) => {
+                self.state.stroke_space = ColorSpace::Device(Device::Cmyk);
+                self.state.stroke = color::cmyk(*v);
+            }
             Operator::FillSpace(name) => {
-                let spaces = self
-                    .doc
-                    .get_dict(self.resources, "ColorSpace")?
-                    .unwrap_or_default();
-                let space = spaces
-                    .get(name.as_ref())
-                    .ok_or_else(|| Error::new("no such color space in the resources"))?;
-                let separation = Separation::load(self.doc, space)?;
-                // The initial color of a Separation is the tint 1 (8.6.6.4).
-                self.state.fill = separation.rgb(Fixed::ONE)?;
-                self.state.fill_space = FillSpace::Separation(separation);
+                let space = self.color_space(name)?;
+                self.state.fill = space.initial()?;
+                self.state.fill_space = space;
+            }
+            Operator::StrokeSpace(name) => {
+                let space = self.color_space(name)?;
+                self.state.stroke = space.initial()?;
+                self.state.stroke_space = space;
+            }
+            Operator::FillComponents(c) => {
+                self.state.fill = self.state.fill_space.components("sc", c.as_slice())?;
+            }
+            Operator::StrokeComponents(c) => {
+                self.state.stroke = self.state.stroke_space.components("SC", c.as_slice())?;
             }
             Operator::FillColor(tint) => match &self.state.fill_space {
-                FillSpace::Separation(s) => self.state.fill = s.rgb(*tint)?,
-                FillSpace::Device(_) => {
+                ColorSpace::Separation(s) => self.state.fill = s.rgb(*tint)?,
+                ColorSpace::Device(_) => {
                     return Err(Error::new(
                         "unsupported scn with a color space other than Separation",
                     ));
@@ -638,7 +1089,7 @@ impl Renderer<'_> {
             Operator::RenderMode(m) => self.state.render_mode = *m,
             Operator::TextMatrix(m) => self.text_matrix = *m,
             Operator::ShowText(s) => self.show_text(s)?,
-            Operator::Do(name) => self.placeholder(name)?,
+            Operator::Do(name) => self.xobject(name)?,
         }
         Ok(())
     }
@@ -658,7 +1109,8 @@ pub fn render_page_with(
     cache: &FontCache,
 ) -> Result<Canvas> {
     let mut ws = Workspace::default();
-    interpret(doc, page, dpi, true, cache, &mut ws)?;
+    let pictures = PictureCache::new();
+    interpret(doc, page, dpi, true, (cache, &pictures), &mut ws)?;
     Ok(ws.canvas)
 }
 
@@ -672,12 +1124,21 @@ pub fn check_page(doc: &Document, page: &Page, dpi: u32) -> Result<()> {
 /// Checks a page with the fonts of a cache shared by the pages of the
 /// document (docs/adr/0011).
 pub fn check_page_with(doc: &Document, page: &Page, dpi: u32, cache: &FontCache) -> Result<()> {
-    interpret(doc, page, dpi, false, cache, &mut Workspace::default())
+    let pictures = PictureCache::new();
+    interpret(
+        doc,
+        page,
+        dpi,
+        false,
+        (cache, &pictures),
+        &mut Workspace::default(),
+    )
 }
 
 /// The buffers that a thread keeps between the pages it checks and renders
-/// (docs/adr/0014): the operators, the stack of graphics states, the paths,
-/// the cells and pixels of filling, and the image.
+/// (docs/adr/0014): the operators, the stack of graphics states, the paths
+/// of device space and of user space, the cells and pixels of filling, the
+/// masks of the clips (docs/adr/0027), and the image.
 #[derive(Default)]
 pub struct Workspace {
     ops: Vec<Op<'static>>,
@@ -690,6 +1151,12 @@ pub struct Workspace {
     segments: Vec<Segment>,
     strokes: StrokeScratch,
     dash: Vec<i64>,
+    user_path: PathOf<i64>,
+    user_outline: PathOf<i64>,
+    user_strokes: StrokeScratchOf<i64>,
+    /// The masks of the clips of the last page (docs/adr/0027).
+    pub(crate) clips: ClipStack,
+    quad: Path,
 }
 
 /// An empty `Vec` of operators of another content, in the allocation of
@@ -704,22 +1171,26 @@ fn interpret(
     page: &Page,
     dpi: u32,
     paint: bool,
-    cache: &FontCache,
+    caches: Caches,
     ws: &mut Workspace,
 ) -> Result<()> {
     let at_page = |e: Error| e.at_page(page.index + 1);
     let mut ops: Vec<Op> = recycle(std::mem::take(&mut ws.ops));
-    let result = interpret_ops((doc, dpi, cache), page, paint, ws, &mut ops, true).map_err(at_page);
+    let result =
+        interpret_ops((doc, dpi, caches), page, paint, ws, &mut ops, true).map_err(at_page);
     ws.ops = recycle(ops);
     result
 }
 
+/// The caches of the fonts and of the decoded images (docs/adr/0027).
+type Caches<'d> = (&'d FontCache, &'d PictureCache);
+
 /// What every page of a rendering shares: the document, the resolution and
-/// the cache of the fonts.
-type Context<'d> = (&'d Document, u32, &'d FontCache);
+/// the caches.
+type Context<'d> = (&'d Document, u32, Caches<'d>);
 
 fn interpret_ops<'c>(
-    (doc, dpi, cache): Context,
+    (doc, dpi, (cache, pictures)): Context,
     page: &'c Page,
     paint: bool,
     ws: &mut Workspace,
@@ -739,7 +1210,8 @@ fn interpret_ops<'c>(
     let mut renderer = Renderer {
         doc,
         cache,
-        resources: &page.resources,
+        pictures,
+        resources: Cow::Borrowed(&page.resources),
         canvas,
         width,
         height,
@@ -751,15 +1223,29 @@ fn interpret_ops<'c>(
         segments: std::mem::take(&mut ws.segments),
         strokes: std::mem::take(&mut ws.strokes),
         dash: std::mem::take(&mut ws.dash),
+        user_path: std::mem::take(&mut ws.user_path),
+        user_outline: std::mem::take(&mut ws.user_outline),
+        user_strokes: std::mem::take(&mut ws.user_strokes),
+        clips: std::mem::take(&mut ws.clips),
+        pending_clip: None,
+        forms: 0,
+        form_bytes: 0,
+        quad: std::mem::take(&mut ws.quad),
         state: GraphicsState {
             ctm: device_matrix(&page.media_box, dpi)?,
             line_width: Fixed::ONE,
-            round_cap: false,
+            cap: Cap::Butt,
+            line_join: 0,
+            miter_limit: Fixed::from_int(10)?,
             dash: Arc::from([]),
             dash_phase: Fixed::ZERO,
             fill: [0, 0, 0],
-            fill_space: FillSpace::Device(Device::Gray),
+            fill_space: ColorSpace::Device(Device::Gray),
             stroke: [0, 0, 0],
+            stroke_space: ColorSpace::Device(Device::Gray),
+            clip: None,
+            clips: 0,
+            own_clip: false,
             font: None,
             font_size: Fixed::ZERO,
             h_scale: Fixed::ONE,
@@ -769,12 +1255,12 @@ fn interpret_ops<'c>(
         path: std::mem::take(&mut ws.path),
         text_matrix: Matrix::IDENTITY,
         fonts: BTreeMap::new(),
-        point_half_width: Fixed::from_int(i64::from(dpi))
-            .and_then(|d| d.checked_div(Fixed::from_int(72)?))?
-            .to_units(7),
+        form_depth: 0,
     };
     renderer.stack.clear();
     renderer.path.clear();
+    renderer.user_path.clear();
+    renderer.clips.clear();
     let result = ops.iter().try_for_each(|op| {
         renderer
             .op(&op.operator)
@@ -789,6 +1275,11 @@ fn interpret_ops<'c>(
     ws.segments = renderer.segments;
     ws.strokes = renderer.strokes;
     ws.dash = renderer.dash;
+    ws.user_path = renderer.user_path;
+    ws.user_outline = renderer.user_outline;
+    ws.user_strokes = renderer.user_strokes;
+    ws.clips = renderer.clips;
+    ws.quad = renderer.quad;
     result
 }
 
@@ -801,6 +1292,9 @@ pub struct Session<'a> {
     pages: Pages<'a>,
     dpi: u32,
     fonts: FontCache,
+    /// The decoded images, shared by the pages, the check and the
+    /// rendering (docs/adr/0027).
+    pictures: PictureCache,
     /// The operators of each page that the check parsed, until the page is
     /// rendered; only for pages borrowed by [`Session::from_pages`], whose
     /// contents outlive the session (docs/adr/0015).
@@ -844,6 +1338,7 @@ impl<'a> Session<'a> {
             pages: Pages::Owned(doc.pages_with(jobs)?),
             dpi,
             fonts: FontCache::new(),
+            pictures: PictureCache::new(),
             parsed: Vec::new(),
         })
     }
@@ -858,6 +1353,7 @@ impl<'a> Session<'a> {
             pages: Pages::Borrowed(pages),
             dpi,
             fonts: FontCache::new(),
+            pictures: PictureCache::new(),
             parsed: pages.iter().map(|_| Mutex::new(None)).collect(),
         }
     }
@@ -869,6 +1365,7 @@ impl<'a> Session<'a> {
             pages: Pages::Owned(vec![page.clone()]),
             dpi,
             fonts: FontCache::new(),
+            pictures: PictureCache::new(),
             parsed: Vec::new(),
         }
     }
@@ -905,12 +1402,19 @@ impl<'a> Session<'a> {
     /// Checks one page in the buffers of `ws`.
     pub fn check_with(&self, ws: &mut Workspace, page: usize) -> Result<()> {
         let Pages::Borrowed(pages) = self.pages else {
-            return interpret(self.doc, self.page(page)?, self.dpi, false, &self.fonts, ws);
+            return interpret(
+                self.doc,
+                self.page(page)?,
+                self.dpi,
+                false,
+                (&self.fonts, &self.pictures),
+                ws,
+            );
         };
         let p: &'a Page = pages.get(page).ok_or_else(|| self.no_page(page))?;
         let mut ops = Vec::new();
         interpret_ops(
-            (self.doc, self.dpi, &self.fonts),
+            (self.doc, self.dpi, (&self.fonts, &self.pictures)),
             p,
             false,
             ws,
@@ -936,7 +1440,7 @@ impl<'a> Session<'a> {
                 .take();
             if let Some(mut ops) = taken {
                 interpret_ops(
-                    (self.doc, self.dpi, &self.fonts),
+                    (self.doc, self.dpi, (&self.fonts, &self.pictures)),
                     p,
                     true,
                     ws,
@@ -947,7 +1451,14 @@ impl<'a> Session<'a> {
                 return Ok(&ws.canvas);
             }
         }
-        interpret(self.doc, self.page(page)?, self.dpi, true, &self.fonts, ws)?;
+        interpret(
+            self.doc,
+            self.page(page)?,
+            self.dpi,
+            true,
+            (&self.fonts, &self.pictures),
+            ws,
+        )?;
         Ok(&ws.canvas)
     }
 
@@ -993,10 +1504,24 @@ impl<'a> Session<'a> {
 pub(crate) mod tests;
 
 #[cfg(test)]
-mod box_tests;
+pub(crate) mod image_tests;
+
+#[cfg(test)]
+mod form_tests;
+#[cfg(test)]
+mod limit_tests;
 
 #[cfg(test)]
 mod stroke_tests;
 
 #[cfg(test)]
 mod session_tests;
+
+#[cfg(test)]
+mod join_tests;
+
+#[cfg(test)]
+mod affine_tests;
+
+#[cfg(test)]
+mod clip_tests;
