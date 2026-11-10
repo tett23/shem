@@ -24,6 +24,13 @@ const MAX_PIXELS: u128 = 1 << 28;
 /// The most levels of forms within forms, the page being level 0
 /// (docs/adr/0027).
 const MAX_FORM_DEPTH: usize = 8;
+// The limits on the forms placed in a page, the bytes of their contents,
+// the nesting of q (the q of a form included) and the clips that are
+// alive at once (docs/adr/0030).
+const MAX_FORMS_IN_PAGE: usize = 4096;
+const MAX_FORM_BYTES_IN_PAGE: usize = 1 << 26;
+const MAX_Q_DEPTH: usize = 64;
+const MAX_CLIPS: usize = 16;
 
 /// The size of the image of a page: the size of the MediaBox times dpi / 72,
 /// rounded up, computed exactly from the Q32.32 values.
@@ -231,6 +238,9 @@ struct GraphicsState {
     // The index of the clip's mask in the workspace's stack, or none
     // (docs/adr/0027).
     clip: Option<usize>,
+    // How many clips are alive in this state, counted also when the masks
+    // are not made (docs/adr/0030).
+    clips: usize,
     // The text state (ISO 32000-1 9.3): the font and its size, the
     // horizontal scaling (Tz / 100) and the rendering mode.
     font: Option<Arc<Font>>,
@@ -261,6 +271,10 @@ struct Renderer<'a> {
     fonts: BTreeMap<Vec<u8>, Arc<Font>>,
     // How many forms the content being drawn is within (docs/adr/0027).
     form_depth: usize,
+    // The forms placed in the page so far and the bytes of their contents
+    // (docs/adr/0030).
+    forms: usize,
+    form_bytes: usize,
     // Whether pixels are drawn; without it, the page is only interpreted.
     paint: bool,
     // The buffers that the glyphs, the strokes and the fills of the page
@@ -321,9 +335,15 @@ impl Renderer<'_> {
     /// Narrows the clip to the path under the rule (docs/adr/0027): the
     /// new mask goes right after the mask of the state below, whose masks
     /// the state keeps; the masks above it are free.
-    fn clip_to(&mut self, path: &Path, rule: FillRule) {
+    fn clip_to(&mut self, path: &Path, rule: FillRule) -> Result<()> {
+        // Counted before the masks, so that the check finds it
+        // (docs/adr/0030).
+        self.state.clips += 1;
+        if self.state.clips > MAX_CLIPS {
+            return Err(Error::new(format!("clips nested deeper than {MAX_CLIPS}")));
+        }
         if !self.paint {
-            return;
+            return Ok(());
         }
         let keep = self.stack.last().and_then(|s| s.clip).map_or(0, |i| i + 1);
         let index = self.clips.intersect(
@@ -336,6 +356,7 @@ impl Renderer<'_> {
             &mut self.scratch,
         );
         self.state.clip = Some(index);
+        Ok(())
     }
 
     /// Fills the stroke of a path, `half` units on each side.
@@ -554,13 +575,15 @@ impl Renderer<'_> {
         } else {
             Ok(())
         };
-        if let Some(rule) = self.pending_clip.take()
-            && stroked.is_ok()
-        {
-            let path = std::mem::take(&mut self.path);
-            self.clip_to(&path, rule);
-            self.path = path;
-        }
+        let stroked = match self.pending_clip.take() {
+            Some(rule) if stroked.is_ok() => {
+                let path = std::mem::take(&mut self.path);
+                let clipped = self.clip_to(&path, rule);
+                self.path = path;
+                clipped
+            }
+            _ => stroked,
+        };
         self.path.clear();
         self.user_path.clear();
         stroked
@@ -858,18 +881,31 @@ impl Renderer<'_> {
                 "forms nested deeper than {MAX_FORM_DEPTH}"
             )));
         }
+        self.forms += 1;
+        if self.forms > MAX_FORMS_IN_PAGE {
+            return Err(Error::new(format!(
+                "more than {MAX_FORMS_IN_PAGE} forms in a page"
+            )));
+        }
         let content = self.doc.stream_data(stream)?;
+        self.form_bytes += content.len();
+        if self.form_bytes > MAX_FORM_BYTES_IN_PAGE {
+            return Err(Error::new(format!(
+                "form contents larger than {MAX_FORM_BYTES_IN_PAGE} bytes in a page"
+            )));
+        }
         let ops = content::parse(&content)?;
         content::check_resources(self.doc, &resources, &ops)?;
         // q
-        self.stack.push(self.state.clone());
+        self.save()?;
         let depth = self.stack.len();
         let result = (|| {
             self.state.ctm = matrix.concat(&self.state.ctm)?;
             self.quad_of(rect)?;
             let quad = std::mem::take(&mut self.quad);
-            self.clip_to(&quad, FillRule::NonZero);
+            let clipped = self.clip_to(&quad, FillRule::NonZero);
             self.quad = quad;
+            clipped?;
             let saved = std::mem::replace(&mut self.resources, Cow::Owned(resources));
             let fonts = std::mem::take(&mut self.fonts);
             self.form_depth += 1;
@@ -891,6 +927,15 @@ impl Renderer<'_> {
         result
     }
 
+    /// `q`, within the limit on its nesting (docs/adr/0030).
+    fn save(&mut self) -> Result<()> {
+        if self.stack.len() >= MAX_Q_DEPTH {
+            return Err(Error::new(format!("q nested deeper than {MAX_Q_DEPTH}")));
+        }
+        self.stack.push(self.state.clone());
+        Ok(())
+    }
+
     /// The color space of a name of the resources (`cs`, `CS`).
     fn color_space(&self, name: &[u8]) -> Result<ColorSpace> {
         let spaces = self
@@ -910,7 +955,7 @@ impl Renderer<'_> {
 
     fn op(&mut self, op: &Operator) -> Result<()> {
         match op {
-            Operator::Save => self.stack.push(self.state.clone()),
+            Operator::Save => self.save()?,
             Operator::Restore => {
                 self.state = self.stack.pop().ok_or_else(|| Error::new("Q without q"))?;
                 // The masks above the restored state's are free (docs/adr/0027).
@@ -1177,6 +1222,8 @@ fn interpret_ops<'c>(
         user_strokes: std::mem::take(&mut ws.user_strokes),
         clips: std::mem::take(&mut ws.clips),
         pending_clip: None,
+        forms: 0,
+        form_bytes: 0,
         quad: std::mem::take(&mut ws.quad),
         state: GraphicsState {
             ctm: device_matrix(&page.media_box, dpi)?,
@@ -1191,6 +1238,7 @@ fn interpret_ops<'c>(
             stroke: [0, 0, 0],
             stroke_space: ColorSpace::Device(Device::Gray),
             clip: None,
+            clips: 0,
             font: None,
             font_size: Fixed::ZERO,
             h_scale: Fixed::ONE,
@@ -1453,6 +1501,8 @@ pub(crate) mod image_tests;
 
 #[cfg(test)]
 mod form_tests;
+#[cfg(test)]
+mod limit_tests;
 
 #[cfg(test)]
 mod stroke_tests;

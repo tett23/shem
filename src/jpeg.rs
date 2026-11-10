@@ -21,6 +21,9 @@ use crate::fixed::div_round_i64;
 /// (docs/adr/0027).
 pub const MAX_SAMPLES: u64 = 1 << 26;
 
+/// The scans of a JPEG (docs/adr/0030).
+pub const MAX_SCANS: usize = 256;
+
 /// A decoded image: `samples` holds `width × height × components` bytes,
 /// row by row, the components of a pixel together, after the colour
 /// transform.
@@ -1077,6 +1080,9 @@ fn parse(data: &[u8]) -> Result<Parsed> {
                 let scan = parse_sos(body, frame, &tables)?;
                 pos = decode_scan(data, pos, frame, &tables, &scan, restart_interval)?;
                 scans += 1;
+                if scans > MAX_SCANS {
+                    return Err(Error::new(format!("JPEG with more than {MAX_SCANS} scans")));
+                }
             }
             0xEE if body.len() >= 12 && &body[..5] == b"Adobe" => {
                 if body[11] > 2 {

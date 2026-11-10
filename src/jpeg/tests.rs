@@ -560,3 +560,31 @@ fn a_progressive_file_that_stops_after_some_scans_decodes_what_it_has() {
     assert_eq!((image.width, image.height, image.components), (19, 13, 3));
     assert_ne!(image.samples, decode(&data).unwrap().samples);
 }
+
+/// The JPEG with its last scan (from its SOS marker to the EOI) repeated
+/// to make `scans` scans in all.
+fn with_scans(data: &[u8], scans: usize) -> Vec<u8> {
+    let sos = (0..data.len() - 1)
+        .rev()
+        .find(|&i| data[i] == 0xFF && data[i + 1] == 0xDA)
+        .unwrap();
+    let eoi = data.len() - 2;
+    assert_eq!(&data[eoi..], [0xFF, 0xD9]);
+    let before = (0..sos)
+        .filter(|&i| data[i] == 0xFF && data[i + 1] == 0xDA)
+        .count();
+    let mut out = data[..sos].to_vec();
+    (0..scans - before).for_each(|_| out.extend(&data[sos..eoi]));
+    out.extend([0xFF, 0xD9]);
+    out
+}
+
+#[test]
+fn a_jpeg_has_at_most_256_scans() {
+    // docs/adr/0030: three scans, one for each component; the last one
+    // repeated.
+    let data = fixture("sequential-noninterleaved.jpg");
+    assert!(decode(&with_scans(&data, 256)).is_ok());
+    let e = decode(&with_scans(&data, 257)).unwrap_err().to_string();
+    assert!(e.contains("JPEG with more than 256 scans"), "{e}");
+}
