@@ -1,15 +1,16 @@
 //! Interpreting a page's content into an image (docs/adr/0003).
 
-use crate::color::{self, Device, FillSpace, Separation};
+use crate::clip::ClipStack;
+use crate::color::{self, ColorSpace, Device};
 use crate::content::{self, Op, Operator, Text};
 use crate::error::{Error, Result};
-use crate::fixed::{Fixed, Matrix, round_shift};
+use crate::fixed::{Fixed, Matrix, div_round_i64, isqrt, round_shift};
 use crate::font::{Font, FontCache, Segment};
 use crate::pdf::Object;
 use crate::pdf::{Dict, Document, Page};
 use crate::raster::{
-    Canvas, DASH_UNIT, FillRule, Frame, Path, Point, Scratch, Stroke, StrokeScratch, signed_area,
-    stroke_into, stroke_styled_into,
+    Canvas, Cap, DASH_UNIT, FillRule, Frame, Join, Path, PathOf, Point, Scratch, Stroke,
+    StrokeScratch, StrokeScratchOf, signed_area, stroke_into, stroke_styled_into,
 };
 
 /// The fill and the lines of the box of an image or a form (docs/adr/0006).
@@ -132,19 +133,56 @@ fn stroke_margin(half: i64) -> i64 {
     16 * half + 16
 }
 
+/// Whether a CTM keeps angles: a rotation or a reflection with one scale
+/// (docs/adr/0003). The strokes under one are scaled in device space;
+/// the others are built in user space (docs/adr/0027).
+fn keeps_angles(ctm: &Matrix) -> Result<bool> {
+    Ok((ctm.a == ctm.d && ctm.b.checked_neg()? == ctm.c)
+        || (ctm.a.checked_neg()? == ctm.d && ctm.b == ctm.c))
+}
+
 /// The scale of a stroke: `sqrt(|det CTM|)`, by which the widths and the
 /// dashes of user space go to device space. The CTM keeps angles; another
 /// is an error (docs/adr/0003).
 fn stroke_scale(ctm: &Matrix) -> Result<Fixed> {
-    let keeps_angles = (ctm.a == ctm.d && ctm.b.checked_neg()? == ctm.c)
-        || (ctm.a.checked_neg()? == ctm.d && ctm.b == ctm.c);
-    if !keeps_angles {
+    if !keeps_angles(ctm)? {
         return Err(Error::new(
             "unsupported stroke with a CTM that does not keep angles",
         ));
     }
     ctm.det()?.abs()?.sqrt()
 }
+
+/// An upper bound of the scale of a CTM, `sqrt(a² + b² + c² + d²)`, as a
+/// Q32.32 raw value: the integer square root of the sum, which is at most
+/// it, plus 1 (docs/adr/0027). By it, a length of user space is at most
+/// that many pixels per unit, whatever its direction.
+fn scale_bound(ctm: &Matrix) -> u128 {
+    let sq = |v: Fixed| u128::from(v.raw().unsigned_abs()).pow(2);
+    let sum = [ctm.a, ctm.b, ctm.c, ctm.d]
+        .iter()
+        .fold(0u128, |sum, &v| sum.saturating_add(sq(v)));
+    isqrt(sum) + 1
+}
+
+/// The flatness of the curves of user space under a CTM: the largest
+/// second difference, in units of 2^−32, that the bound of the scale maps
+/// to 1/16 pixel or less: `2^60 / bound` (docs/adr/0027).
+fn user_flatness(bound: u128) -> i64 {
+    ((1u128 << 60) / bound).min(i64::MAX as u128) as i64
+}
+
+/// The least period of a dash array in user space under a CTM: the one
+/// that the bound of the scale maps to 1/16 pixel, so `period · bound ≥
+/// 2^60` (docs/adr/0027).
+fn user_period_is_long_enough(period: i128, bound: u128) -> bool {
+    period >= 0 && (period as u128).saturating_mul(bound) >= 1 << 60
+}
+
+/// The largest absolute value of the coordinates of the points of a path
+/// of user space that the stroke's arithmetic takes: below 2^62, so that
+/// the differences of two coordinates fit in i64 (docs/adr/0027).
+const USER_REACH: i64 = (1 << 62) - 1;
 
 /// Half the width of a stroke in device space, in units of 1/256 pixel. The
 /// CTM keeps angles; a line width of 0 is one pixel (ISO 32000-1 8.4.3.2).
@@ -176,15 +214,21 @@ const MIN_DASH_PERIOD: i128 = 16 * DASH_UNIT as i128;
 struct GraphicsState {
     ctm: Matrix,
     line_width: Fixed,
-    // Round caps (1 J) and the dash array with its phase (d), in user
-    // space (docs/adr/0025). The array is shared, so that saving the state
-    // allocates nothing.
-    round_cap: bool,
+    // The caps (J), the joins (j) with the miter limit (M), and the dash
+    // array with its phase (d), in user space (docs/adr/0025, 0027). The
+    // array is shared, so that saving the state allocates nothing.
+    cap: Cap,
+    line_join: i64,
+    miter_limit: Fixed,
     dash: Arc<[Fixed]>,
     dash_phase: Fixed,
     fill: [u8; 3],
-    fill_space: FillSpace,
+    fill_space: ColorSpace,
     stroke: [u8; 3],
+    stroke_space: ColorSpace,
+    // The index of the clip's mask in the workspace's stack, or none
+    // (docs/adr/0027).
+    clip: Option<usize>,
     // The text state (ISO 32000-1 9.3): the font and its size, the
     // horizontal scaling (Tz / 100) and the rendering mode.
     font: Option<Arc<Font>>,
@@ -224,6 +268,16 @@ struct Renderer<'a> {
     // dash array in device space (docs/adr/0025).
     strokes: StrokeScratch,
     dash: Vec<i64>,
+    // The page's path in user space, built beside the device path under
+    // a CTM that does not keep angles, the outline of its stroke, and the
+    // disc and the dash of those strokes (docs/adr/0027).
+    user_path: PathOf<i64>,
+    user_outline: PathOf<i64>,
+    user_strokes: StrokeScratchOf<i64>,
+    // The masks of the clips, and the rule of a W or W* waiting for the
+    // operator that ends the path (docs/adr/0027).
+    clips: ClipStack,
+    pending_clip: Option<FillRule>,
 }
 
 impl Renderer<'_> {
@@ -232,11 +286,49 @@ impl Renderer<'_> {
     }
 
     fn fill(&mut self, path: &Path, rgb: [u8; 3]) {
+        self.fill_with(path, FillRule::NonZero, rgb);
+    }
+
+    /// Fills a path under a rule with a color, within the clip if there is
+    /// one (docs/adr/0027).
+    fn fill_with(&mut self, path: &Path, rule: FillRule, rgb: [u8; 3]) {
         if !self.paint {
             return;
         }
-        self.canvas
-            .fill(path, FillRule::NonZero, rgb, &mut self.scratch);
+        match self.state.clip {
+            None => self.canvas.fill(path, rule, rgb, &mut self.scratch),
+            Some(i) => {
+                self.canvas
+                    .fill_within(path, rule, rgb, &mut self.scratch, self.clips.get(i))
+            }
+        }
+    }
+
+    /// Whether the user path is built beside the device path: the CTM
+    /// does not keep angles, so a stroke would be built in user space
+    /// (docs/adr/0027).
+    fn builds_user_path(&self) -> Result<bool> {
+        Ok(!keeps_angles(&self.state.ctm)?)
+    }
+
+    /// Narrows the clip to the path under the rule (docs/adr/0027): the
+    /// new mask goes right after the mask of the state below, whose masks
+    /// the state keeps; the masks above it are free.
+    fn clip_to(&mut self, path: &Path, rule: FillRule) {
+        if !self.paint {
+            return;
+        }
+        let keep = self.stack.last().and_then(|s| s.clip).map_or(0, |i| i + 1);
+        let index = self.clips.intersect(
+            keep,
+            self.state.clip,
+            path,
+            rule,
+            self.width,
+            self.height,
+            &mut self.scratch,
+        );
+        self.state.clip = Some(index);
     }
 
     /// Fills the stroke of a path, `half` units on each side.
@@ -302,9 +394,11 @@ impl Renderer<'_> {
             if self.paint {
                 let style = Stroke {
                     half,
-                    round_cap: self.state.round_cap,
+                    cap: self.state.cap,
+                    join: self.join(),
                     dash: &dash,
                     phase,
+                    flatness: crate::raster::FLATNESS,
                 };
                 let frame = Frame::around(self.width, self.height, margin);
                 let mut outline = std::mem::take(&mut self.outline);
@@ -318,6 +412,151 @@ impl Renderer<'_> {
         });
         self.dash = dash;
         result
+    }
+
+    /// The join of the strokes of the state: `j` with the limit `M`
+    /// (docs/adr/0027).
+    fn join(&self) -> Join {
+        match self.state.line_join {
+            1 => Join::Round,
+            2 => Join::Bevel,
+            _ => Join::Miter(self.state.miter_limit.raw()),
+        }
+    }
+
+    /// Strokes the page's path under a CTM that does not keep angles
+    /// (docs/adr/0027): the outline is built in user space, in units of
+    /// 2^−32, with the widths and the dashes as they are, and its points
+    /// are mapped to the device as the points of a path are. The checks
+    /// find the errors without drawing: a width of 0, a dash period too
+    /// short for the bound of the scale, and points beyond the device.
+    fn stroke_user_path(&mut self) -> Result<()> {
+        if self.state.line_width == Fixed::ZERO {
+            return Err(Error::new(
+                "zero-width stroke with a CTM that does not keep angles",
+            ));
+        }
+        let ctm = self.state.ctm;
+        let bound = scale_bound(&ctm);
+        let half = div_round_i64(self.state.line_width.raw(), 2).max(1);
+        let mut dash = std::mem::take(&mut self.dash);
+        dash.clear();
+        dash.extend(self.state.dash.iter().map(|v| v.raw()));
+        let result = (|| {
+            let doubled = if dash.len() % 2 == 1 { 2 } else { 1 };
+            let period: i128 = dash.iter().map(|&l| i128::from(l)).sum::<i128>() * doubled;
+            if !dash.is_empty() && !user_period_is_long_enough(period, bound) {
+                return Err(Error::new("dash pattern shorter than 1/16 pixel"));
+            }
+            let phase = if dash.is_empty() {
+                0
+            } else {
+                (i128::from(self.state.dash_phase.raw()) % period) as i64
+            };
+            let beyond = |v: i64| v.abs() > USER_REACH;
+            if self
+                .user_path
+                .points()
+                .iter()
+                .any(|&(x, y)| beyond(x) || beyond(y))
+            {
+                return Err(Error::new("stroke outside the range of coordinates"));
+            }
+            let style = Stroke {
+                half,
+                cap: self.state.cap,
+                join: self.join(),
+                dash: &dash,
+                phase,
+                flatness: user_flatness(bound),
+            };
+            let mut user_outline = std::mem::take(&mut self.user_outline);
+            user_outline.clear();
+            stroke_styled_into(
+                &self.user_path,
+                &style,
+                &Frame::NONE,
+                &mut self.user_strokes,
+                &mut user_outline,
+            );
+            // The points are mapped without the checks when the bounds
+            // show that they fit (docs/adr/0015).
+            let extent = user_outline
+                .points()
+                .iter()
+                .fold((0, 0), |(mx, my), &(x, y)| {
+                    (mx.max(x.unsigned_abs()), my.max(y.unsigned_abs()))
+                });
+            let fits = fits_with_extent(&ctm, extent);
+            let mut outline = std::mem::take(&mut self.outline);
+            outline.clear();
+            let mapped = user_outline.subpaths().try_for_each(|s| {
+                s.points.iter().enumerate().try_for_each(|(i, &(x, y))| {
+                    let (x, y) = (Fixed::from_raw(x), Fixed::from_raw(y));
+                    let p = if fits {
+                        to_device_fitting(&ctm, x, y)
+                    } else {
+                        to_device(&ctm, x, y)
+                            .map_err(|_| Error::new("stroke outside the range of coordinates"))?
+                    };
+                    if i == 0 {
+                        outline.move_to(p);
+                    } else {
+                        outline.line_to(p);
+                    }
+                    Ok::<_, Error>(())
+                })?;
+                outline.close();
+                Ok(())
+            });
+            if mapped.is_ok() && self.paint {
+                let rgb = self.state.stroke;
+                self.fill(&outline, rgb);
+            }
+            self.outline = outline;
+            self.user_outline = user_outline;
+            mapped
+        })();
+        self.dash = dash;
+        result
+    }
+
+    /// Strokes the page's path (`S`, `B`, `B*`) in the way of its CTM.
+    fn stroke_current_path(&mut self) -> Result<()> {
+        if self.builds_user_path()? {
+            return self.stroke_user_path();
+        }
+        let path = std::mem::take(&mut self.path);
+        let result = self.stroke_path(&path);
+        self.path = path;
+        result
+    }
+
+    /// Ends the page's path with a painting operator: fills it under the
+    /// rule, strokes it, narrows the clip to it if a `W` or `W*` came
+    /// before, and empties it (docs/adr/0027).
+    fn end_path(&mut self, fill: Option<FillRule>, stroke: bool) -> Result<()> {
+        let mut path = std::mem::take(&mut self.path);
+        if let Some(rule) = fill {
+            let rgb = self.state.fill;
+            self.fill_with(&path, rule, rgb);
+        }
+        self.path = std::mem::take(&mut path);
+        let stroked = if stroke {
+            self.stroke_current_path()
+        } else {
+            Ok(())
+        };
+        if let Some(rule) = self.pending_clip.take()
+            && stroked.is_ok()
+        {
+            let path = std::mem::take(&mut self.path);
+            self.clip_to(&path, rule);
+            self.path = path;
+        }
+        self.path.clear();
+        self.user_path.clear();
+        stroked
     }
 
     /// The font of a name of the resources, read at its first use.
@@ -543,21 +782,46 @@ impl Renderer<'_> {
         Ok(())
     }
 
+    /// The color space of a name of the resources (`cs`, `CS`).
+    fn color_space(&self, name: &[u8]) -> Result<ColorSpace> {
+        let spaces = self
+            .doc
+            .get_dict(self.resources, "ColorSpace")?
+            .unwrap_or_default();
+        let space = spaces
+            .get(name)
+            .ok_or_else(|| Error::new("no such color space in the resources"))?;
+        ColorSpace::load(self.doc, space)
+    }
+
+    /// The point of user space as the user path holds it (docs/adr/0027).
+    fn user_point(x: Fixed, y: Fixed) -> (i64, i64) {
+        (x.raw(), y.raw())
+    }
+
     fn op(&mut self, op: &Operator) -> Result<()> {
         match op {
             Operator::Save => self.stack.push(self.state.clone()),
             Operator::Restore => {
                 self.state = self.stack.pop().ok_or_else(|| Error::new("Q without q"))?;
+                // The masks above the restored state's are free (docs/adr/0027).
+                self.clips.truncate(self.state.clip.map_or(0, |i| i + 1));
             }
             Operator::Concat(m) => self.state.ctm = m.concat(&self.state.ctm)?,
             Operator::LineWidth(w) => self.state.line_width = *w,
             Operator::MoveTo(x, y) => {
                 let p = self.point(*x, *y)?;
                 self.path.move_to(p);
+                if self.builds_user_path()? {
+                    self.user_path.move_to(Self::user_point(*x, *y));
+                }
             }
             Operator::LineTo(x, y) => {
                 let p = self.point(*x, *y)?;
                 self.path.line_to(p);
+                if self.builds_user_path()? {
+                    self.user_path.line_to(Self::user_point(*x, *y));
+                }
             }
             Operator::CurveTo([x1, y1, x2, y2, x3, y3]) => {
                 let (c1, c2, p) = (
@@ -567,8 +831,20 @@ impl Renderer<'_> {
                 );
                 let frame = self.curve_frame();
                 self.path.curve_to_within(c1, c2, p, &frame);
+                if self.builds_user_path()? {
+                    let flatness = user_flatness(scale_bound(&self.state.ctm));
+                    self.user_path.curve_to_flat(
+                        Self::user_point(*x1, *y1),
+                        Self::user_point(*x2, *y2),
+                        Self::user_point(*x3, *y3),
+                        flatness,
+                    );
+                }
             }
-            Operator::ClosePath => self.path.close(),
+            Operator::ClosePath => {
+                self.path.close();
+                self.user_path.close();
+            }
             Operator::Rect([x, y, w, h]) => {
                 // x y m, x+w y l, x+w y+h l, x y+h l, h (ISO 32000-1 8.5.2.1)
                 let (x1, y1) = (x.checked_add(*w)?, y.checked_add(*h)?);
@@ -581,47 +857,62 @@ impl Renderer<'_> {
                 self.path.move_to(corners[0]);
                 corners[1..].iter().for_each(|&c| self.path.line_to(c));
                 self.path.close();
+                if self.builds_user_path()? {
+                    let corners = [(*x, *y), (x1, *y), (x1, y1), (*x, y1)]
+                        .map(|(x, y)| Self::user_point(x, y));
+                    self.user_path.move_to(corners[0]);
+                    corners[1..].iter().for_each(|&c| self.user_path.line_to(c));
+                    self.user_path.close();
+                }
             }
-            Operator::Fill => {
-                let mut path = std::mem::take(&mut self.path);
-                let rgb = self.state.fill;
-                self.fill(&path, rgb);
-                path.clear();
-                self.path = path;
+            Operator::Fill => self.end_path(Some(FillRule::NonZero), false)?,
+            Operator::FillEvenOdd => self.end_path(Some(FillRule::EvenOdd), false)?,
+            Operator::Stroke => self.end_path(None, true)?,
+            Operator::FillStroke => self.end_path(Some(FillRule::NonZero), true)?,
+            Operator::FillStrokeEvenOdd => self.end_path(Some(FillRule::EvenOdd), true)?,
+            Operator::EndPath => self.end_path(None, false)?,
+            Operator::Clip => self.pending_clip = Some(FillRule::NonZero),
+            Operator::ClipEvenOdd => self.pending_clip = Some(FillRule::EvenOdd),
+            Operator::LineCap(cap) => {
+                self.state.cap = match cap {
+                    1 => Cap::Round,
+                    2 => Cap::Square,
+                    _ => Cap::Butt,
+                }
             }
-            Operator::Stroke => {
-                let mut path = std::mem::take(&mut self.path);
-                let result = self.stroke_path(&path);
-                path.clear();
-                self.path = path;
-                result?;
-            }
-            Operator::LineCap(cap) => self.state.round_cap = *cap == 1,
+            Operator::LineJoin(join) => self.state.line_join = *join,
+            Operator::MiterLimit(limit) => self.state.miter_limit = *limit,
             Operator::Dash(array, phase) => {
                 self.state.dash = array.clone();
                 self.state.dash_phase = *phase;
             }
             Operator::FillCmyk(v) => {
-                self.state.fill_space = FillSpace::Device(Device::Cmyk);
+                self.state.fill_space = ColorSpace::Device(Device::Cmyk);
                 self.state.fill = color::cmyk(*v);
             }
-            Operator::StrokeCmyk(v) => self.state.stroke = color::cmyk(*v),
+            Operator::StrokeCmyk(v) => {
+                self.state.stroke_space = ColorSpace::Device(Device::Cmyk);
+                self.state.stroke = color::cmyk(*v);
+            }
             Operator::FillSpace(name) => {
-                let spaces = self
-                    .doc
-                    .get_dict(self.resources, "ColorSpace")?
-                    .unwrap_or_default();
-                let space = spaces
-                    .get(name.as_ref())
-                    .ok_or_else(|| Error::new("no such color space in the resources"))?;
-                let separation = Separation::load(self.doc, space)?;
-                // The initial color of a Separation is the tint 1 (8.6.6.4).
-                self.state.fill = separation.rgb(Fixed::ONE)?;
-                self.state.fill_space = FillSpace::Separation(separation);
+                let space = self.color_space(name)?;
+                self.state.fill = space.initial()?;
+                self.state.fill_space = space;
+            }
+            Operator::StrokeSpace(name) => {
+                let space = self.color_space(name)?;
+                self.state.stroke = space.initial()?;
+                self.state.stroke_space = space;
+            }
+            Operator::FillComponents(c) => {
+                self.state.fill = self.state.fill_space.components("sc", c.as_slice())?;
+            }
+            Operator::StrokeComponents(c) => {
+                self.state.stroke = self.state.stroke_space.components("SC", c.as_slice())?;
             }
             Operator::FillColor(tint) => match &self.state.fill_space {
-                FillSpace::Separation(s) => self.state.fill = s.rgb(*tint)?,
-                FillSpace::Device(_) => {
+                ColorSpace::Separation(s) => self.state.fill = s.rgb(*tint)?,
+                ColorSpace::Device(_) => {
                     return Err(Error::new(
                         "unsupported scn with a color space other than Separation",
                     ));
@@ -676,8 +967,9 @@ pub fn check_page_with(doc: &Document, page: &Page, dpi: u32, cache: &FontCache)
 }
 
 /// The buffers that a thread keeps between the pages it checks and renders
-/// (docs/adr/0014): the operators, the stack of graphics states, the paths,
-/// the cells and pixels of filling, and the image.
+/// (docs/adr/0014): the operators, the stack of graphics states, the paths
+/// of device space and of user space, the cells and pixels of filling, the
+/// masks of the clips (docs/adr/0027), and the image.
 #[derive(Default)]
 pub struct Workspace {
     ops: Vec<Op<'static>>,
@@ -690,6 +982,11 @@ pub struct Workspace {
     segments: Vec<Segment>,
     strokes: StrokeScratch,
     dash: Vec<i64>,
+    user_path: PathOf<i64>,
+    user_outline: PathOf<i64>,
+    user_strokes: StrokeScratchOf<i64>,
+    /// The masks of the clips of the last page (docs/adr/0027).
+    pub(crate) clips: ClipStack,
 }
 
 /// An empty `Vec` of operators of another content, in the allocation of
@@ -751,15 +1048,24 @@ fn interpret_ops<'c>(
         segments: std::mem::take(&mut ws.segments),
         strokes: std::mem::take(&mut ws.strokes),
         dash: std::mem::take(&mut ws.dash),
+        user_path: std::mem::take(&mut ws.user_path),
+        user_outline: std::mem::take(&mut ws.user_outline),
+        user_strokes: std::mem::take(&mut ws.user_strokes),
+        clips: std::mem::take(&mut ws.clips),
+        pending_clip: None,
         state: GraphicsState {
             ctm: device_matrix(&page.media_box, dpi)?,
             line_width: Fixed::ONE,
-            round_cap: false,
+            cap: Cap::Butt,
+            line_join: 0,
+            miter_limit: Fixed::from_int(10)?,
             dash: Arc::from([]),
             dash_phase: Fixed::ZERO,
             fill: [0, 0, 0],
-            fill_space: FillSpace::Device(Device::Gray),
+            fill_space: ColorSpace::Device(Device::Gray),
             stroke: [0, 0, 0],
+            stroke_space: ColorSpace::Device(Device::Gray),
+            clip: None,
             font: None,
             font_size: Fixed::ZERO,
             h_scale: Fixed::ONE,
@@ -775,6 +1081,8 @@ fn interpret_ops<'c>(
     };
     renderer.stack.clear();
     renderer.path.clear();
+    renderer.user_path.clear();
+    renderer.clips.clear();
     let result = ops.iter().try_for_each(|op| {
         renderer
             .op(&op.operator)
@@ -789,6 +1097,10 @@ fn interpret_ops<'c>(
     ws.segments = renderer.segments;
     ws.strokes = renderer.strokes;
     ws.dash = renderer.dash;
+    ws.user_path = renderer.user_path;
+    ws.user_outline = renderer.user_outline;
+    ws.user_strokes = renderer.user_strokes;
+    ws.clips = renderer.clips;
     result
 }
 
@@ -1000,3 +1312,12 @@ mod stroke_tests;
 
 #[cfg(test)]
 mod session_tests;
+
+#[cfg(test)]
+mod join_tests;
+
+#[cfg(test)]
+mod affine_tests;
+
+#[cfg(test)]
+mod clip_tests;

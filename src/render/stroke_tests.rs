@@ -220,15 +220,11 @@ fn a_dash_period_of_a_sixteenth_of_a_pixel_is_the_least() {
 }
 
 #[test]
-fn a_stroke_with_a_ctm_that_does_not_keep_angles_is_an_error() {
-    let content = "2 0 0 1 0 0 cm 1 w 0 5 m 5 5 l S";
-    assert_eq!(
-        error("0 0 10 10", content, 72),
-        (
-            "unsupported stroke with a CTM that does not keep angles".to_string(),
-            at_s(content)
-        )
-    );
+fn a_stroke_with_a_ctm_that_does_not_keep_angles_is_drawn_from_user_space() {
+    // Before docs/adr/0027, an error; now the stroke is built in user
+    // space and mapped (src/render/affine_tests.rs).
+    let canvas = render("0 0 10 10", "2 0 0 1 0 0 cm 1 w 0 5 m 5 5 l S", 72);
+    assert!(dark(canvas.pixel(9, 4)[0]) || dark(canvas.pixel(9, 5)[0]));
     // A rotation keeps them.
     render("0 0 10 10", "0 1 -1 0 10 0 cm 1 w 0 5 m 5 5 l S", 72);
 }

@@ -7,13 +7,20 @@ use super::*;
 
 const HI: i64 = i32::MAX as i64;
 
-fn solid(half: i64, round_cap: bool) -> Stroke<'static> {
+/// The style of docs/adr/0025: miter joins of limit 10, butt or round caps.
+fn styled(half: i64, round_cap: bool, dash: &[i64], phase: i64) -> Stroke<'_> {
     Stroke {
         half,
-        round_cap,
-        dash: &[],
-        phase: 0,
+        cap: if round_cap { Cap::Round } else { Cap::Butt },
+        join: MITER_10,
+        dash,
+        phase,
+        flatness: FLATNESS,
     }
+}
+
+fn solid(half: i64, round_cap: bool) -> Stroke<'static> {
+    styled(half, round_cap, &[], 0)
 }
 
 // --- butt caps
@@ -240,12 +247,7 @@ fn reference_dashes(points: &[Point], closed: bool, dash: &[i64], phase: i64) ->
 
 /// The dashes of [`for_each_dash`] without a frame, as owned points.
 fn dashes_of(points: &[Point], closed: bool, dash: &[i64], phase: i64) -> Vec<Vec<Point>> {
-    let style = Stroke {
-        half: 1,
-        round_cap: false,
-        dash,
-        phase,
-    };
+    let style = styled(1, false, dash, phase);
     let mut out = Vec::new();
     let mut piece = Vec::new();
     for_each_dash(
@@ -534,12 +536,7 @@ fn dashed_strokes_of_paths_off_the_canvas_equal_the_whole() {
                     .collect();
                 let doubled = if m % 2 == 1 { 2 } else { 1 };
                 let phase = rng.range(0, dash.iter().sum::<i64>() * doubled);
-                let style = Stroke {
-                    half,
-                    round_cap: k % 2 == 0,
-                    dash: &dash,
-                    phase,
-                };
+                let style = styled(half, k % 2 == 0, &dash, phase);
                 assert_pruned_stroke(&cmds, &style, w, h, &mut scratch);
             });
         });
@@ -558,12 +555,7 @@ fn far_segments_only_move_along_the_dashes() {
     path.line_to((13 * ONE, -100 * ONE));
     path.line_to((13 * ONE, 20 * ONE));
     let dash = [5 * PX, 5 * PX];
-    let style = Stroke {
-        half,
-        round_cap: true,
-        dash: &dash,
-        phase: 0,
-    };
+    let style = styled(half, true, &dash, 0);
     let pruned = stroke_styled(&path, &style, &frame);
     let whole = stroke_styled(&path, &style, &Frame::NONE);
     assert!(pruned.subpaths().count() < whole.subpaths().count());
@@ -599,6 +591,281 @@ fn a_dot_at_the_end_of_an_open_polyline_is_not_drawn() {
     assert_eq!(
         dots.iter().map(|d| d[0]).collect::<Vec<_>>(),
         square.to_vec()
+    );
+}
+
+// --- the strokes of user space, in i64 (docs/adr/0027)
+
+/// The outline of a path of user space whose points are those of a device
+/// path times 2^16, with the style scaled the same, covers the pixels that
+/// the device outline covers, within the rounding of the finer units. With
+/// 2^16, the lengths of the dashes are the same integers in both spaces,
+/// so the dashes are cut the same.
+#[test]
+fn the_stroke_in_i64_is_the_stroke_in_i32_scaled() {
+    const K: u32 = 16;
+    let mut rng = Rng(0x0027_0001);
+    let mut polygons = 0;
+    (0..200).for_each(|k| {
+        let dashed = k % 5 != 0;
+        let cmds = random_cmds_from(&mut rng, false, |rng| rng.point(-(1 << 14), 1 << 14));
+        let path = build(&cmds);
+        let mut user = PathOf::<i64>::new();
+        path.subpaths().for_each(|s| {
+            s.points.iter().enumerate().for_each(|(i, &(x, y))| {
+                let p = (i64::from(x) << K, i64::from(y) << K);
+                if i == 0 {
+                    user.move_to(p);
+                } else {
+                    user.line_to(p);
+                }
+            });
+            if s.closed {
+                user.close();
+            }
+        });
+        let half = rng.range(1, 1 << 12);
+        let cap = [Cap::Butt, Cap::Round, Cap::Square][k % 3];
+        let join = [MITER_10, Join::Round, Join::Bevel, Join::Miter(3 << 32)][k % 4];
+        let dash: Vec<i64> = match k % 5 {
+            0 => vec![],
+            1 => vec![3 * PX, 2 * PX],
+            _ => vec![
+                rng.range(1, 8) * PX,
+                rng.range(0, 8) * PX,
+                rng.range(1, 8) * PX,
+            ],
+        };
+        let device = Stroke {
+            half,
+            cap,
+            join,
+            dash: &dash,
+            phase: 0,
+            flatness: FLATNESS,
+        };
+        // The lengths of user space are in its units; those of device
+        // space in 2^−16 device units: the same integers with K = 16.
+        let user_dash: Vec<i64> = dash.iter().map(|&d| d << (K - 16)).collect();
+        let user_style = Stroke {
+            half: half << K,
+            cap,
+            join,
+            dash: &user_dash,
+            phase: 0,
+            flatness: FLATNESS << K,
+        };
+        let expected = stroke_styled(&path, &device, &Frame::NONE);
+        let mut out = PathOf::<i64>::new();
+        stroke_styled_into(
+            &user,
+            &user_style,
+            &Frame::NONE,
+            &mut StrokeScratchOf::default(),
+            &mut out,
+        );
+        polygons += out.subpaths().count();
+        if dashed {
+            // The dashes are cut at the same points, within the rounding
+            // of the finer units. Their outlines are not compared: a dash
+            // that ends within a unit of a vertex makes a segment of a
+            // unit in one space and none in the other, and the join with
+            // it can reach far.
+            path.subpaths().for_each(|s| {
+                let mut piece = Vec::new();
+                let mut on_device: Vec<Vec<Point>> = Vec::new();
+                for_each_dash(
+                    s.points,
+                    s.closed,
+                    &device,
+                    &Frame::NONE,
+                    &mut piece,
+                    |p, _| on_device.push(p.to_vec()),
+                );
+                let points: Vec<(i64, i64)> = s
+                    .points
+                    .iter()
+                    .map(|&(x, y)| (i64::from(x) << K, i64::from(y) << K))
+                    .collect();
+                let mut piece = Vec::new();
+                let mut in_user: Vec<Vec<(i64, i64)>> = Vec::new();
+                for_each_dash(
+                    &points,
+                    s.closed,
+                    &user_style,
+                    &Frame::NONE,
+                    &mut piece,
+                    |p, _| in_user.push(p.to_vec()),
+                );
+                assert_eq!(on_device.len(), in_user.len(), "{cmds:?} {device:?}");
+                on_device.iter().zip(&in_user).for_each(|(d, u)| {
+                    assert_eq!(d.len(), u.len(), "{cmds:?} {device:?}");
+                    d.iter().zip(u).for_each(|(&(dx, dy), &(ux, uy))| {
+                        let (ux, uy) = (ux >> K, uy >> K);
+                        assert!(
+                            (ux - i64::from(dx)).abs() <= 1 && (uy - i64::from(dy)).abs() <= 1,
+                            "{cmds:?} {device:?}: ({dx}, {dy}) and ({ux}, {uy})"
+                        );
+                    });
+                });
+            });
+            return;
+        }
+        // The polygons are not compared one by one: the control points of
+        // the discs round once more in the finer units, which can split a
+        // disc differently. The coverages of the two outlines on a canvas
+        // around the points, the user outline rounded back to device
+        // units, agree within the rounding of the edges.
+        let (w, h) = (160, 160);
+        let shift = 80 * ONE64;
+        let mut device_outline = Path::new();
+        expected.subpaths().for_each(|s| {
+            s.points.iter().enumerate().for_each(|(i, &(x, y))| {
+                let p = ((i64::from(x) + shift) as i32, (i64::from(y) + shift) as i32);
+                if i == 0 {
+                    device_outline.move_to(p);
+                } else {
+                    device_outline.line_to(p);
+                }
+            });
+            device_outline.close();
+        });
+        let mut user_outline = Path::new();
+        out.subpaths().for_each(|s| {
+            s.points.iter().enumerate().for_each(|(i, &(x, y))| {
+                let round = |v: i64| ((v + (1 << (K - 1))) >> K) + shift;
+                let p = (round(x) as i32, round(y) as i32);
+                if i == 0 {
+                    user_outline.move_to(p);
+                } else {
+                    user_outline.line_to(p);
+                }
+            });
+            user_outline.close();
+        });
+        let mut grid = vec![0u8; w * h];
+        coverage(&device_outline, FillRule::NonZero, w, h)
+            .iter()
+            .for_each(|&(x, y, a)| grid[y * w + x] = a);
+        let mut got = vec![0u8; w * h];
+        coverage(&user_outline, FillRule::NonZero, w, h)
+            .iter()
+            .for_each(|&(x, y, a)| got[y * w + x] = a);
+        // Where discs overlap, the accumulated coverage of an edge pixel
+        // adds the difference of each, so a pixel may differ by more than
+        // the rounding of one edge; over the canvas, the difference is
+        // below 1 part in 200 of the coverage.
+        let mut total = 0i64;
+        grid.iter().zip(&got).enumerate().for_each(|(i, (&e, &g))| {
+            let d = (i32::from(e) - i32::from(g)).abs();
+            total += i64::from(d);
+            assert!(
+                d <= 32,
+                "{cmds:?} {device:?}: pixel ({}, {}) is {e} and {g}",
+                i % w,
+                i / w,
+            );
+        });
+        let covered: i64 = grid.iter().map(|&v| i64::from(v)).sum();
+        assert!(
+            total * 200 <= covered.max(1),
+            "{cmds:?} {device:?}: {total} of {covered}"
+        );
+    });
+    assert!(polygons > 2000, "{polygons}");
+}
+
+#[test]
+fn a_round_join_is_the_disc_at_the_vertex() {
+    // docs/adr/0027: the polygons of an L with round joins are the two
+    // rectangles and the disc of the round caps moved to the vertex.
+    let mut path = Path::new();
+    path.move_to((10 * ONE, 10 * ONE));
+    path.line_to((40 * ONE, 10 * ONE));
+    path.line_to((40 * ONE, 50 * ONE));
+    let style = Stroke {
+        half: 300,
+        cap: Cap::Butt,
+        join: Join::Round,
+        dash: &[],
+        phase: 0,
+        flatness: FLATNESS,
+    };
+    let out = stroke_styled(&path, &style, &Frame::NONE);
+    let polygons: Vec<Vec<Point>> = out.subpaths().map(|s| s.points.to_vec()).collect();
+    assert_eq!(polygons.len(), 3);
+    assert_eq!(polygons[0].len(), 4);
+    assert_eq!(polygons[1].len(), 4);
+    let moved: Vec<Point> = disc(300)
+        .iter()
+        .map(|&(x, y)| (x + 40 * ONE, y + 10 * ONE))
+        .collect();
+    assert_eq!(polygons[2], moved);
+    // A bevel join is the triangle, and a miter join the quadrilateral.
+    let bevel = stroke_styled(
+        &path,
+        &Stroke {
+            join: Join::Bevel,
+            ..style
+        },
+        &Frame::NONE,
+    );
+    assert_eq!(
+        bevel.subpaths().map(|s| s.points.len()).collect::<Vec<_>>(),
+        [4, 4, 3]
+    );
+    let miter = stroke_styled(
+        &path,
+        &Stroke {
+            join: MITER_10,
+            ..style
+        },
+        &Frame::NONE,
+    );
+    assert_eq!(
+        miter.subpaths().map(|s| s.points.len()).collect::<Vec<_>>(),
+        [4, 4, 4]
+    );
+}
+
+#[test]
+fn a_user_half_width_too_large_for_the_products_still_miters() {
+    // A half width of 2^40 in user space (256 points of width) with
+    // directions of 2^40: the miter point is computed with the low bits
+    // dropped, and lands at the corner of the right angle.
+    let m = miter((1 << 40, 0), (0, 1 << 40), 1 << 40, 10 << 32).unwrap();
+    assert!(
+        (m.0.abs() - (1 << 40)).abs() <= 2 && (m.1.abs() - (1 << 40)).abs() <= 2,
+        "{m:?}"
+    );
+    // And so does the join of a right angle in user space, in units of
+    // 2^−32: the corner is within 2 units of the vertex plus half.
+    let mut path = PathOf::<i64>::new();
+    path.move_to((0, 0));
+    path.line_to((1 << 40, 0));
+    path.line_to((1 << 40, 1 << 40));
+    let mut out = PathOf::<i64>::new();
+    stroke_styled_into(
+        &path,
+        &Stroke {
+            half: 1 << 36,
+            cap: Cap::Butt,
+            join: MITER_10,
+            dash: &[],
+            phase: 0,
+            flatness: FLATNESS << 20,
+        },
+        &Frame::NONE,
+        &mut StrokeScratchOf::default(),
+        &mut out,
+    );
+    let corner = ((1i64 << 40) + (1 << 36), -(1i64 << 36));
+    assert!(
+        out.points()
+            .iter()
+            .any(|&(x, y)| (x - corner.0).abs() <= 2 && (y - corner.1).abs() <= 2),
+        "{:?}",
+        out.points()
     );
 }
 

@@ -24,6 +24,16 @@ fn device_gray() {
 }
 
 #[test]
+fn device_rgb() {
+    // docs/adr/0027: each component as DeviceGray rounds it.
+    let c = |v: [&str; 3]| rgb(v.map(n));
+    assert_eq!(c(["0", "0", "0"]), [0, 0, 0]);
+    assert_eq!(c(["1", "1", "1"]), [255, 255, 255]);
+    assert_eq!(c(["1", "0.5", "0"]), [255, 128, 0]);
+    assert_eq!(c(["-1", "2", "0.25"]), [0, 255, 64]);
+}
+
+#[test]
 fn device_cmyk() {
     let c = |v: [&str; 4]| cmyk(v.map(n));
     assert_eq!(c(["0", "0", "0", "0"]), [255, 255, 255]);
@@ -100,8 +110,11 @@ fn what_v0_1_does_not_read() {
     assert!(error_of("", "/DeviceCMYK cs").contains("no color space DeviceCMYK"));
     assert!(error_of("", "1 scn").contains("unsupported scn"));
     assert!(
-        error_of("/ColorSpace << /C [/ICCBased 5 0 R] >>", "/C cs")
-            .contains("unsupported ColorSpace ICCBased")
+        error_of(
+            "/ColorSpace << /C [/Indexed /DeviceGray 1 <0001>] >>",
+            "/C cs"
+        )
+        .contains("unsupported ColorSpace Indexed")
     );
     assert!(
         error_of(
@@ -131,4 +144,100 @@ fn what_v0_1_does_not_read() {
         )
         .contains("C0")
     );
+}
+
+// --- ICCBased by the number of components, sc and SC (docs/adr/0027)
+
+/// A page with an ICCBased color space of `n` components as /C, whose
+/// stream is object 5.
+fn icc_pdf(n: &str, content: &str) -> Vec<u8> {
+    page_pdf(
+        "0 0 4 4",
+        "/ColorSpace << /C [/ICCBased 5 0 R] >>",
+        content,
+        &[&format!("<< /N {n} /Length 0 >>\nstream\n\nendstream")],
+    )
+}
+
+fn icc_pixel(n: &str, content: &str) -> [u8; 3] {
+    render_pdf(&icc_pdf(n, content), 72).unwrap().pixel(1, 1)
+}
+
+fn icc_error(n: &str, content: &str) -> String {
+    render_pdf(&icc_pdf(n, content), 72)
+        .unwrap_err()
+        .message()
+        .to_string()
+}
+
+#[test]
+fn icc_based_colors_are_those_of_the_device_space_of_their_components() {
+    assert_eq!(icc_pixel("1", "/C cs 0.5 sc 0 0 4 4 re f"), gray(n("0.5")));
+    assert_eq!(
+        icc_pixel("3", "/C cs 1 0.5 0 sc 0 0 4 4 re f"),
+        rgb(["1", "0.5", "0"].map(n))
+    );
+    assert_eq!(
+        icc_pixel("4", "/C cs 0.5 0 0 0.5 sc 0 0 4 4 re f"),
+        cmyk(["0.5", "0", "0", "0.5"].map(n))
+    );
+    // The same for the stroke: a wide line across the page.
+    assert_eq!(
+        icc_pixel("3", "/C CS 1 0.5 0 SC 8 w 0 2 m 4 2 l S"),
+        rgb(["1", "0.5", "0"].map(n))
+    );
+    // The color after cs and CS is black.
+    assert_eq!(icc_pixel("3", "/C cs 0 0 4 4 re f"), [0, 0, 0]);
+    assert_eq!(icc_pixel("4", "/C CS 8 w 0 2 m 4 2 l S"), [0, 0, 0]);
+}
+
+#[test]
+fn sc_and_sc_take_the_components_of_the_space() {
+    assert_eq!(
+        icc_error("3", "/C cs 1 sc"),
+        "sc with 1 components for a color space of 3"
+    );
+    assert_eq!(
+        icc_error("1", "/C CS 1 0 0 SC"),
+        "SC with 3 components for a color space of 1"
+    );
+    // The initial space is DeviceGray; k and K select DeviceCMYK.
+    let pixel = |content: &str| {
+        render_pdf(&page_pdf("0 0 4 4", "", content, &[]), 72)
+            .unwrap()
+            .pixel(1, 1)
+    };
+    assert_eq!(pixel("0.5 sc 0 0 4 4 re f"), [128, 128, 128]);
+    assert_eq!(pixel("0.5 SC 8 w 0 2 m 4 2 l S"), [128, 128, 128]);
+    assert_eq!(pixel("0 0 0 1 k 0 0 1 0 sc 0 0 4 4 re f"), [255, 255, 0]);
+    assert_eq!(
+        pixel("0 0 0 1 K 0 0 1 0 SC 8 w 0 2 m 4 2 l S"),
+        [255, 255, 0]
+    );
+    assert_eq!(
+        error_of("", "0 0 0 1 k 1 sc"),
+        "page 1: offset 12: sc with 1 components for a color space of 4"
+    );
+    // A Separation takes scn, not sc.
+    assert!(error_of(REG, "/Reg cs 1 sc").contains("unsupported sc with a Separation"));
+    // An ICCBased space takes sc, not scn.
+    assert!(icc_error("3", "/C cs 1 scn").contains("unsupported scn"));
+}
+
+#[test]
+fn icc_based_with_other_components_is_an_error() {
+    assert_eq!(icc_error("2", "/C cs"), "unsupported ICCBased with N 2");
+    assert_eq!(icc_error("5", "/C cs"), "unsupported ICCBased with N 5");
+    assert!(error_of("/ColorSpace << /C [/ICCBased] >>", "/C cs").contains("malformed ICCBased"));
+    assert!(
+        error_of("/ColorSpace << /C [/ICCBased /DeviceRGB] >>", "/C cs")
+            .contains("malformed ICCBased")
+    );
+}
+
+#[test]
+fn q_and_q_restore_the_stroke_color_space() {
+    let pixel = |content: &str| render_pdf(&icc_pdf("3", content), 72).unwrap().pixel(1, 1);
+    assert_eq!(pixel("q /C CS 1 0 0 SC Q 8 w 0 2 m 4 2 l S"), [0, 0, 0]);
+    assert_eq!(pixel("q /C CS Q 0.5 SC 8 w 0 2 m 4 2 l S"), [128, 128, 128]);
 }

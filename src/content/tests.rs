@@ -112,9 +112,9 @@ fn wrong_operands_are_errors() {
 #[test]
 fn unsupported_operators_are_errors() {
     for op in [
-        "TJ", "Td", "TD", "T*", "'", "\"", "Tc", "Tw", "TL", "Ts", "v", "y", "s", "f*", "B", "b",
-        "W", "W*", "n", "j", "M", "gs", "sh", "BI", "d0", "d1", "g", "G", "rg", "RG", "sc", "SC",
-        "SCN", "CS", "BX", "EX", "MP", "DP", "BMC", "ri", "i", "F", "B*", "b*", "Tk",
+        "TJ", "Td", "TD", "T*", "'", "\"", "Tc", "Tw", "TL", "Ts", "v", "y", "s", "b", "gs", "sh",
+        "BI", "d0", "d1", "g", "G", "rg", "RG", "SCN", "BX", "EX", "MP", "DP", "BMC", "ri", "i",
+        "F", "b*", "Tk",
     ] {
         let e = err(&format!("q {op} Q"));
         assert_eq!(e, format!("offset 2: unsupported operator {op}"), "{op}");
@@ -155,10 +155,11 @@ fn the_operators_of_a_stroke() {
 }
 
 #[test]
-fn line_caps_other_than_butt_and_round() {
+fn line_caps_other_than_butt_round_and_square() {
     assert!(parse(b"0 J").is_ok());
     assert!(parse(b"1 J").is_ok());
-    assert_eq!(err("2 J"), "offset 2: unsupported J 2");
+    // Square caps are read since docs/adr/0027.
+    assert_eq!(ops("2 J"), vec![Operator::LineCap(2)]);
     assert_eq!(err("3 J"), "offset 2: malformed J 3");
     assert_eq!(err("-1 J"), "offset 3: malformed J -1");
 }
@@ -334,6 +335,17 @@ fn show(ops: &[Op]) -> String {
         Stroke => "S".into(),
         LineCap(c) => format!("J({c})"),
         Dash(a, p) => format!("d([{}],{p})", nums(a)),
+        LineJoin(j) => format!("j({j})"),
+        MiterLimit(m) => format!("M({m})"),
+        FillEvenOdd => "f*".into(),
+        FillStroke => "B".into(),
+        FillStrokeEvenOdd => "B*".into(),
+        EndPath => "n".into(),
+        Clip => "W".into(),
+        ClipEvenOdd => "W*".into(),
+        StrokeSpace(n) => format!("CS({})", name(n)),
+        FillComponents(c) => format!("sc({})", nums(c.as_slice())),
+        StrokeComponents(c) => format!("SC({})", nums(c.as_slice())),
         FillCmyk(v) => format!("k({})", nums(v)),
         StrokeCmyk(v) => format!("K({})", nums(v)),
         FillSpace(n) => format!("cs({})", name(n)),
@@ -695,4 +707,173 @@ fn an_integer_is_an_operand_when_it_is_a_fixed() {
             )
         );
     });
+}
+
+// --- the operators of the figures of Golem (docs/adr/0027)
+
+fn components(values: &[&str]) -> Components {
+    let values: Vec<Fixed> = values.iter().map(|v| n(v)).collect();
+    Components::new(&values).unwrap()
+}
+
+#[test]
+fn the_operators_of_a_figure() {
+    assert_eq!(
+        ops(
+            "1 j 2 j 0 j 4 M 1.5 M 2 J /GolemSRGB CS /GolemSRGB cs 0.5 sc 1 0 0 SC \
+             0 0 0 1 sc 0 0 1 1 re f* 0 0 1 1 re B 0 0 1 1 re B* 0 0 1 1 re n \
+             0 0 1 1 re W n 0 0 1 1 re W* f"
+        ),
+        vec![
+            Operator::LineJoin(1),
+            Operator::LineJoin(2),
+            Operator::LineJoin(0),
+            Operator::MiterLimit(n("4")),
+            Operator::MiterLimit(n("1.5")),
+            Operator::LineCap(2),
+            Operator::StrokeSpace(b"GolemSRGB".as_slice().into()),
+            Operator::FillSpace(b"GolemSRGB".as_slice().into()),
+            Operator::FillComponents(components(&["0.5"])),
+            Operator::StrokeComponents(components(&["1", "0", "0"])),
+            Operator::FillComponents(components(&["0", "0", "0", "1"])),
+            Operator::Rect(["0", "0", "1", "1"].map(n)),
+            Operator::FillEvenOdd,
+            Operator::Rect(["0", "0", "1", "1"].map(n)),
+            Operator::FillStroke,
+            Operator::Rect(["0", "0", "1", "1"].map(n)),
+            Operator::FillStrokeEvenOdd,
+            Operator::Rect(["0", "0", "1", "1"].map(n)),
+            Operator::EndPath,
+            Operator::Rect(["0", "0", "1", "1"].map(n)),
+            Operator::Clip,
+            Operator::EndPath,
+            Operator::Rect(["0", "0", "1", "1"].map(n)),
+            Operator::ClipEvenOdd,
+            Operator::Fill,
+        ]
+    );
+    for (src, op) in [
+        ("1.0 j", "j"),
+        ("/A j", "j"),
+        ("j", "j"),
+        ("M", "M"),
+        ("/A M", "M"),
+        ("1 2 M", "M"),
+        ("1 CS", "CS"),
+        ("/A /B CS", "CS"),
+        ("sc", "sc"),
+        ("1 2 3 4 5 sc", "sc"),
+        ("/A sc", "sc"),
+        ("SC", "SC"),
+        ("1 2 3 4 5 SC", "SC"),
+        ("1 /A SC", "SC"),
+        ("0 0 1 1 re 1 f*", "f*"),
+        ("0 0 1 1 re 1 B", "B"),
+        ("0 0 1 1 re 1 B*", "B*"),
+        ("0 0 1 1 re 1 n", "n"),
+        ("0 0 1 1 re 1 W n", "W"),
+        ("0 0 1 1 re 1 W* n", "W*"),
+    ] {
+        let e = err(src);
+        assert!(e.contains(&format!("operands of {op}")), "{src}: {e}");
+    }
+}
+
+#[test]
+fn line_joins_other_than_miter_round_and_bevel() {
+    assert_eq!(err("3 j"), "offset 2: malformed j 3");
+    assert_eq!(err("-1 j"), "offset 3: malformed j -1");
+}
+
+#[test]
+fn miter_limits_below_1() {
+    assert!(parse(b"1 M").is_ok());
+    assert!(parse(b"10 M").is_ok());
+    assert_eq!(err("0.5 M"), "offset 4: malformed M");
+    assert_eq!(err("0 M"), "offset 2: malformed M");
+    assert_eq!(err("-1 M"), "offset 3: malformed M");
+}
+
+#[test]
+fn where_the_operators_of_a_figure_may_appear() {
+    // W and W* go right before the operator that ends the path.
+    for src in [
+        "0 0 1 1 re W n",
+        "0 0 1 1 re W* n",
+        "0 0 1 1 re W f",
+        "0 0 1 1 re W f*",
+        "0 0 1 1 re W S",
+        "0 0 1 1 re W B",
+        "0 0 1 1 re W B*",
+        "0 0 m 1 1 l W n",
+        "0 0 1 1 re W n 0 0 1 1 re W n",
+    ] {
+        assert!(parse(src.as_bytes()).is_ok(), "{src}");
+    }
+    assert!(err("W n").contains("W without a current point"));
+    assert!(err("W* n").contains("W* without a current point"));
+    assert!(err("0 0 1 1 re W 1 1 l n").contains("l after W"));
+    assert!(err("0 0 1 1 re W 2 2 m n").contains("m after W"));
+    assert!(err("0 0 1 1 re W h n").contains("h after W"));
+    assert!(err("0 0 1 1 re W W n").contains("W after W"));
+    assert!(err("0 0 1 1 re W* W n").contains("W after W*"));
+    assert!(err("0 0 1 1 re W").contains("path not painted"));
+    assert!(err("BT 0 0 1 1 re W n ET").contains("inside a text object"));
+    // The painting operators end the path as f and S do.
+    for op in ["f*", "B", "B*", "n"] {
+        assert!(
+            parse(format!("0 0 1 1 re {op} q Q").as_bytes()).is_ok(),
+            "{op}"
+        );
+        assert!(
+            err(&format!("BT {op} ET")).contains("inside a text object"),
+            "{op}"
+        );
+        assert!(
+            err(&format!("0 0 m {op} 1 1 l f")).contains("without a current point"),
+            "{op}"
+        );
+    }
+    // The state and the colors go where w and k go.
+    assert!(parse(b"BT 1 j 4 M 2 J /A CS 1 sc 1 SC ET").is_ok());
+    assert!(err("0 0 m 1 j").contains("j inside a path"));
+    assert!(err("0 0 m 4 M").contains("M inside a path"));
+    assert!(err("0 0 m /A CS").contains("CS inside a path"));
+    assert!(err("0 0 m 1 sc").contains("sc inside a path"));
+    assert!(err("0 0 m 1 SC").contains("SC inside a path"));
+}
+
+#[test]
+fn the_figures_that_golem_writes() {
+    // The operators of the Forms of the SVG figures and of chart.pdf
+    // (docs/adr/0027).
+    for src in [
+        "1 0 0 -1 0 100 cm /GolemSRGB cs /GolemSRGB CS q 1 0 0 sc 0 0 1 SC 2 w 0 J 0 j 4 M [] 0 d \
+         10 10 m 90 10 l 90 90 l h B Q",
+        "q 1 0 0 1 5 5 cm 0 0 50 50 re W n q 0.5 0.5 0.5 sc 0 0 m 100 100 l 0 100 l f* Q Q",
+        "0 0 0 1 k 0 0 10 10 re f /GolemSRGB CS 0 0 1 SC 1 w 0 0 m 10 10 l S",
+    ] {
+        assert!(parse(src.as_bytes()).is_ok(), "{src}");
+    }
+}
+
+#[test]
+fn the_names_of_cs_are_in_the_resources() {
+    let doc = crate::pdf::Document::parse(&crate::render::tests::page_pdf(
+        "0 0 10 10",
+        "/ColorSpace << /A [/Separation /All /DeviceGray << /FunctionType 2 /Domain [0 1] /N 1 >>] >>",
+        "",
+        &[],
+    ))
+    .unwrap();
+    let page = &doc.pages().unwrap()[0];
+    let check = |src: &str| {
+        let ops = parse(src.as_bytes()).unwrap();
+        check_resources(&doc, &page.resources, &ops).map_err(|e| e.message().to_string())
+    };
+    assert_eq!(check("/A CS"), Ok(()));
+    assert_eq!(
+        check("/B CS"),
+        Err("no color space B in the resources".to_string())
+    );
 }

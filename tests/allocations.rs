@@ -159,6 +159,30 @@ fn the_allocations_do_not_grow_with_the_dashes() {
     });
 }
 
+#[test]
+fn the_allocations_do_not_grow_with_the_clips() {
+    // docs/adr/0027: the masks of the clips are kept in the workspace,
+    // whether the clips nest in q Q or follow each other.
+    assert_not_per_item("q 10 10 50 50 re W n 0 0 100 100 re f Q\n", |s| s);
+    assert_not_per_item("10 10 50 50 re W n 0 0 100 100 re f\n", |s| s);
+    assert_not_per_item("q 10 10 50 50 re W* n 4 w 0 0 m 100 100 l S Q\n", |s| s);
+}
+
+#[test]
+fn the_allocations_do_not_grow_with_the_strokes_under_a_general_ctm() {
+    // docs/adr/0027: the polygons of user space and their images go into
+    // the paths of the workspace.
+    assert_not_per_item("10 10 m 50 50 l 60 20 l S\n", |s| {
+        format!("2 0 0 1 0 0 cm\n{s}")
+    });
+    assert_not_per_item("10 10 m 20 60 40 10 50 50 c S\n", |s| {
+        format!("1 0 0.5 1 0 0 cm 1 j 1 J [3 2] 0 d\n{s}")
+    });
+    assert_not_per_item("10 10 m 50 50 l 60 20 l 10 10 l h B\n", |s| {
+        format!("2 0 0 1 0 0 cm 2 J\n{s}")
+    });
+}
+
 /// The distinct CIDs of the `Tj` of a page, as two-byte hexadecimal strings.
 fn distinct_cids(page: &Page) -> Vec<String> {
     let ops = shem::content::parse(&page.contents).unwrap();

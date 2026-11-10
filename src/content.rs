@@ -27,13 +27,34 @@ pub enum Operator<'a> {
     Rect([Fixed; 4]),
     Fill,
     Stroke,
-    /// `J`: 0 for butt caps, 1 for round caps (docs/adr/0025).
+    /// `J`: 0 for butt caps, 1 for round caps (docs/adr/0025), 2 for
+    /// square caps (docs/adr/0027).
     LineCap(i64),
     /// `d`: the dash array and the phase, in user space (docs/adr/0025).
     Dash(std::sync::Arc<[Fixed]>, Fixed),
+    /// `j`: 0 for miter joins, 1 for round joins, 2 for bevel joins
+    /// (docs/adr/0027).
+    LineJoin(i64),
+    /// `M`: the miter limit, 1 or more (docs/adr/0027).
+    MiterLimit(Fixed),
+    /// `f*`, `B`, `B*` and `n` (docs/adr/0027).
+    FillEvenOdd,
+    FillStroke,
+    FillStrokeEvenOdd,
+    EndPath,
+    /// `W` and `W*`: the path that the next painting operator ends
+    /// becomes the clip (docs/adr/0027).
+    Clip,
+    ClipEvenOdd,
     FillCmyk([Fixed; 4]),
     StrokeCmyk([Fixed; 4]),
     FillSpace(Cow<'a, [u8]>),
+    /// `CS` (docs/adr/0027).
+    StrokeSpace(Cow<'a, [u8]>),
+    /// `sc` and `SC`: the components of a color in the fill or the
+    /// stroke color space (docs/adr/0027).
+    FillComponents(Components),
+    StrokeComponents(Components),
     FillColor(Fixed),
     BeginText,
     EndText,
@@ -45,6 +66,33 @@ pub enum Operator<'a> {
     Do(Cow<'a, [u8]>),
     BeginMarked,
     EndMarked,
+}
+
+/// The components of `sc` and `SC`: one to four numbers, held without an
+/// allocation (docs/adr/0013).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Components {
+    count: u8,
+    values: [Fixed; 4],
+}
+
+impl Components {
+    /// The components of one to four values.
+    pub fn new(values: &[Fixed]) -> Option<Components> {
+        if values.is_empty() || values.len() > 4 {
+            return None;
+        }
+        let mut all = [Fixed::ZERO; 4];
+        all[..values.len()].copy_from_slice(values);
+        Some(Components {
+            count: values.len() as u8,
+            values: all,
+        })
+    }
+
+    pub fn as_slice(&self) -> &[Fixed] {
+        &self.values[..usize::from(self.count)]
+    }
 }
 
 /// The string of `Tj`: a hexadecimal string as the slice of the content,
@@ -163,8 +211,25 @@ fn operator<'a>(
         b"re" => numbers::<4>(operands).map(|v| (Rect(v), Place::Page)),
         b"f" => return none(Fill, Place::Paint),
         b"S" => return none(Stroke, Place::Paint),
+        b"f*" => return none(FillEvenOdd, Place::Paint),
+        b"B" => return none(FillStroke, Place::Paint),
+        b"B*" => return none(FillStrokeEvenOdd, Place::Paint),
+        b"n" => return none(EndPath, Place::Paint),
+        b"W" => return none(Clip, Place::Path),
+        b"W*" => return none(ClipEvenOdd, Place::Path),
         b"J" => match operands {
             [Operand::Int(cap)] => Some((LineCap(*cap), Place::Anywhere)),
+            _ => None,
+        },
+        b"j" => match operands {
+            [Operand::Int(join)] => Some((LineJoin(*join), Place::Anywhere)),
+            _ => None,
+        },
+        b"M" => numbers::<1>(operands).map(|[v]| (MiterLimit(v), Place::Anywhere)),
+        b"sc" => components(operands).map(|c| (FillComponents(c), Place::Anywhere)),
+        b"SC" => components(operands).map(|c| (StrokeComponents(c), Place::Anywhere)),
+        b"CS" => match operands {
+            [n] => name(n).map(|n| (StrokeSpace(n), Place::Anywhere)),
             _ => None,
         },
         b"d" => match operands {
@@ -219,6 +284,19 @@ fn operator<'a>(
     })
 }
 
+/// The components of `sc` and `SC`: one to four numbers (docs/adr/0027).
+fn components(operands: &[Operand]) -> Option<Components> {
+    let mut values = [Fixed::ZERO; 4];
+    if operands.is_empty() || operands.len() > values.len() {
+        return None;
+    }
+    operands
+        .iter()
+        .zip(values.iter_mut())
+        .try_for_each(|(o, v)| o.number().map(|n| *v = n))?;
+    Components::new(&values[..operands.len()])
+}
+
 /// The dash array of `d`: numbers, none negative (docs/adr/0025).
 fn dash_array(array: &[Object]) -> Option<std::sync::Arc<[Fixed]>> {
     array
@@ -239,12 +317,35 @@ struct State {
     in_text: bool,
     /// A path is being built, with a current point.
     in_path: bool,
+    /// The keyword of a `W` or `W*` that the next operator must end the
+    /// path of (docs/adr/0027).
+    clipping: Option<&'static str>,
+}
+
+/// Whether an operator ends a path: `f`, `f*`, `S`, `B`, `B*` or `n`.
+fn ends_path(op: &Operator) -> bool {
+    matches!(
+        op,
+        Operator::Fill
+            | Operator::FillEvenOdd
+            | Operator::Stroke
+            | Operator::FillStroke
+            | Operator::FillStrokeEvenOdd
+            | Operator::EndPath
+    )
 }
 
 impl State {
     /// Checks an operator; the name of its keyword `k` is made only for an error.
     fn check(&mut self, k: &[u8], op: &Operator, place: Place) -> std::result::Result<(), String> {
         let k = || keyword_name(k);
+        if let Some(clip) = self.clipping {
+            // W and W* go right before the operator that ends the path.
+            if !ends_path(op) {
+                return Err(format!("{} after {clip}", k()));
+            }
+            self.clipping = None;
+        }
         if self.in_path
             && !matches!(
                 op,
@@ -253,9 +354,10 @@ impl State {
                     | Operator::CurveTo(_)
                     | Operator::ClosePath
                     | Operator::Rect(_)
-                    | Operator::Fill
-                    | Operator::Stroke
+                    | Operator::Clip
+                    | Operator::ClipEvenOdd
             )
+            && !ends_path(op)
         {
             return Err(format!("{} inside a path", k()));
         }
@@ -274,7 +376,9 @@ impl State {
             Operator::BeginText => self.in_text = true,
             Operator::EndText => self.in_text = false,
             Operator::MoveTo(..) | Operator::Rect(_) => self.in_path = true,
-            Operator::Fill | Operator::Stroke => self.in_path = false,
+            Operator::Clip => self.clipping = Some("W"),
+            Operator::ClipEvenOdd => self.clipping = Some("W*"),
+            op if ends_path(op) => self.in_path = false,
             Operator::BeginMarked => self.marked += 1,
             Operator::EndMarked => {
                 self.marked = self.marked.checked_sub(1).ok_or("EMC without BDC")?;
@@ -282,11 +386,14 @@ impl State {
             Operator::RenderMode(m) if *m != 0 && *m != 2 => {
                 return Err(format!("unsupported Tr {m}"));
             }
-            // Square caps (2 J) are not written by Golem (docs/adr/0025).
-            Operator::LineCap(2) => return Err("unsupported J 2".into()),
             Operator::LineCap(c) if !(0..=2).contains(c) => {
                 return Err(format!("malformed J {c}"));
             }
+            Operator::LineJoin(j) if !(0..=2).contains(j) => {
+                return Err(format!("malformed j {j}"));
+            }
+            // The miter limit is 1 or more (ISO 32000-1 8.4.3.5).
+            Operator::MiterLimit(m) if *m < Fixed::ONE => return Err("malformed M".into()),
             // A dash array of zeros only is malformed (ISO 32000-1 8.4.3.6).
             Operator::Dash(array, _)
                 if !array.is_empty() && array.iter().all(|v| *v == Fixed::ZERO) =>
@@ -370,7 +477,8 @@ pub fn parse_into<'a>(content: &'a [u8], ops: &mut Vec<Op<'a>>) -> Result<()> {
         .map_err(|m| Error::new(m).at_offset(content.len()))
 }
 
-/// Checks that the names of `Tf`, `cs` and `Do` are in the page's resources.
+/// Checks that the names of `Tf`, `cs`, `CS` and `Do` are in the page's
+/// resources.
 pub fn check_resources(doc: &Document, resources: &Dict, ops: &[Op]) -> Result<()> {
     let category = |key: &str| doc.get_dict(resources, key).map(Option::unwrap_or_default);
     let fonts = category("Font")?;
@@ -379,7 +487,7 @@ pub fn check_resources(doc: &Document, resources: &Dict, ops: &[Op]) -> Result<(
     ops.iter().try_for_each(|op| {
         let (kind, dict, name) = match &op.operator {
             Operator::Font(n, _) => ("font", &fonts, n),
-            Operator::FillSpace(n) => ("color space", &spaces, n),
+            Operator::FillSpace(n) | Operator::StrokeSpace(n) => ("color space", &spaces, n),
             Operator::Do(n) => ("XObject", &xobjects, n),
             _ => return Ok(()),
         };
