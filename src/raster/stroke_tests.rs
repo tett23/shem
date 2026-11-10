@@ -288,7 +288,8 @@ fn fine_polyline_length(points: &[Fine]) -> i128 {
 /// the same number of points, each within 2 units; the sum of the
 /// lengths within 2 dash units per segment and the rounding of the ends
 /// of each dash to the device grid.
-fn assert_dashes(points: &[Point], closed: bool, dash: &[i64], phase: i64) {
+/// It returns the number of dashes and of their points compared.
+fn assert_dashes(points: &[Point], closed: bool, dash: &[i64], phase: i64) -> (usize, usize) {
     let actual = dashes_of(points, closed, dash, phase);
     let expected = reference_dashes(points, closed, dash, phase);
     let what = || format!("{points:?} closed {closed} dash {dash:?} phase {phase}");
@@ -310,13 +311,15 @@ fn assert_dashes(points: &[Point], closed: bool, dash: &[i64], phase: i64) {
         .map(|d| fine_polyline_length(d))
         .sum::<i128>()
         >> 16;
-    let segments = points.len() as i128;
+    // The number of segments: the closing one counts for a closed polyline.
+    let segments = (points.len() - usize::from(!closed)) as i128;
     let tolerance = 2 * segments + (actual.len() as i128) * (2 << 16);
     assert!(
         (total - fine_total).abs() <= tolerance,
         "{}: {total} against {fine_total}",
         what()
     );
+    (actual.len(), actual.iter().map(Vec::len).sum())
 }
 
 /// `n` points as a polyline: in dash units, 10 pixels is 10 · 256 · 2^16.
@@ -408,6 +411,7 @@ fn a_closed_polyline_is_dashed_to_its_start() {
 #[test]
 fn random_polylines_are_dashed_as_the_reference() {
     let mut rng = Rng(0x0025_0004);
+    let mut compared = (0, 0, 0);
     (0..2000).for_each(|k| {
         // Segments of 1 to 2^20 units.
         let n = rng.range(2, 8);
@@ -448,8 +452,17 @@ fn random_polylines_are_dashed_as_the_reference() {
         let doubled = if dash.len() % 2 == 1 { 2 } else { 1 };
         let period = dash.iter().sum::<i64>() * doubled;
         let phase = rng.range(0, period);
-        assert_dashes(&points, k % 3 == 0, &dash, phase);
+        let (dashes, dash_points) = assert_dashes(&points, k % 3 == 0, &dash, phase);
+        compared.0 += dashes;
+        compared.1 += dash_points;
+        compared.2 += usize::from(dashes > 1);
     });
+    // The comparisons are not vacuous: for this seed, the 2000 cases cut
+    // 1680285 dashes of 3363412 points, 1695 of the cases into more than one.
+    assert!(
+        compared.0 >= 1_000_000 && compared.1 >= 2_000_000 && compared.2 >= 1500,
+        "{compared:?}"
+    );
 }
 
 // --- the work off the canvas
@@ -459,7 +472,15 @@ fn random_polylines_are_dashed_as_the_reference() {
 /// stroke is flattened within the frame; a dashed one is flattened whole,
 /// as the renderer does (docs/adr/0025), and only its far segments are
 /// skipped.
-fn assert_pruned_stroke(cmds: &[Cmd], style: &Stroke, w: usize, h: usize, scratch: &mut Scratch) {
+/// It returns whether the pruned stroke made fewer polygons than the whole
+/// one, that is, whether the case pruned anything.
+fn assert_pruned_stroke(
+    cmds: &[Cmd],
+    style: &Stroke,
+    w: usize,
+    h: usize,
+    scratch: &mut Scratch,
+) -> bool {
     let frame = Frame::around(w, h, 16 * style.half + 16);
     let path = if style.dash.is_empty() {
         build_within(cmds, &frame)
@@ -474,7 +495,13 @@ fn assert_pruned_stroke(cmds: &[Cmd], style: &Stroke, w: usize, h: usize, scratc
         expected.as_slice(),
         "{w}x{h} {style:?} {cmds:?}"
     );
+    pruned.subpaths().count() < whole.subpaths().count()
 }
+
+/// The cases that prune something, of the 260 and 140 strokes of the two
+/// tests below (counted for their seeds: 204 and 60).
+const PRUNED_SOLID: usize = 150;
+const PRUNED_DASHED: usize = 40;
 
 /// Random commands whose points leave room for the margin of `half`.
 fn cmds_within_margin(rng: &mut Rng, half: i64, w: usize, h: usize) -> Vec<Cmd> {
@@ -493,6 +520,7 @@ fn solid_strokes_of_paths_off_the_canvas_equal_the_whole() {
     // With butt and with round caps, the curves beyond the margin of the
     // stroke are one segment each, and the pixels are the same.
     let mut rng = Rng(0x0025_0005);
+    let mut pruned = 0;
     [(40, 30, 80), (300, 300, 20), (1, 1, 30)]
         .iter()
         .for_each(|&(w, h, n)| {
@@ -505,10 +533,23 @@ fn solid_strokes_of_paths_off_the_canvas_equal_the_whole() {
                     rng.range(1, half + 1)
                 };
                 let cmds = cmds_within_margin(&mut rng, half, w, h);
-                assert_pruned_stroke(&cmds, &solid(half, false), w, h, &mut scratch);
-                assert_pruned_stroke(&cmds, &solid(half, true), w, h, &mut scratch);
+                pruned += usize::from(assert_pruned_stroke(
+                    &cmds,
+                    &solid(half, false),
+                    w,
+                    h,
+                    &mut scratch,
+                ));
+                pruned += usize::from(assert_pruned_stroke(
+                    &cmds,
+                    &solid(half, true),
+                    w,
+                    h,
+                    &mut scratch,
+                ));
             });
         });
+    assert!(pruned >= PRUNED_SOLID, "{pruned}");
 }
 
 #[test]
@@ -517,6 +558,7 @@ fn dashed_strokes_of_paths_off_the_canvas_equal_the_whole() {
     // make no polygon: the pixels are those of the dashes of every
     // segment. Dashes of 8 to 64 pixels, with and without round caps.
     let mut rng = Rng(0x0025_0006);
+    let mut pruned = 0;
     [(40, 30, 40), (300, 300, 10), (1, 1, 20)]
         .iter()
         .for_each(|&(w, h, n)| {
@@ -537,9 +579,10 @@ fn dashed_strokes_of_paths_off_the_canvas_equal_the_whole() {
                 let doubled = if m % 2 == 1 { 2 } else { 1 };
                 let phase = rng.range(0, dash.iter().sum::<i64>() * doubled);
                 let style = styled(half, k % 2 == 0, &dash, phase);
-                assert_pruned_stroke(&cmds, &style, w, h, &mut scratch);
+                pruned += usize::from(assert_pruned_stroke(&cmds, &style, w, h, &mut scratch));
             });
         });
+    assert!(pruned >= PRUNED_DASHED, "{pruned}");
 }
 
 #[test]

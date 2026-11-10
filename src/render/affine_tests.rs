@@ -167,8 +167,86 @@ fn a_general_stroke_beyond_the_range_of_coordinates_is_an_error() {
         )
     );
     let doc = Document::parse(&page_pdf("0 0 40 40", "", content, &[])).unwrap();
-    assert!(check_page(&doc, &doc.pages().unwrap()[0], 72).is_err());
+    let e = check_page(&doc, &doc.pages().unwrap()[0], 72).unwrap_err();
+    assert_eq!(
+        (e.message().to_string(), e.offset()),
+        (
+            "stroke outside the range of coordinates".to_string(),
+            at_s(content)
+        )
+    );
     render("0 0 40 40", "2 0 0 1 0 0 cm 2 w 4194302 2 m 4194302 8 l S");
+}
+
+#[test]
+fn a_user_point_of_2_30_points_is_beyond_the_range_though_the_device_point_is_not() {
+    // docs/adr/0028: the points of user space are in units of 2^−32, and
+    // their differences must fit in i64, so a point of 2^30 points or more
+    // is an error. The CTM shrinks x by 1000, so the device point
+    // (about 1.07e6 pixels) is far within the range of i32 and the error is
+    // not the one of the mapping (src/render.rs, USER_REACH).
+    let beyond = "0.001 0 0 0.5 0 0 cm 2 w 1073741824 5 m 1073741824 8 l S";
+    assert_eq!(
+        error("0 0 40 40", beyond),
+        (
+            "stroke outside the range of coordinates".to_string(),
+            at_s(beyond)
+        )
+    );
+    // The same for y and for a negative point, and for the end of a curve.
+    for content in [
+        "0.5 0 0 0.001 0 0 cm 2 w 5 5 m 5 -1073741825 l S",
+        "0.001 0 0 0.5 0 0 cm 2 w -1073741824 5 m 5 5 l S",
+        "0.001 0 0 0.5 0 0 cm 2 w 5 5 m 5 5 6 6 1073741824 8 c S",
+    ] {
+        assert_eq!(
+            error("0 0 40 40", content),
+            (
+                "stroke outside the range of coordinates".to_string(),
+                at_s(content)
+            ),
+            "{content}"
+        );
+    }
+    // One point below 2^30 passes the check: it draws, off the page.
+    render(
+        "0 0 40 40",
+        "0.001 0 0 0.5 0 0 cm 2 w 1073741823 5 m 1073741823 8 l S",
+    );
+    // The check finds it without drawing.
+    let doc = Document::parse(&page_pdf("0 0 40 40", "", beyond, &[])).unwrap();
+    let e = check_page(&doc, &doc.pages().unwrap()[0], 72).unwrap_err();
+    assert_eq!(e.message(), "stroke outside the range of coordinates");
+}
+
+#[test]
+fn a_dash_period_too_short_for_the_stretch_of_the_ctm_is_an_error() {
+    // docs/adr/0028: 2 0 0 1 0 0 cm stretches the most by 2.24 (the bound
+    // sqrt(a² + b² + c² + d²)), so a period of 0.002 is at most 0.0045
+    // pixels, below 1/16.
+    let short = "2 0 0 1 0 0 cm [0.001 0.001] 0 d 1 w 0 5 m 10 5 l S";
+    assert_eq!(
+        error("0 0 20 10", short),
+        (
+            "dash pattern shorter than 1/16 pixel".to_string(),
+            at_s(short)
+        )
+    );
+    let doc = Document::parse(&page_pdf("0 0 20 10", "", short, &[])).unwrap();
+    let e = check_page(&doc, &doc.pages().unwrap()[0], 72).unwrap_err();
+    assert_eq!(
+        (e.message().to_string(), e.offset()),
+        (
+            "dash pattern shorter than 1/16 pixel".to_string(),
+            at_s(short)
+        )
+    );
+    // An odd array counts twice; a period of 0.1 · 2.24 is long enough.
+    render(
+        "0 0 20 10",
+        "2 0 0 1 0 0 cm [0.05 0.05] 0 d 1 w 0 5 m 10 5 l S",
+    );
+    render("0 0 20 10", "2 0 0 1 0 0 cm [0.05] 0 d 1 w 0 5 m 10 5 l S");
 }
 
 #[test]

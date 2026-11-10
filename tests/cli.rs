@@ -433,13 +433,21 @@ fn errors_of_the_input() {
 
 /// A PDF from object bodies, numbered from 1, with object 1 as the Root.
 fn pdf_of_objects(objects: &[String]) -> Vec<u8> {
+    let bytes: Vec<Vec<u8>> = objects.iter().map(|o| o.clone().into_bytes()).collect();
+    pdf_of_byte_objects(&bytes)
+}
+
+/// [`pdf_of_objects`] for objects with bytes that are not UTF-8.
+fn pdf_of_byte_objects(objects: &[Vec<u8>]) -> Vec<u8> {
     let mut out = b"%PDF-1.6\n".to_vec();
     let offsets: Vec<usize> = objects
         .iter()
         .enumerate()
         .map(|(i, o)| {
             let at = out.len();
-            out.extend(format!("{} 0 obj\n{o}\nendobj\n", i + 1).into_bytes());
+            out.extend(format!("{} 0 obj\n", i + 1).into_bytes());
+            out.extend(o);
+            out.extend(b"\nendobj\n");
             at
         })
         .collect();
@@ -657,9 +665,9 @@ fn wrong_jobs_are_usage_errors() {
 /// A three-page PDF whose third page places the image XObject of the
 /// given dictionary and raw data (docs/adr/0027).
 fn pdf_with_an_image_on_the_third_page(dict: &str, data: &[u8]) -> Vec<u8> {
-    let mut objects = vec![
-        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
-        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>".to_string(),
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>".to_vec(),
     ];
     ["0 0 1 1 re f", "", "q 10 0 0 10 0 0 cm /Im1 Do Q"]
         .iter()
@@ -668,15 +676,75 @@ fn pdf_with_an_image_on_the_third_page(dict: &str, data: &[u8]) -> Vec<u8> {
             objects.push(format!(
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /Im1 9 0 R >> >> /Contents {} 0 R >>",
                 4 + 2 * i
-            ));
-            objects.push(format!("<< /Length {} >>\nstream\n{c}\nendstream", c.len()));
+            ).into_bytes());
+            objects.push(
+                format!("<< /Length {} >>\nstream\n{c}\nendstream", c.len()).into_bytes(),
+            );
         });
-    objects.push(format!(
-        "<< /Type /XObject /Subtype /Image {dict} /Length {} >>\nstream\n{}\nendstream",
-        data.len(),
-        String::from_utf8_lossy(data)
-    ));
-    pdf_of_objects(&objects)
+    objects.push(
+        [
+            format!(
+                "<< /Type /XObject /Subtype /Image {dict} /Length {} >>\nstream\n",
+                data.len()
+            )
+            .into_bytes(),
+            data.to_vec(),
+            b"\nendstream".to_vec(),
+        ]
+        .concat(),
+    );
+    pdf_of_byte_objects(&objects)
+}
+
+#[test]
+fn nothing_is_written_when_a_jpeg_of_a_later_page_is_broken() {
+    // docs/adr/0027: the check decodes the JPEG, so one that is cut off, or
+    // whose size is not that of the dictionary, on the third page stops the
+    // rendering before any file is written. The whole file is the control.
+    let dir = scratch("broken-jpeg");
+    let gray = std::fs::read(format!(
+        "{}/tests/fixtures/jpeg/gray.jpg",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let dict = |w: u32| {
+        format!(
+            "/Filter /DCTDecode /Width {w} /Height 13 /ColorSpace /DeviceGray /BitsPerComponent 8"
+        )
+    };
+    let render = |name: &str, dict: &str, data: &[u8]| {
+        let input = write_pdf(
+            &dir,
+            &format!("{name}.pdf"),
+            &pdf_with_an_image_on_the_third_page(dict, data),
+        );
+        let out = dir.join(format!("out-{name}"));
+        let (code, stdout, stderr) = shem(&["render", &input, out.to_str().unwrap()]);
+        (code, stdout, stderr, files(&out), input)
+    };
+    let (code, _, stderr, written, _) = render("whole", &dict(19), &gray);
+    assert_eq!((code, written.len()), (0, 3), "{stderr}");
+    let broken: [(&str, String, &[u8], &str); 3] = [
+        (
+            "cut",
+            dict(19),
+            &gray[..gray.len() / 2],
+            "corrupt JPEG data",
+        ),
+        ("width", dict(20), &gray, "does not match the JPEG frame"),
+        ("junk", dict(19), b"not a jpeg", "JPEG"),
+    ];
+    broken.iter().for_each(|(name, dict, data, text)| {
+        let (code, stdout, stderr, written, input) = render(name, dict, data);
+        assert_eq!(code, 1, "{name}: {stderr}");
+        assert_eq!(stdout, "");
+        assert!(
+            stderr.starts_with(&format!("shem: {input}: page 3: ")),
+            "{name}: {stderr}"
+        );
+        assert!(stderr.contains(text), "{name}: {stderr}");
+        assert!(written.is_empty(), "{name}: {written:?}");
+    });
 }
 
 #[test]

@@ -34,15 +34,34 @@ fn white(v: u8) -> bool {
 
 #[test]
 fn the_strokes_that_golem_writes_render() {
-    // The three outputs of the test of Golem's Writer (docs/adr/0025).
-    for content in [
-        "0.5 w\n0 0 m\n1 0 l\nS\n",
-        "1 w [3 2] 0 d\n0 0 m\n1 0 l\n1 1 l\nh S\n",
-        "1 w 1 J [0 3] 0 d\n0 0 m\n1 0 l\nS\n",
-    ] {
+    // The three outputs of the test of Golem's Writer (docs/adr/0025). Each
+    // draws in the corner (0, 0) of the page, the bottom left pixel, only.
+    let drawn = |content: &str| -> Vec<(usize, usize, u8)> {
         let canvas = render("0 0 10 10", content, 72);
-        assert!(canvas.pixels.iter().any(|&v| v != 255), "{content}");
-    }
+        (0..10)
+            .flat_map(|y| (0..10).map(move |x| (x, y)))
+            .map(|(x, y)| (x, y, canvas.pixel(x, y)[0]))
+            .filter(|&(_, _, v)| v != 255)
+            .collect()
+    };
+    // A line of width 1/2 along y = 0: the quarter of a pixel is on the page,
+    // and 255 · (1 − 1/4) = 191.
+    assert_eq!(drawn("0.5 w\n0 0 m\n1 0 l\nS\n"), [(0, 9, 191)]);
+    // The triangle of sides 1 is dashed [3 2] from the corner, and its
+    // outline of width 1 reaches only the two pixels around the corner and
+    // the one above the second.
+    let triangle = drawn("1 w [3 2] 0 d\n0 0 m\n1 0 l\n1 1 l\nh S\n");
+    assert!(triangle.iter().all(|&(x, y, _)| x <= 1 && y >= 7));
+    assert!(triangle.contains(&(0, 9, 0)), "{triangle:?}");
+    // A dot of radius 1/2 at the corner: a quarter of the disc is on the
+    // page, π/16 of a pixel, which the flattened disc covers a little less
+    // than (1/16 pixel of flatness); nothing else is drawn.
+    let dot = drawn("1 w 1 J [0 3] 0 d\n0 0 m\n1 0 l\nS\n");
+    assert_eq!(dot.len(), 1, "{dot:?}");
+    assert!(
+        dot[0].0 == 0 && dot[0].1 == 9 && (190..=215).contains(&dot[0].2),
+        "{dot:?}"
+    );
 }
 
 #[test]
@@ -223,10 +242,18 @@ fn a_dash_period_of_a_sixteenth_of_a_pixel_is_the_least() {
 fn a_stroke_with_a_ctm_that_does_not_keep_angles_is_drawn_from_user_space() {
     // Before docs/adr/0027, an error; now the stroke is built in user
     // space and mapped (src/render/affine_tests.rs).
-    let canvas = render("0 0 10 10", "2 0 0 1 0 0 cm 1 w 0 5 m 5 5 l S", 72);
-    assert!(dark(canvas.pixel(9, 4)[0]) || dark(canvas.pixel(9, 5)[0]));
-    // A rotation keeps them.
-    render("0 0 10 10", "0 1 -1 0 10 0 cm 1 w 0 5 m 5 5 l S", 72);
+    // The line of width 1 along y = 5 stretched twice across: the same
+    // pixels as the line from 0 to 10, half covering rows 4 and 5.
+    let stretched = render("0 0 10 10", "2 0 0 1 0 0 cm 1 w 0 5 m 5 5 l S", 72);
+    assert_eq!(stretched, render("0 0 10 10", "1 w 0 5 m 10 5 l S", 72));
+    assert_eq!(stretched.pixel(9, 4), [127, 127, 127]);
+    assert_eq!(stretched.pixel(9, 5), [127, 127, 127]);
+    assert_eq!(stretched.pixel(9, 3), [255, 255, 255]);
+    // A rotation keeps the angles, and the line is the one drawn without it.
+    assert_eq!(
+        render("0 0 10 10", "0 1 -1 0 10 0 cm 1 w 0 5 m 5 5 l S", 72),
+        render("0 0 10 10", "1 w 5 0 m 5 5 l S", 72)
+    );
 }
 
 #[test]
@@ -251,7 +278,14 @@ fn a_stroke_beyond_the_range_of_coordinates_is_an_error() {
         &[],
     ))
     .unwrap();
-    assert!(check_page(&doc, &doc.pages().unwrap()[0], 72).is_err());
+    let e = check_page(&doc, &doc.pages().unwrap()[0], 72).unwrap_err();
+    assert_eq!(
+        (e.message().to_string(), e.offset()),
+        (
+            "stroke outside the range of coordinates".to_string(),
+            at_s("2 w 8388590 5 m 8388600 5 l S")
+        )
+    );
 }
 
 #[test]
@@ -286,6 +320,16 @@ fn a_dotted_line_has_no_dot_at_its_end() {
         dots,
         "........####........####........####........................"
     );
+}
+
+#[test]
+fn square_caps_on_dashes_of_no_length_draw_nothing() {
+    // docs/adr/0028: a dash of no length has no direction to extend along.
+    let square = render("0 0 30 10", "2 J [0 3] 0 d 2 w 0 5 m 20 5 l S", 72);
+    assert!(square.pixels.iter().all(|&v| v == 255));
+    // Round caps make the dots, so the page is not blank for another reason.
+    let round = render("0 0 30 10", "1 J [0 3] 0 d 2 w 0 5 m 20 5 l S", 72);
+    assert!(round.pixels.iter().any(|&v| v != 255));
 }
 
 #[test]
