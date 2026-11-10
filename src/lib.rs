@@ -15,6 +15,7 @@ pub mod fixed;
 pub mod flate;
 pub mod font;
 pub mod image;
+pub mod jpeg;
 pub mod parallel;
 pub mod pdf;
 pub mod png;
