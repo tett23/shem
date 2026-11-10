@@ -58,10 +58,16 @@ static ALLOCATOR: Peak = Peak;
 
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
+/// Held for the whole of a test, from before it makes its input: the
+/// allocator counts the process, so the input of one test (tens of
+/// megabytes) would otherwise add to the peak of the other.
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// The largest number of bytes allocated beyond those at the start, while
-/// `f` runs.
+/// `f` runs. The caller holds [`one_at_a_time`].
 fn peak_of<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
     let base = CURRENT.load(Ordering::SeqCst);
     PEAK.store(base, Ordering::SeqCst);
     let out = f();
@@ -130,6 +136,7 @@ fn png(width: u32, height: u32, z: &[u8]) -> Vec<u8> {
 
 #[test]
 fn a_stream_past_the_limit_allocates_at_most_twice_the_limit() {
+    let _serial = one_at_a_time();
     let limit: usize = 1 << 26;
     let data = flate_page_pdf(&zlib(&vec![0u8; limit + 1]));
     let (error, peak) = peak_of(|| {
@@ -148,6 +155,7 @@ fn a_stream_past_the_limit_allocates_at_most_twice_the_limit() {
 
 #[test]
 fn a_png_past_its_size_allocates_at_most_twice_its_size() {
+    let _serial = one_at_a_time();
     let (width, height) = (200u32, 200u32);
     let size = height as usize * (width as usize * 3 + 1);
     let data = png(width, height, &zlib(&vec![0u8; 1_000_000]));
