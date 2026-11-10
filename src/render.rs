@@ -239,8 +239,10 @@ struct GraphicsState {
     // (docs/adr/0027).
     clip: Option<usize>,
     // How many clips are alive in this state, counted also when the masks
-    // are not made (docs/adr/0030).
+    // are not made, and whether this state made its own: a clip of the
+    // same state replaces its mask (docs/adr/0030).
     clips: usize,
+    own_clip: bool,
     // The text state (ISO 32000-1 9.3): the font and its size, the
     // horizontal scaling (Tz / 100) and the rendering mode.
     font: Option<Arc<Font>>,
@@ -338,7 +340,10 @@ impl Renderer<'_> {
     fn clip_to(&mut self, path: &Path, rule: FillRule) -> Result<()> {
         // Counted before the masks, so that the check finds it
         // (docs/adr/0030).
-        self.state.clips += 1;
+        if !self.state.own_clip {
+            self.state.clips += 1;
+            self.state.own_clip = true;
+        }
         if self.state.clips > MAX_CLIPS {
             return Err(Error::new(format!("clips nested deeper than {MAX_CLIPS}")));
         }
@@ -933,6 +938,7 @@ impl Renderer<'_> {
             return Err(Error::new(format!("q nested deeper than {MAX_Q_DEPTH}")));
         }
         self.stack.push(self.state.clone());
+        self.state.own_clip = false;
         Ok(())
     }
 
@@ -1239,6 +1245,7 @@ fn interpret_ops<'c>(
             stroke_space: ColorSpace::Device(Device::Gray),
             clip: None,
             clips: 0,
+            own_clip: false,
             font: None,
             font_size: Fixed::ZERO,
             h_scale: Fixed::ONE,

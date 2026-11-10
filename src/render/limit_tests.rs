@@ -69,7 +69,11 @@ fn the_contents_of_forms_in_a_page_are_at_most_2_26_bytes() {
         "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << >>".to_string(),
         content.into_bytes(),
     );
-    let at = pdf_with_streams("0 0 20 20", &"/X1 Do ".repeat(1024), &[leaf.clone()]);
+    let at = pdf_with_streams(
+        "0 0 20 20",
+        &"/X1 Do ".repeat(1024),
+        std::slice::from_ref(&leaf),
+    );
     assert!(render_pdf(&at, 72).is_ok());
     let past = pdf_with_streams("0 0 20 20", &"/X1 Do ".repeat(1025), &[leaf]);
     let e = check_error(&past);
@@ -95,7 +99,13 @@ fn a_form_counts_as_a_q() {
     // 63 q and the q of the form: 64; one more q is past the limit.
     let leaf = form(None, 0);
     let at = format!("{}/X1 Do{}", "q ".repeat(63), " Q".repeat(63));
-    assert!(render_pdf(&pdf_with_streams("0 0 10 10", &at, &[leaf.clone()]), 72).is_ok());
+    assert!(
+        render_pdf(
+            &pdf_with_streams("0 0 10 10", &at, std::slice::from_ref(&leaf)),
+            72
+        )
+        .is_ok()
+    );
     let past = format!("{}/X1 Do{}", "q ".repeat(64), " Q".repeat(64));
     let e = render_pdf(&pdf_with_streams("0 0 10 10", &past, &[leaf]), 72)
         .unwrap_err()
@@ -114,16 +124,14 @@ fn at_most_16_clips_are_nested() {
     assert!(e.contains("clips nested deeper than 16"), "{e}");
     // The check finds it without drawing a mask.
     assert!(check_error(&data).contains("clips nested deeper than 16"));
-    // Clips in one state count too: two W in one q are two clips.
-    let two = format!(
-        "{}{}",
-        "q 0 0 10 10 re W n 0 0 10 10 re W n ".repeat(9),
-        "Q ".repeat(9)
+    // Clips of one state replace its mask: many W in one q are one clip.
+    let one = format!(
+        "{}{}0 0 5 5 re f{}",
+        "q 0 0 10 10 re W n ".repeat(15),
+        "q ".to_string() + &"0 0 10 10 re W n ".repeat(40),
+        " Q".repeat(16)
     );
-    let e = render_pdf(&page_pdf("0 0 10 10", "", &two, &[]), 72)
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("clips nested deeper than 16"), "{e}");
+    assert!(render_pdf(&page_pdf("0 0 10 10", "", &one, &[]), 72).is_ok());
 }
 
 #[test]
@@ -132,7 +140,13 @@ fn the_bbox_of_a_form_is_a_clip() {
     let leaf = form(None, 0);
     let clip = "q 0 0 10 10 re W n ";
     let at = format!("{}/X1 Do{}", clip.repeat(15), " Q".repeat(15));
-    assert!(render_pdf(&pdf_with_streams("0 0 10 10", &at, &[leaf.clone()]), 72).is_ok());
+    assert!(
+        render_pdf(
+            &pdf_with_streams("0 0 10 10", &at, std::slice::from_ref(&leaf)),
+            72
+        )
+        .is_ok()
+    );
     let past = format!("{}/X1 Do{}", clip.repeat(16), " Q".repeat(16));
     let e = render_pdf(&pdf_with_streams("0 0 10 10", &past, &[leaf]), 72)
         .unwrap_err()
