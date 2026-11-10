@@ -60,6 +60,20 @@ impl Device {
         }
     }
 
+    /// The RGB of 8-bit components, as many as [`Device::components`]:
+    /// the samples of an image (docs/adr/0027). CMYK goes by
+    /// `R = 255 − min(255, C + K)` (docs/adr/0005).
+    pub fn rgb8(self, v: &[u8]) -> [u8; 3] {
+        match self {
+            Device::Gray => [v[0]; 3],
+            Device::Rgb => [v[0], v[1], v[2]],
+            Device::Cmyk => {
+                let k = u16::from(v[3]);
+                [v[0], v[1], v[2]].map(|c| (255 - (u16::from(c) + k).min(255)) as u8)
+            }
+        }
+    }
+
     /// The device space of an ICCBased space of `n` components.
     fn of_icc(n: i64) -> Option<Device> {
         match n {
@@ -67,6 +81,27 @@ impl Device {
             3 => Some(Device::Rgb),
             4 => Some(Device::Cmyk),
             _ => None,
+        }
+    }
+
+    /// Reads the color space of an image (docs/adr/0027): the names
+    /// `DeviceGray` and `DeviceCMYK`, or `[/ICCBased stream]` by its `N`.
+    /// `DeviceRGB` and the other spaces are errors.
+    pub fn load(doc: &Document, obj: &Object) -> Result<Device> {
+        let space = doc.resolve(obj)?;
+        match &space {
+            Object::Name(n) if n == b"DeviceGray" => Ok(Device::Gray),
+            Object::Name(n) if n == b"DeviceCMYK" => Ok(Device::Cmyk),
+            Object::Array(_) => match ColorSpace::load(doc, &space)? {
+                ColorSpace::Device(d) => Ok(d),
+                ColorSpace::Separation(_) => {
+                    Err(Error::new("unsupported ColorSpace Separation of an image"))
+                }
+            },
+            other => Err(Error::new(format!(
+                "unsupported ColorSpace {}",
+                other.describe()
+            ))),
         }
     }
 }

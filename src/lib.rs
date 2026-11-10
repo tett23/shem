@@ -18,6 +18,7 @@ pub mod image;
 pub mod jpeg;
 pub mod parallel;
 pub mod pdf;
+pub mod picture;
 pub mod png;
 pub mod raster;
 pub mod render;

@@ -14,7 +14,7 @@ v0.1 は、今の Golem の Writer が書く PDF の部分集合に合ってい�
 - ページの内容の演算子：`BT ET Tf Tz Tm Tj Tr w re f m c h q Q cm Do k K cs scn BDC EMC` と、角丸の囲みの枠の `l S J d`（[ADR 0025](adr/0025-strokes-of-paths-with-round-caps-and-dashes.md)）
 - 文字：CFF（`CIDFontType0C`）と TrueType（`FontFile2`）の CIDFont、`Identity-H` と `Identity-V`、縦組みの位置ベクトル、合成の斜体と太字
 - 色：DeviceGray、DeviceCMYK、トンボの Separation
-- 画像と図版（Form XObject）：中身を描かず、バツ印の付いた灰色の箱で描く
+- 画像と図版（Form XObject）：当初は中身を描かず、バツ印の付いた灰色の箱で描く（[ADR 0006](adr/0006-placeholder-boxes-for-images-and-forms.md)）。その後、中身を描くように改めた（[ADR 0027](adr/0027-images-and-figures.md)）
 - 出力：PNG と PPM、解像度の指定
 - 配布：Linux の x86-64 と aarch64（musl）、macOS の aarch64
 
@@ -24,7 +24,7 @@ v0.1 は、今の Golem の Writer が書く PDF の部分集合に合ってい�
 ## v0.x：Golem に追従し、v1 に向けて広げる
 
 - Golem の Writer が新しい演算子や資源を書くようになったら、先に shem を直してリリースする。
-- 画像の復号（JPEG、PNG の標本、`SMask`）と、図版の描画（SVG の図版の Form、取り込んだ PDF の図版の Form）を入れる。Golem の v2 では図版をフレームに合わせて拡大縮小するので、Golem の v1.x か v2 に間に合わせる。
+- 画像の復号（JPEG、Flate の標本、`SMask`）と、図版の描画（SVG の図版の Form、取り込んだ PDF の図版の Form）は入れた（[ADR 0027](adr/0027-images-and-figures.md)）。残るのは、ICC のプロファイルによる色の変換、`ImageMask`、`Mask`、`Matte`、透明のグループ、Form の中の文字、JPEG の算術符号とロスレスと階層の符号化、`JPXDecode`、`JBIG2Decode`、`CCITTFaxDecode` である。
 - v1 に向けた範囲の拡大を、少しずつ入れる。
 
 ## v1：汎用の PDF のラスタライザ
@@ -50,7 +50,7 @@ shem の描いた結果が正しいことは、shem 自身のテストでは示�
 リリースの前に、メンテナーが次の項目を確かめる。
 
 - **文字**：Golem の fixture（和文の縦組みと横組み、縦組みの中の欧文、合成の太字と斜体）を、shem と pdftoppm で描いて並べる。字の抜け、字の取り違え、位置のずれ、回転の向きの誤りがないこと。
-- **画像と図版の箱**：Golem の `figures` の fixture で、箱の位置と大きさが、pdftoppm が描く画像と図版の位置と大きさに合うこと。
+- **画像と図版**：Golem の `figures`、`complex-horizontal`、`complex-vertical` の fixture で、画像の位置と向き（縦組みで回した画像を含む）、図版の線と塗りと切り抜き、透過が、pdftoppm が描くものと合うこと（[ADR 0027](adr/0027-images-and-figures.md)）。拡大した小さな画像の補間は、pdftoppm（最近傍）と shem（双線形）で違ってよい。
 - **色とトンボ**：CMYK の塗りとトンボが、pdftoppm と同じ場所に出ること。色の値は CMYK から RGB への式が違うので一致しなくてよい。
 - **線と破線**：Golem の `boxes` と `boxes-vertical` の fixture で、角丸の囲みの枠の角の丸み、破線の位置、点の形と間隔、`border-sides` で途切れた辺の端が、pdftoppm と合うこと（[ADR 0025](adr/0025-strokes-of-paths-with-round-caps-and-dashes.md)）。
 - **差分の画像**：Golem の fixture の一字を変えた PDF を作って前と後を描き、`shem diff` のディレクトリの比較の差分の画像で、変わった字の場所がすぐにわかること（[ADR 0010](adr/0010-diff-images.md)）。
