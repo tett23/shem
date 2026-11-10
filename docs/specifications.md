@@ -234,7 +234,7 @@ Form の `BBox` は、`Do` の中だけ、切り抜きを狭める（[画像と�
 
 - ベースライン（SOF0）、拡張の順次（SOF1、ハフマン符号、8 ビットと 12 ビット）、プログレッシブ（SOF2、8 ビットと 12 ビット）を読む。算術符号、ロスレス、階層の符号化は `unsupported JPEG <SOF の番号>` のエラーにする。成分の数は 1、3、4、標本化の係数は 1 から 4 とし、リスタートの間隔（DRI と RSTn）を読む。
 - 逆 DCT は、libjpeg の `jidctint.c` の整数の式（`CONST_BITS` 13、`PASS1_BITS` は 8 ビットで 2、12 ビットで 1）と同じ計算で、標本を 0 から `2^精度 − 1` に切り詰める。色差の補間は、標本化が 2×1 と 2×2 の成分では `jdsample.c` の fancy upsampling と同じ式、ほかの比は標本の繰り返しとする。
-- 色の変換は、APP14（Adobe）の `transform` が 1 なら YCbCr、2 なら YCCK、0 なら変換なしとする。APP14 がなければ、成分 3 は YCbCr、1 と 4 は変換なしとする。YCbCr から RGB への変換は、`jdcolor.c` の整数の表（`SCALEBITS` 16）と同じ式とする。YCCK は、YCbCr を RGB にした値を `2^精度 − 1` から引いて CMY とし、K はそのままとする。
+- 色の変換は、APP14（Adobe）の `transform` が 1 なら YCbCr、2 なら YCCK、0 なら変換なしとする。APP14 がなければ、成分 3 は YCbCr、1 と 4 は変換なしとする。`transform` が 2 を超えれば、成分の数によらず `unsupported JPEG APP14 transform <t>` のエラーにする。成分 1 では、`transform` が 0、1、2 のどれでも変換をしない（[ADR 0031](adr/0031-corrections-to-image-range-and-app14.md)）。YCbCr から RGB への変換は、`jdcolor.c` の整数の表（`SCALEBITS` 16）と同じ式とする。YCCK は、YCbCr を RGB にした値を `2^精度 − 1` から引いて CMY とし、K はそのままとする。
 - 12 ビットの標本は、色の変換の後に `div_round(v × 255, 4095)` で 8 ビットにする。
 - 画像の辞書の `Width`、`Height`、`BitsPerComponent` が SOF と合わなければ `<キー> <辞書の値> of the image does not match the JPEG frame (<SOF の値>)`、色空間の成分の数が SOF と合わなければ `the color space of the image has <n> components but the JPEG frame <m>` のエラーにする。
 - 壊れた JPEG（途中で切れたもの、表のない符号など）は `corrupt JPEG data: <内容>` のエラーにする。Adobe の反転した CMYK の JPEG は、`Decode [1 0 1 0 1 0 1 0]` で反転してから CMYK の変換に入れる。
@@ -246,7 +246,7 @@ Form の `BBox` は、`Do` の中だけ、切り抜きを狭める（[画像と�
 - `u − 1/2` と `v − 1/2` の整数部（床）を `i0`、`j0`、端数を `fx`、`fy`（2^−16 単位）とし、四つの標本 `(i0, j0)`、`(i0 + 1, j0)`、`(i0, j0 + 1)`、`(i0 + 1, j0 + 1)` を、画像の縁の外は縁の標本に切り詰めて引く。
 - RGB の各成分と不透明度は、`(s00 · (2^16 − fx) + s10 · fx) · (2^16 − fy) + (s01 · (2^16 − fx) + s11 · fx) · fy` を 2^32 で割って丸めた値（同じ近さなら偶数）とする。補間は 8 ビットの RGB にした後の標本で行い、`SMask` の不透明度は `SMask` の大きさで同じ規則で補間する。RGB と不透明度は別々に補間する（不透明度を掛けてから補間することはしない）。
 - 画素の不透明度は、覆いに `SMask` の不透明度を `div_round(a × m, 255)` で掛け、さらに切り抜きを同じ式で掛けた値とし、`(c × a + p × (255 − a) + 127) / 255` で重ねる。
-- 画像は、塗りと同じく、平行四辺形のうちキャンバスの中の画素だけを求める。行の中の画素の座標は、行の最初の画素の値から 1 画素ごとの差分を厳密に足して進める。CTM の成分の絶対値が 2^57（Q32.32 の生の値）を超えれば `image outside the range of coordinates` のエラーにする（四隅が装置の空間に収まる CTM では起きない）。
+- 画像は、塗りと同じく、平行四辺形のうちキャンバスの中の画素だけを求める。行の中の画素の座標は、行の最初の画素の値から 1 画素ごとの差分を厳密に足して進める。CTM の成分の絶対値が 2^57（Q32.32 の生の値）を超えれば `image outside the range of coordinates` のエラーにする（四隅が装置の空間に収まる CTM では起きない。`Do` で置く画像の四隅を写せなければ、先に `arithmetic overflow` のエラーになる。[ADR 0031](adr/0031-corrections-to-image-range-and-app14.md)）。
 
 ### 検査とキャッシュ
 
