@@ -115,7 +115,11 @@ fn at_most_16_clips_are_nested() {
     // The check finds it without drawing a mask.
     assert!(check_error(&data).contains("clips nested deeper than 16"));
     // Clips in one state count too: two W in one q are two clips.
-    let two = format!("{}{}", "q 0 0 10 10 re W n 0 0 10 10 re W n ".repeat(9), "Q ".repeat(9));
+    let two = format!(
+        "{}{}",
+        "q 0 0 10 10 re W n 0 0 10 10 re W n ".repeat(9),
+        "Q ".repeat(9)
+    );
     let e = render_pdf(&page_pdf("0 0 10 10", "", &two, &[]), 72)
         .unwrap_err()
         .to_string();
