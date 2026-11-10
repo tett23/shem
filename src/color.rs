@@ -1,4 +1,5 @@
-//! Colors: DeviceGray, DeviceCMYK and Separation (docs/adr/0005).
+//! Colors: DeviceGray, DeviceCMYK and Separation (docs/adr/0005), RGB and
+//! ICCBased by its number of components (docs/adr/0027).
 //!
 //! Colors become 8-bit RGB by the conversions of ISO 32000-1 10.3, without
 //! ICC profiles.
@@ -25,25 +26,47 @@ pub fn cmyk(v: [Fixed; 4]) -> [u8; 3] {
     [c, m, y].map(|x| (255 - (x + k).min(255)) as u8)
 }
 
-/// A device color space.
+/// RGB to 8-bit RGB: each component as [`component`] rounds it
+/// (docs/adr/0027).
+pub fn rgb(v: [Fixed; 3]) -> [u8; 3] {
+    v.map(component)
+}
+
+/// A device color space, or an ICCBased one, which is read as the device
+/// space of its number of components (docs/adr/0027).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Device {
     Gray,
+    Rgb,
     Cmyk,
 }
 
 impl Device {
-    fn components(self) -> usize {
+    /// The number of components.
+    pub fn components(self) -> usize {
         match self {
             Device::Gray => 1,
+            Device::Rgb => 3,
             Device::Cmyk => 4,
         }
     }
 
-    fn rgb(self, values: &[Fixed]) -> [u8; 3] {
+    /// The RGB of the components, which are as many as [`Device::components`].
+    pub fn rgb(self, values: &[Fixed]) -> [u8; 3] {
         match self {
             Device::Gray => gray(values[0]),
+            Device::Rgb => rgb([values[0], values[1], values[2]]),
             Device::Cmyk => cmyk([values[0], values[1], values[2], values[3]]),
+        }
+    }
+
+    /// The device space of an ICCBased space of `n` components.
+    fn of_icc(n: i64) -> Option<Device> {
+        match n {
+            1 => Some(Device::Gray),
+            3 => Some(Device::Rgb),
+            4 => Some(Device::Cmyk),
+            _ => None,
         }
     }
 }
@@ -72,24 +95,15 @@ impl Separation {
 
     /// Reads `[/Separation name alternate function]` (8.6.6.4).
     pub fn load(doc: &Document, obj: &Object) -> Result<Separation> {
-        let space = doc.resolve(obj)?;
-        let items = match &space {
-            Object::Array(a) => a.clone(),
-            other => {
-                return Err(Error::new(format!(
-                    "unsupported ColorSpace {}",
-                    other.describe()
-                )));
-            }
-        };
-        let family = items.first().and_then(Object::as_name).unwrap_or_default();
-        if family != b"Separation" {
-            return Err(Error::new(format!(
-                "unsupported ColorSpace {}",
-                String::from_utf8_lossy(family)
-            )));
+        match ColorSpace::load(doc, obj)? {
+            ColorSpace::Separation(s) => Ok(s),
+            ColorSpace::Device(_) => Err(Error::new("not a Separation color space")),
         }
-        let [_, _, alternate, function] = items.as_slice() else {
+    }
+
+    /// Reads the items of `[/Separation name alternate function]`.
+    fn load_items(doc: &Document, items: &[Object]) -> Result<Separation> {
+        let [_, _, alternate, function] = items else {
             return Err(Error::new("malformed Separation color space"));
         };
         let alternate = match doc.resolve(alternate)?.as_name() {
@@ -158,11 +172,80 @@ impl Separation {
     }
 }
 
-/// The color space of the fill, as v0.1 reads it.
+/// A color space of the fill or the stroke, as shem reads it: a device
+/// space (DeviceGray, DeviceCMYK, or an ICCBased space by its number of
+/// components) or a Separation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FillSpace {
+pub enum ColorSpace {
     Device(Device),
     Separation(Separation),
+}
+
+impl ColorSpace {
+    /// Reads a color space of the resources: `[/ICCBased stream]` by the
+    /// `N` of the stream (docs/adr/0027), or `[/Separation …]`
+    /// (docs/adr/0005).
+    pub fn load(doc: &Document, obj: &Object) -> Result<ColorSpace> {
+        let space = doc.resolve(obj)?;
+        let items = match &space {
+            Object::Array(a) => a.as_slice(),
+            other => {
+                return Err(Error::new(format!(
+                    "unsupported ColorSpace {}",
+                    other.describe()
+                )));
+            }
+        };
+        let family = items.first().and_then(Object::as_name).unwrap_or_default();
+        match family {
+            b"Separation" => Separation::load_items(doc, items).map(ColorSpace::Separation),
+            b"ICCBased" => {
+                let [_, stream] = items else {
+                    return Err(Error::new("malformed ICCBased color space"));
+                };
+                let dict = match doc.resolve(stream)? {
+                    Object::Stream(s) => s.dict,
+                    _ => return Err(Error::new("malformed ICCBased color space")),
+                };
+                let n = doc
+                    .get(&dict, "N")?
+                    .ok_or_else(|| Error::new("an ICCBased color space without N"))?;
+                let device = n.as_int().and_then(Device::of_icc).ok_or_else(|| {
+                    Error::new(format!("unsupported ICCBased with N {}", n.describe()))
+                })?;
+                Ok(ColorSpace::Device(device))
+            }
+            _ => Err(Error::new(format!(
+                "unsupported ColorSpace {}",
+                String::from_utf8_lossy(family)
+            ))),
+        }
+    }
+
+    /// The color after the space is selected: black (ISO 32000-1
+    /// 8.6.3), or the tint 1 of a Separation (8.6.6.4).
+    pub fn initial(&self) -> Result<[u8; 3]> {
+        match self {
+            ColorSpace::Device(_) => Ok([0, 0, 0]),
+            ColorSpace::Separation(s) => s.rgb(Fixed::ONE),
+        }
+    }
+
+    /// The RGB of the components of `sc` or `SC` (`op`), which must be as
+    /// many as the device space has (docs/adr/0027).
+    pub fn components(&self, op: &str, values: &[Fixed]) -> Result<[u8; 3]> {
+        match self {
+            ColorSpace::Device(d) if d.components() == values.len() => Ok(d.rgb(values)),
+            ColorSpace::Device(d) => Err(Error::new(format!(
+                "{op} with {} components for a color space of {}",
+                values.len(),
+                d.components()
+            ))),
+            ColorSpace::Separation(_) => Err(Error::new(format!(
+                "unsupported {op} with a Separation color space"
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]

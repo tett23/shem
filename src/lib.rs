@@ -6,6 +6,7 @@
 //! machine.
 
 pub mod cli;
+pub mod clip;
 pub mod color;
 pub mod content;
 pub mod diff;

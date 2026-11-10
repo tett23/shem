@@ -5,6 +5,7 @@
 //! the signed height of the edges that cross it (cover) and twice the
 //! signed area to their left (area), and a row is swept from the left.
 
+use crate::clip::{Clip, mul_alpha};
 use crate::fixed::{div_round, isqrt};
 
 /// A point in units of 1/256 pixel.
@@ -18,29 +19,86 @@ const ONE64: i64 = ONE as i64;
 const FULL: i64 = ONE64 * ONE64 * 2;
 
 /// A curve is split until its control points are within 1/16 pixel.
-const FLATNESS: i64 = ONE64 / 16;
+pub const FLATNESS: i64 = ONE64 / 16;
 const MAX_DEPTH: u32 = 16;
+
+/// The integers of the coordinates of a path: `i32` in device space, in
+/// units of 1/256 pixel, and `i64` in user space, in units of 2^−32, for
+/// the strokes under a CTM that does not keep angles (docs/adr/0027). The
+/// geometry of the strokes is written once for both.
+pub trait Coord: Copy + Eq + Ord + std::fmt::Debug + Default {
+    /// The shift of the squared differences of the coordinates in the
+    /// lengths of the dashes ([`segment_length`]): 32 for device space,
+    /// whose lengths are in units of 2^−16 device units, and 0 for user
+    /// space, whose lengths are in its units.
+    const LENGTH_SHIFT: u32;
+    /// The bits the components of a direction are shifted under
+    /// ([`direction`]): 32 in device space, where the differences of
+    /// coordinates are under 2^32 already, so nothing is shifted; 28 in
+    /// user space, so that the products of the squared lengths of two
+    /// directions stay within u128 in the test of the miter limit.
+    const DIRECTION_BITS: u32;
+    fn wide(self) -> i64;
+    /// The value, which the caller knows to fit.
+    fn narrow(v: i64) -> Self;
+}
+
+impl Coord for i32 {
+    const LENGTH_SHIFT: u32 = 32;
+    const DIRECTION_BITS: u32 = 32;
+    fn wide(self) -> i64 {
+        i64::from(self)
+    }
+    fn narrow(v: i64) -> i32 {
+        v as i32
+    }
+}
+
+impl Coord for i64 {
+    const LENGTH_SHIFT: u32 = 0;
+    const DIRECTION_BITS: u32 = 28;
+    fn wide(self) -> i64 {
+        self
+    }
+    fn narrow(v: i64) -> i64 {
+        v
+    }
+}
 
 /// A subpath of a [`Path`]: its points, and whether it is closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Subpath<'a> {
-    pub points: &'a [Point],
+pub struct Subpath<'a, C = i32> {
+    pub points: &'a [(C, C)],
     pub closed: bool,
 }
 
 /// A path of line segments in device space: the points of every subpath in
 /// one `Vec`, and where each subpath starts, so that a path cleared and
 /// built again keeps its buffers (docs/adr/0013).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Path {
-    points: Vec<Point>,
+pub type Path = PathOf<i32>;
+
+/// A path of line segments with coordinates in `C` ([`Coord`]): the one of
+/// device space is [`Path`]; the one of user space, for the strokes under
+/// a CTM that does not keep angles, is `PathOf<i64>` (docs/adr/0027).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathOf<C> {
+    points: Vec<(C, C)>,
     /// The index of the first point of each subpath, and whether it is closed.
     starts: Vec<(usize, bool)>,
 }
 
-impl Path {
-    pub fn new() -> Path {
-        Path::default()
+impl<C> Default for PathOf<C> {
+    fn default() -> PathOf<C> {
+        PathOf {
+            points: Vec::new(),
+            starts: Vec::new(),
+        }
+    }
+}
+
+impl<C: Coord> PathOf<C> {
+    pub fn new() -> PathOf<C> {
+        PathOf::default()
     }
 
     /// Removes the subpaths and keeps the capacity of the buffers.
@@ -49,13 +107,13 @@ impl Path {
         self.starts.clear();
     }
 
-    pub fn move_to(&mut self, p: Point) {
+    pub fn move_to(&mut self, p: (C, C)) {
         self.starts.push((self.points.len(), false));
         self.points.push(p);
     }
 
     /// The current point: the last point, or the start of a closed subpath.
-    pub fn current_point(&self) -> Option<Point> {
+    pub fn current_point(&self) -> Option<(C, C)> {
         self.starts.last().map(|&(start, closed)| {
             if closed {
                 self.points[start]
@@ -65,7 +123,7 @@ impl Path {
         })
     }
 
-    pub fn line_to(&mut self, p: Point) {
+    pub fn line_to(&mut self, p: (C, C)) {
         match self.starts.last() {
             Some(&(_, false)) => self.points.push(p),
             _ => {
@@ -77,17 +135,14 @@ impl Path {
         }
     }
 
-    pub fn curve_to(&mut self, c1: Point, c2: Point, p: Point) {
-        self.curve_to_within(c1, c2, p, &Frame::NONE);
-    }
-
-    /// [`Path::curve_to`] on a canvas: the parts of the curve beyond the
-    /// frame are one segment each (docs/adr/0022).
-    pub fn curve_to_within(&mut self, c1: Point, c2: Point, p: Point, frame: &Frame) {
+    /// [`Path::curve_to`] with the curve split until the larger second
+    /// difference of its control points is at most `flatness`, in the
+    /// units of `C`, by the same subdivision; nothing is skipped
+    /// (docs/adr/0027).
+    pub fn curve_to_flat(&mut self, c1: (C, C), c2: (C, C), p: (C, C), flatness: i64) {
         let start = self.current_point().unwrap_or(c1);
-        // After the first point, the subpath is open: the others are pushed.
         let mut first = true;
-        flatten_curve_into(start, c1, c2, p, frame, |q| {
+        flatten_plain_into(start, c1, c2, p, flatness, |q| {
             if first {
                 self.line_to(q);
                 first = false;
@@ -108,11 +163,11 @@ impl Path {
     }
 
     /// The points of every subpath.
-    pub fn points(&self) -> &[Point] {
+    pub fn points(&self) -> &[(C, C)] {
         &self.points
     }
 
-    pub fn subpaths(&self) -> impl Iterator<Item = Subpath<'_>> {
+    pub fn subpaths(&self) -> impl Iterator<Item = Subpath<'_, C>> {
         let ends = self
             .starts
             .iter()
@@ -129,13 +184,35 @@ impl Path {
     }
 
     /// Adds a closed polygon, reversed if its signed area is negative.
-    fn push_positive(&mut self, polygon: &[Point]) {
+    fn push_positive(&mut self, polygon: &[(C, C)]) {
         let start = self.points.len();
         self.starts.push((start, true));
         self.points.extend_from_slice(polygon);
         if signed_area(polygon) < 0 {
             self.points[start..].reverse();
         }
+    }
+}
+
+impl Path {
+    pub fn curve_to(&mut self, c1: Point, c2: Point, p: Point) {
+        self.curve_to_within(c1, c2, p, &Frame::NONE);
+    }
+
+    /// [`Path::curve_to`] on a canvas: the parts of the curve beyond the
+    /// frame are one segment each (docs/adr/0022).
+    pub fn curve_to_within(&mut self, c1: Point, c2: Point, p: Point, frame: &Frame) {
+        let start = self.current_point().unwrap_or(c1);
+        // After the first point, the subpath is open: the others are pushed.
+        let mut first = true;
+        flatten_curve_into(start, c1, c2, p, frame, |q| {
+            if first {
+                self.line_to(q);
+                first = false;
+            } else {
+                self.points.push(q);
+            }
+        });
     }
 }
 
@@ -231,8 +308,10 @@ impl Frame {
     }
 
     /// Whether both ends of a segment are in one region beyond the frame.
-    fn holds_segment(&self, a: Point, b: Point) -> bool {
-        self.holds(a, b, a, b)
+    fn holds_segment<C: Coord>(&self, a: (C, C), b: (C, C)) -> bool {
+        let (xlo, xhi) = (a.0.wide().min(b.0.wide()), a.0.wide().max(b.0.wide()));
+        let (ylo, yhi) = (a.1.wide().min(b.1.wide()), a.1.wide().max(b.1.wide()));
+        yhi <= self.top || ylo >= self.bottom || xlo >= self.right || xhi <= self.left
     }
 
     /// Whether some point of the bounds of the four points is in a region
@@ -312,6 +391,67 @@ fn flatten_curve_into(
     }
     let frame = frame.reaches(p0, p1, p2, p3).then_some(frame);
     split(p0, p1, p2, p3, 0, frame, &mut emit);
+}
+
+/// The points of [`flatten_curve`] with the flatness `limit` in the units
+/// of `C`, and no region skipped: the same subdivision, in i128, for the
+/// curves of user space and the discs of their caps and joins
+/// (docs/adr/0027). With `FLATNESS` and coordinates of device space, the
+/// points are those of [`flatten_curve`].
+pub fn flatten_plain_into<C: Coord>(
+    p0: (C, C),
+    p1: (C, C),
+    p2: (C, C),
+    p3: (C, C),
+    limit: i64,
+    mut emit: impl FnMut((C, C)),
+) {
+    type W = (i128, i128);
+    fn widen<C: Coord>(p: (C, C)) -> W {
+        (i128::from(p.0.wide()), i128::from(p.1.wide()))
+    }
+    fn mid(a: W, b: W) -> W {
+        ((a.0 + b.0) >> 1, (a.1 + b.1) >> 1)
+    }
+    fn flat(p0: W, p1: W, p2: W, p3: W) -> i128 {
+        let second = |a: W, b: W, c: W| {
+            let dx = a.0 - 2 * b.0 + c.0;
+            let dy = a.1 - 2 * b.1 + c.1;
+            dx.abs().max(dy.abs())
+        };
+        second(p0, p1, p2).max(second(p1, p2, p3))
+    }
+    fn split<C: Coord>(
+        a: W,
+        b: W,
+        c: W,
+        d: W,
+        depth: u32,
+        limit: i128,
+        emit: &mut impl FnMut((C, C)),
+    ) {
+        if depth >= MAX_DEPTH || flat(a, b, c, d) <= limit {
+            emit((C::narrow(d.0 as i64), C::narrow(d.1 as i64)));
+            return;
+        }
+        let ab = mid(a, b);
+        let bc = mid(b, c);
+        let cd = mid(c, d);
+        let abc = mid(ab, bc);
+        let bcd = mid(bc, cd);
+        let m = mid(abc, bcd);
+        split(a, ab, abc, m, depth + 1, limit, emit);
+        split(m, bcd, cd, d, depth + 1, limit, emit);
+    }
+    split(
+        widen(p0),
+        widen(p1),
+        widen(p2),
+        widen(p3),
+        0,
+        i128::from(limit),
+        &mut emit,
+    );
 }
 
 #[cfg(test)]
@@ -730,7 +870,11 @@ fn for_each_edge(path: &Path, mut f: impl FnMut(Point, Point)) {
 /// path on a `width` × `height` canvas: rows in the canvas, and columns
 /// from −1, where the cells left of the canvas are summed, to the last
 /// column of the canvas. `None` if no cell can.
-fn grid_bounds(path: &Path, width: usize, height: usize) -> Option<(i64, i64, i64, i64)> {
+pub(crate) fn grid_bounds(
+    path: &Path,
+    width: usize,
+    height: usize,
+) -> Option<(i64, i64, i64, i64)> {
     let (min, max) = path
         .subpaths()
         .filter(|s| s.points.len() > 1)
@@ -790,7 +934,7 @@ pub fn visit_coverage(
 /// Calls `visit(y, x, opacities)` with the pixels of [`coverage`] by runs of
 /// a row: the pixels from `x` have the opacities, 0 included, in order. The
 /// runs come in the order of the pixels, and no run is empty.
-fn visit_rows(
+pub(crate) fn visit_rows(
     path: &Path,
     rule: FillRule,
     width: usize,
@@ -943,16 +1087,19 @@ fn sweep_into(
 }
 
 /// Twice the signed area of a polygon (the shoelace formula).
-pub fn signed_area(points: &[Point]) -> i128 {
+pub fn signed_area<C: Coord>(points: &[(C, C)]) -> i128 {
     points
         .iter()
         .zip(points.iter().cycle().skip(1))
-        .map(|(a, b)| i128::from(a.0) * i128::from(b.1) - i128::from(b.0) * i128::from(a.1))
+        .map(|(a, b)| {
+            i128::from(a.0.wide()) * i128::from(b.1.wide())
+                - i128::from(b.0.wide()) * i128::from(a.1.wide())
+        })
         .sum()
 }
 
-fn add(p: Point, v: (i64, i64)) -> Point {
-    ((i64::from(p.0) + v.0) as i32, (i64::from(p.1) + v.1) as i32)
+fn add<C: Coord>(p: (C, C), v: (i64, i64)) -> (C, C) {
+    (C::narrow(p.0.wide() + v.0), C::narrow(p.1.wide() + v.1))
 }
 
 fn neg(v: (i64, i64)) -> (i64, i64) {
@@ -969,16 +1116,69 @@ fn normal(d: (i64, i64), half: i64) -> (i64, i64) {
     )
 }
 
-fn direction(a: Point, b: Point) -> (i64, i64) {
-    (
-        i64::from(b.0) - i64::from(a.0),
-        i64::from(b.1) - i64::from(a.1),
-    )
+/// The vector along a direction, `half` units long, rounded as the normal
+/// is: the extension of a square cap (docs/adr/0027).
+fn along(d: (i64, i64), half: i64) -> (i64, i64) {
+    let (nx, ny) = normal(d, half);
+    (ny, -nx)
+}
+
+/// The difference of two points.
+fn delta<C: Coord>(a: (C, C), b: (C, C)) -> (i64, i64) {
+    (b.0.wide() - a.0.wide(), b.1.wide() - a.1.wide())
+}
+
+/// The direction from `a` to `b` for the normals and the joins, with its
+/// components under 2^[`Coord::DIRECTION_BITS`]: the differences of device
+/// coordinates are under 2^32 already, and those of user space are shifted
+/// right until they are under 2^28, which keeps their angle to 2^−27
+/// (docs/adr/0027).
+fn direction<C: Coord>(a: (C, C), b: (C, C)) -> (i64, i64) {
+    let d = delta(a, b);
+    let bits = 64 - (d.0.unsigned_abs() | d.1.unsigned_abs()).leading_zeros();
+    let shift = bits.saturating_sub(C::DIRECTION_BITS);
+    (d.0 >> shift, d.1 >> shift)
+}
+
+/// The join of a stroke (`j`): a miter within the limit, the Q32.32 raw
+/// value of `M`, and a bevel past it; a round join; or a bevel
+/// (docs/adr/0027).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Join {
+    Miter(i64),
+    Round,
+    Bevel,
+}
+
+/// The miter limit of 10 as [`Join::Miter`] holds it: the joins of
+/// docs/adr/0003 and docs/adr/0025.
+pub const MITER_10: Join = Join::Miter(10 << 32);
+
+/// The cap of a stroke (`J`): butt, round (docs/adr/0025) or square
+/// (docs/adr/0027).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cap {
+    Butt,
+    Round,
+    Square,
 }
 
 /// Adds the polygon of the join at `v` between the directions `d1` and
-/// `d2` to `out`: a miter if it is within the limit of 10, a bevel otherwise.
-fn join(out: &mut Path, v: Point, d1: (i64, i64), d2: (i64, i64), half: i64) {
+/// `d2` to `out`: a miter if it is within the limit, a bevel otherwise,
+/// or the disc of a round join.
+fn join<C: Coord>(
+    out: &mut PathOf<C>,
+    v: (C, C),
+    d1: (i64, i64),
+    d2: (i64, i64),
+    half: i64,
+    kind: Join,
+    disc: Option<&[(C, C)]>,
+) {
+    if let (Join::Round, Some(disc)) = (kind, disc) {
+        push_disc(out, disc, v);
+        return;
+    }
     let cross = i128::from(d1.0) * i128::from(d2.1) - i128::from(d1.1) * i128::from(d2.0);
     if cross == 0 {
         return;
@@ -986,16 +1186,47 @@ fn join(out: &mut Path, v: Point, d1: (i64, i64), d2: (i64, i64), half: i64) {
     let sign = if cross > 0 { -1 } else { 1 };
     let a = add(v, normal(d1, half * sign));
     let b = add(v, normal(d2, half * sign));
-    match miter(d1, d2, half) {
+    let limit = match kind {
+        Join::Miter(limit) => limit,
+        Join::Round | Join::Bevel => 0,
+    };
+    match miter(d1, d2, half, limit) {
         Some(m) => out.push_positive(&[v, a, add(v, m), b]),
         None => out.push_positive(&[v, a, b]),
     }
 }
 
+/// `a · b` of two u128 values as its high and low words.
+fn mul_wide(a: u128, b: u128) -> (u128, u128) {
+    const MASK: u128 = (1 << 64) - 1;
+    let (a0, a1) = (a & MASK, a >> 64);
+    let (b0, b1) = (b & MASK, b >> 64);
+    let (ll, lh, hl, hh) = (a0 * b0, a0 * b1, a1 * b0, a1 * b1);
+    let mid = (ll >> 64) + (lh & MASK) + (hl & MASK);
+    let lo = (ll & MASK) | ((mid & MASK) << 64);
+    let hi = hh + (lh >> 64) + (hl >> 64) + (mid >> 64);
+    (hi, lo)
+}
+
+/// Whether the miter of the join between directions with the dot product
+/// `dot` and the product of lengths `lens` is within the limit, the Q32.32
+/// raw value of `M`: `M² · (lens + dot) ≥ 2 · lens`, compared exactly in
+/// integers with `M²` as `raw²`, which is `M²` times 2^64
+/// (docs/adr/0027). With `M` 10, this is `100 · dot + 98 · lens ≥ 0`.
+fn within_miter_limit(dot: i128, lens: i128, limit: i64) -> bool {
+    let sum = lens + dot;
+    if sum < 0 {
+        return false;
+    }
+    let squared = u128::from(limit.unsigned_abs()) * u128::from(limit.unsigned_abs());
+    let lens = lens as u128;
+    mul_wide(squared, sum as u128) >= (lens >> 63, lens << 65)
+}
+
 /// The offset of the miter point of the join between the directions `d1`
 /// and `d2` from its vertex, or `None` for a bevel: when the directions
-/// are parallel or the miter ratio is past the limit of 10.
-fn miter(d1: (i64, i64), d2: (i64, i64), half: i64) -> Option<(i64, i64)> {
+/// are parallel or the miter ratio is past the limit.
+fn miter(d1: (i64, i64), d2: (i64, i64), half: i64, limit: i64) -> Option<(i64, i64)> {
     let cross = i128::from(d1.0) * i128::from(d2.1) - i128::from(d1.1) * i128::from(d2.0);
     if cross == 0 {
         return None;
@@ -1008,9 +1239,9 @@ fn miter(d1: (i64, i64), d2: (i64, i64), half: i64) -> Option<(i64, i64)> {
         (i128::from(d.0) * i128::from(d.0) + i128::from(d.1) * i128::from(d.1)) as u128
     };
     let lens = isqrt(len2(d1).saturating_mul(len2(d2))) as i128;
-    // The miter ratio 1 / sin(phi / 2) is at most 10 if (1 − cos phi) · 10² ≥ 2,
+    // The miter ratio 1 / sin(phi / 2) is at most M if (1 − cos phi) · M² ≥ 2,
     // where cos phi = −dot / lens.
-    let within_limit = 100 * dot + 98 * lens >= 0;
+    let within_limit = within_miter_limit(dot, lens, limit);
     let det = i128::from(n1.0) * i128::from(n2.1) - i128::from(n1.1) * i128::from(n2.0);
     if !within_limit || det == 0 {
         return None;
@@ -1029,8 +1260,18 @@ fn miter(d1: (i64, i64), d2: (i64, i64), half: i64) -> Option<(i64, i64)> {
     let den = div_round(den, 1 << 32);
     let half = i128::from(half);
     let part = |a: i128, b: i128| -> Option<i64> {
-        let num = half.checked_mul(a * l2 + b * l1)?;
-        i64::try_from(div_round(num, den)).ok()
+        let sum = a * l2 + b * l1;
+        // A half width of user space may be too large for the product in
+        // i128 (docs/adr/0027): the sum and the divisor then lose the
+        // same low bits. A half width of device space is under 2^27 and
+        // never does.
+        let bits = |v: i128| 128 - v.unsigned_abs().leading_zeros();
+        let shift = (bits(half) + bits(sum)).saturating_sub(126);
+        let (sum, den) = (sum >> shift, den >> shift);
+        if den <= 0 {
+            return None;
+        }
+        i64::try_from(div_round(half * sum, den)).ok()
     };
     Some((part(p1.0, p2.0)?, part(p1.1, p2.1)?))
 }
@@ -1053,24 +1294,35 @@ pub fn stroke(path: &Path, half: i64) -> Path {
 
 /// Adds the polygons of [`stroke`] to `out`.
 pub fn stroke_into(path: &Path, half: i64, out: &mut Path) {
+    let style = Stroke {
+        half,
+        cap: Cap::Butt,
+        join: MITER_10,
+        dash: &[],
+        phase: 0,
+        flatness: FLATNESS,
+    };
     path.subpaths()
-        .for_each(|s| stroke_polyline(s.points, s.closed, half, None, (false, false), out));
+        .for_each(|s| stroke_polyline(s.points, s.closed, &style, None, (false, false), out));
 }
 
 /// Adds the polygons of the stroke of one polyline to `out`: the
 /// quadrilateral of each segment, then the joins between the segments
 /// (and, when it is closed, the join at its start), then, when it is open
 /// and `disc` is the disc of round caps, the disc at each end that `caps`
-/// asks for. Repeated points make no segment; a polyline with no segment
-/// adds nothing.
-fn stroke_polyline(
-    points: &[Point],
+/// asks for. With square caps, the first and the last segment of an open
+/// polyline reach `half` further along their directions at the ends that
+/// `caps` asks for (docs/adr/0027). Repeated points make no segment; a
+/// polyline with no segment adds nothing.
+fn stroke_polyline<C: Coord>(
+    points: &[(C, C)],
     closed: bool,
-    half: i64,
-    disc: Option<&[Point]>,
+    style: &Stroke,
+    disc: Option<&[(C, C)]>,
     caps: (bool, bool),
-    out: &mut Path,
+    out: &mut PathOf<C>,
 ) {
+    let half = style.half;
     // The segments between the points, without the repeated points,
     // and the segment back to the start of a closed subpath.
     let open = points
@@ -1083,8 +1335,28 @@ fn stroke_polyline(
     let (first, last) = (points[0], points[points.len() - 1]);
     let closing = (closed && first != last).then_some((last, first));
     let segments = open.chain(closing);
-    segments.clone().for_each(|(a, b)| {
-        let n = normal(direction(a, b), half);
+    let square = (style.cap == Cap::Square && !closed).then(|| segments.clone().count());
+    segments.clone().enumerate().for_each(|(i, (a, b))| {
+        let d = direction(a, b);
+        let n = normal(d, half);
+        let (a, b) = match square {
+            Some(count) => {
+                let reach = along(d, half);
+                (
+                    if i == 0 && caps.0 {
+                        add(a, neg(reach))
+                    } else {
+                        a
+                    },
+                    if i + 1 == count && caps.1 {
+                        add(b, reach)
+                    } else {
+                        b
+                    },
+                )
+            }
+            None => (a, b),
+        };
         out.push_positive(&[add(a, n), add(b, n), add(b, neg(n)), add(a, neg(n))]);
     });
     let joins = segments.clone().zip(segments.clone().skip(1));
@@ -1093,10 +1365,19 @@ fn stroke_polyline(
         .nth(1)
         .and(closed.then_some(()))
         .and_then(|()| segments.clone().last().zip(segments.clone().next()));
-    joins
-        .chain(around)
-        .for_each(|(p, q)| join(out, p.1, direction(p.0, p.1), direction(q.0, q.1), half));
+    joins.chain(around).for_each(|(p, q)| {
+        join(
+            out,
+            p.1,
+            direction(p.0, p.1),
+            direction(q.0, q.1),
+            half,
+            style.join,
+            disc,
+        )
+    });
     if let Some(disc) = disc
+        && style.cap == Cap::Round
         && !closed
     {
         if caps.0 {
@@ -1109,35 +1390,51 @@ fn stroke_polyline(
 }
 
 /// Adds the disc, a positive polygon around the origin, moved to `center`.
-fn push_disc(out: &mut Path, disc: &[Point], center: Point) {
+fn push_disc<C: Coord>(out: &mut PathOf<C>, disc: &[(C, C)], center: (C, C)) {
     out.starts.push((out.points.len(), true));
-    out.points.extend(
-        disc.iter()
-            .map(|&(x, y)| add(center, (i64::from(x), i64::from(y)))),
-    );
+    out.points
+        .extend(disc.iter().map(|&(x, y)| add(center, (x.wide(), y.wide()))));
 }
 
-/// The style of the stroke of a page's path (docs/adr/0025): half the
-/// width in device units, the caps, and the dash array in units of
-/// 2^−16 device units with its phase, both scaled to the device already,
-/// the phase within the period. An empty array is a solid line.
+/// The style of the stroke of a page's path (docs/adr/0025, 0027): half
+/// the width, the caps, the joins, and the dash array with its phase, the
+/// phase within the period, in the units of the coordinates. In device
+/// space, the half width is in device units, the dashes in units of 2^−16
+/// device units, both scaled to the device already, and the flatness of
+/// the discs is [`FLATNESS`]. In user space, every length is in units of
+/// 2^−32, and the flatness is the one of its curves. An empty array is a
+/// solid line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stroke<'a> {
     pub half: i64,
-    pub round_cap: bool,
+    pub cap: Cap,
+    pub join: Join,
     pub dash: &'a [i64],
     pub phase: i64,
+    pub flatness: i64,
 }
 
 /// The units of the lengths of the dashes in one device unit (1/256 pixel).
 pub const DASH_UNIT: i64 = 1 << 16;
 
 /// The buffers of the strokes of a page, kept between them (docs/adr/0013):
-/// the disc of the round caps, and the points of one dash.
-#[derive(Clone, Debug, Default)]
-pub struct StrokeScratch {
-    disc: Vec<Point>,
-    piece: Vec<Point>,
+/// the disc of the round caps and joins, and the points of one dash.
+pub type StrokeScratch = StrokeScratchOf<i32>;
+
+/// [`StrokeScratch`] for coordinates in `C`.
+#[derive(Clone, Debug)]
+pub struct StrokeScratchOf<C> {
+    disc: Vec<(C, C)>,
+    piece: Vec<(C, C)>,
+}
+
+impl<C> Default for StrokeScratchOf<C> {
+    fn default() -> StrokeScratchOf<C> {
+        StrokeScratchOf {
+            disc: Vec::new(),
+            piece: Vec::new(),
+        }
+    }
 }
 
 /// The factor of the distance of the control points of a quarter circle
@@ -1151,26 +1448,34 @@ const QUARTER_CONTROL: i128 = 36195;
 /// are, then its reflections in the axes, so that the disc is symmetric
 /// in the axes and the diagonals. `half` is below 2^31.
 pub fn disc_into(half: i64, out: &mut Vec<Point>) {
+    disc_flat_into(half, FLATNESS, out);
+}
+
+/// [`disc_into`] in the units of `C`, with the flatness of its curves
+/// (docs/adr/0027). `half` is below 2^62.
+pub fn disc_flat_into<C: Coord>(half: i64, flatness: i64, out: &mut Vec<(C, C)>) {
     out.clear();
-    let h = half as i32;
-    let k = div_round(i128::from(half) * QUARTER_CONTROL, 65536) as i32;
-    out.push((h, 0));
-    flatten_curve_into((h, 0), (h, k), (k, h), (0, h), &Frame::NONE, |p| {
+    let h = C::narrow(half);
+    let k = C::narrow(div_round(i128::from(half) * QUARTER_CONTROL, 65536) as i64);
+    let zero = C::narrow(0);
+    out.push((h, zero));
+    flatten_plain_into((h, zero), (h, k), (k, h), (zero, h), flatness, |p| {
         out.push(p)
     });
+    let flip = |v: C| C::narrow(-v.wide());
     let n = out.len();
     // From (0, half) to (−half, 0), to (0, −half), and back to (half, 0).
     (0..n - 1).rev().for_each(|i| {
         let (x, y) = out[i];
-        out.push((-x, y));
+        out.push((flip(x), y));
     });
     (1..n).for_each(|i| {
         let (x, y) = out[i];
-        out.push((-x, -y));
+        out.push((flip(x), flip(y)));
     });
     (1..n - 1).rev().for_each(|i| {
         let (x, y) = out[i];
-        out.push((x, -y));
+        out.push((x, flip(y)));
     });
 }
 
@@ -1182,22 +1487,23 @@ pub fn disc(half: i64) -> Vec<Point> {
 }
 
 /// The length of a segment in units of 2^−16 device units, rounded down:
-/// `isqrt((dx² + dy²) · 2^32)` (docs/adr/0025).
-pub fn segment_length(a: Point, b: Point) -> i64 {
-    let (dx, dy) = direction(a, b);
+/// `isqrt((dx² + dy²) · 2^32)` (docs/adr/0025). In user space, the units
+/// of its coordinates: `isqrt(dx² + dy²)` (docs/adr/0027).
+pub fn segment_length<C: Coord>(a: (C, C), b: (C, C)) -> i64 {
+    let (dx, dy) = delta(a, b);
     let d2 = (i128::from(dx) * i128::from(dx) + i128::from(dy) * i128::from(dy)) as u128;
     // Most segments are shorter than 256 pixels, where the product fits
     // in u64, whose square root is faster.
     match u32::try_from(d2) {
-        Ok(d2) => (u64::from(d2) << 32).isqrt() as i64,
-        Err(_) => isqrt(d2 << 32) as i64,
+        Ok(d2) => (u64::from(d2) << C::LENGTH_SHIFT).isqrt() as i64,
+        Err(_) => isqrt(d2 << C::LENGTH_SHIFT) as i64,
     }
 }
 
-/// The point `at` units of 2^−16 device units from `a` on the segment to
-/// `b` of `length`: `a + div_round((b − a) · at, length)`, by component.
-fn point_at(a: Point, b: Point, at: i64, length: i64) -> Point {
-    let (dx, dy) = direction(a, b);
+/// The point `at` units of the lengths from `a` on the segment to `b` of
+/// `length`: `a + div_round((b − a) · at, length)`, by component.
+fn point_at<C: Coord>(a: (C, C), b: (C, C), at: i64, length: i64) -> (C, C) {
+    let (dx, dy) = delta(a, b);
     let part = |d: i64| div_round(i128::from(d) * i128::from(at), i128::from(length)) as i64;
     add(a, (part(dx), part(dy)))
 }
@@ -1272,13 +1578,13 @@ impl<'a> Dashes<'a> {
 /// one; both are in the region, where no pixel changes. In a closed
 /// polyline the segment back to the start is dashed as the others, and the
 /// last dash is not joined with the first.
-fn for_each_dash(
-    points: &[Point],
+fn for_each_dash<C: Coord>(
+    points: &[(C, C)],
     closed: bool,
     style: &Stroke,
     frame: &Frame,
-    piece: &mut Vec<Point>,
-    mut emit: impl FnMut(&[Point], (bool, bool)),
+    piece: &mut Vec<(C, C)>,
+    mut emit: impl FnMut(&[(C, C)], (bool, bool)),
 ) {
     let (first, last) = (points[0], points[points.len() - 1]);
     let closing = (closed && first != last).then_some((last, first));
@@ -1352,50 +1658,50 @@ pub fn stroke_styled(path: &Path, style: &Stroke, frame: &Frame) -> Path {
 
 /// Adds the polygons of the stroke of a page's path to `out`: those of
 /// [`stroke_into`], with the disc of a round cap at the ends of each open
-/// subpath, and each subpath cut by the dash array into dashes stroked as
-/// open subpaths (docs/adr/0025). The disc is made once and moved to each
-/// end. A subpath of one point draws nothing; a closed one, or one whose
-/// points are all the same, draws the disc with round caps when the dash
-/// array is on at its start (ISO 32000-1 8.5.3.2). The frame is the one
-/// of the margin of the stroke, beyond which a dashed segment only moves
-/// along the array.
-pub fn stroke_styled_into(
-    path: &Path,
+/// subpath and of a round join at each vertex, and each subpath cut by the
+/// dash array into dashes stroked as open subpaths (docs/adr/0025,
+/// docs/adr/0027). The disc is made once and moved to each end. A subpath
+/// of one point draws nothing; a closed one, or one whose points are all
+/// the same, draws the disc with round caps when the dash array is on at
+/// its start (ISO 32000-1 8.5.3.2). The frame is the one of the margin of
+/// the stroke, beyond which a dashed segment only moves along the array.
+pub fn stroke_styled_into<C: Coord>(
+    path: &PathOf<C>,
     style: &Stroke,
     frame: &Frame,
-    scratch: &mut StrokeScratch,
-    out: &mut Path,
+    scratch: &mut StrokeScratchOf<C>,
+    out: &mut PathOf<C>,
 ) {
-    let StrokeScratch { disc, piece } = scratch;
-    let round = style.round_cap.then(|| {
-        disc_into(style.half, disc);
+    let StrokeScratchOf { disc, piece } = scratch;
+    let round = (style.cap == Cap::Round || style.join == Join::Round).then(|| {
+        disc_flat_into(style.half, style.flatness, disc);
         disc.as_slice()
     });
-    let half = style.half;
+    let round_cap = round.filter(|_| style.cap == Cap::Round);
     path.subpaths().for_each(|s| {
         let points = s.points;
         if points.iter().all(|&p| p == points[0]) {
             let on = style.dash.is_empty() || Dashes::start(style.dash, style.phase).on();
-            if let Some(disc) = round
+            if let Some(disc) = round_cap
                 && (s.closed || points.len() > 1)
                 && on
             {
                 push_disc(out, disc, points[0]);
             }
         } else if style.dash.is_empty() {
-            stroke_polyline(points, s.closed, half, round, (true, true), out);
+            stroke_polyline(points, s.closed, style, round, (true, true), out);
         } else {
             for_each_dash(points, s.closed, style, frame, piece, |dash, caps| {
                 if dash.iter().all(|&p| p == dash[0]) {
                     // A dash of no length is a disc with round caps.
-                    if let Some(disc) = round
+                    if let Some(disc) = round_cap
                         && caps.0
                         && caps.1
                     {
                         push_disc(out, disc, dash[0]);
                     }
                 } else {
-                    stroke_polyline(dash, false, half, round, caps, out);
+                    stroke_polyline(dash, false, style, round, caps, out);
                 }
             });
         }
@@ -1466,6 +1772,35 @@ impl Canvas {
             } else {
                 paint_run(run, alphas, |p, a| paint_bytes(p, a, rgb));
             }
+        });
+    }
+
+    /// [`Canvas::fill`] within a clip: the opacity of each pixel is
+    /// `div_round(a × c, 255)` of its coverage and its clip
+    /// (docs/adr/0027). The pixels outside the box of the clip are left.
+    pub fn fill_within(
+        &mut self,
+        path: &Path,
+        rule: FillRule,
+        rgb: [u8; 3],
+        scratch: &mut Scratch,
+        clip: &Clip,
+    ) {
+        if clip.is_empty() {
+            return;
+        }
+        let (width, height) = (self.width, self.height);
+        visit_rows(path, rule, width, height, scratch, |y, x0, alphas| {
+            let Some((range, clips)) = clip.span(y, x0, x0 + alphas.len()) else {
+                return;
+            };
+            let run = &mut self.pixels[(y * width + range.start) * 3..][..range.len() * 3];
+            run.as_chunks_mut::<3>()
+                .0
+                .iter_mut()
+                .zip(&alphas[range.start - x0..range.end - x0])
+                .zip(clips)
+                .for_each(|((p, &a), &c)| paint_bytes(p, mul_alpha(a, c), rgb));
         });
     }
 }
