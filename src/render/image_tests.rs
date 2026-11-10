@@ -672,6 +672,58 @@ fn errors_of_images() {
 }
 
 #[test]
+fn an_indexed_decode_is_absent_or_zero_to_hival() {
+    // docs/adr/0029: hival 3; [3 0] (the inversion of the components) and
+    // [0 1] are errors, [0 3] is the default.
+    let indexed = "/ColorSpace [/Indexed /DeviceGray 3 <104080f0>] /BitsPerComponent 8";
+    let samples = [0, 1, 2, 3];
+    let plain = two_by_two(indexed, &samples);
+    assert_eq!(plain.pixel(0, 0), [0x10; 3]);
+    assert_eq!(plain.pixel(1, 0), [0x40; 3]);
+    assert_eq!(plain.pixel(0, 1), [0x80; 3]);
+    assert_eq!(plain.pixel(1, 1), [0xf0; 3]);
+    assert_eq!(
+        two_by_two(&format!("{indexed} /Decode [0 3]"), &samples),
+        plain
+    );
+    let fails = |decode: &str| {
+        error(
+            "0 0 2 2",
+            "q 2 0 0 2 0 0 cm /X1 Do Q",
+            &[image(
+                &format!("/Width 2 /Height 2 {indexed} /Decode {decode}"),
+                &samples,
+            )],
+        )
+    };
+    let e = fails("[3 0]");
+    assert!(e.contains("unsupported Decode [3 0]"), "{e}");
+    let e = fails("[0 1]");
+    assert!(e.contains("unsupported Decode [0 1]"), "{e}");
+    let e = fails("[0 3 0 3]");
+    assert!(e.contains("unsupported Decode"), "{e}");
+}
+
+#[test]
+fn a_ctm_beyond_2_57_is_an_error_of_the_corners_first() {
+    // docs/adr/0029 says an image whose CTM has an entry above 2^57 is
+    // `image outside the range of coordinates`. The corners of the unit
+    // square are mapped to the device before the mapping is made, and such a
+    // CTM fails there; the bound of the mapping is tested in
+    // src/picture/tests.rs. The page is an error, "arithmetic overflow" of
+    // the corners, and the message of the ADR is not reachable through `Do`.
+    let e = error(
+        "0 0 2 2",
+        "q 100000000 0 0 2 0 0 cm /X1 Do Q",
+        &[image(
+            "/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &[0],
+        )],
+    );
+    assert!(e.contains("arithmetic overflow"), "{e}");
+}
+
+#[test]
 fn errors_of_smasks() {
     let with_mask = |mask: (String, Vec<u8>)| {
         error(

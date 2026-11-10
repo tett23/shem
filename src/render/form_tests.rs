@@ -281,6 +281,36 @@ fn text_and_groups_in_a_form_are_errors() {
 }
 
 #[test]
+fn a_font_selection_outside_bt_is_allowed_in_a_form() {
+    // docs/adr/0029: only BT is an error; Tz and Tr outside a text object
+    // are read as they are on a page, and the form draws on.
+    let content = "100 Tz 0 Tr 0 0 10 10 re f";
+    let c = draw(
+        "0 0 20 20",
+        "/X1 Do",
+        &[form(
+            &format!("/BBox [0 0 100 100] {NO_RESOURCES}"),
+            content,
+        )],
+    );
+    assert_eq!(c, plain("0 0 20 20", content));
+    assert_eq!(c.pixel(0, 19), [0, 0, 0]);
+    assert_eq!(c.pixel(15, 0), [255, 255, 255]);
+    // Tf is read too: it gets as far as looking up the font, which this
+    // form does not have, and the error is the one of the page, not
+    // "text in a form" or an unsupported operator.
+    let e = error(
+        "0 0 20 20",
+        "/X1 Do",
+        &[form(
+            &format!("/BBox [0 0 100 100] {NO_RESOURCES}"),
+            "/F1 12 Tf",
+        )],
+    );
+    assert!(e.ends_with("offset 7: no font F1 in the resources"), "{e}");
+}
+
+#[test]
 fn the_errors_of_a_form_name_its_object_and_offset() {
     let e = error(
         "0 0 20 20",

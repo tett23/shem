@@ -697,6 +697,41 @@ fn pdf_with_an_image_on_the_third_page(dict: &str, data: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn nothing_is_written_when_a_stroke_of_a_later_page_is_an_error() {
+    // docs/adr/0025, 0028: the checks of the strokes (a dash period under
+    // 1/16 pixel under a general CTM, a user point beyond 2^30 points) find
+    // the error of the third page before any file is written.
+    let dir = scratch("broken-stroke");
+    let cases = [
+        (
+            "2 0 0 1 0 0 cm [0.001 0.001] 0 d 1 w 0 5 m 10 5 l S",
+            "dash pattern shorter than 1/16 pixel",
+        ),
+        (
+            "0.001 0 0 0.5 0 0 cm 2 w 1073741824 5 m 1073741824 8 l S",
+            "stroke outside the range of coordinates",
+        ),
+    ];
+    cases.iter().enumerate().for_each(|(i, (content, text))| {
+        let input = write_pdf(
+            &dir,
+            &format!("stroke-{i}.pdf"),
+            &pdf(&["0 0 1 1 re f", "", content], "0 0 20 10"),
+        );
+        let out = dir.join(format!("out-{i}"));
+        let (code, stdout, stderr) = shem(&["render", &input, out.to_str().unwrap()]);
+        assert_eq!(code, 1, "{stderr}");
+        assert_eq!(stdout, "");
+        assert!(
+            stderr.starts_with(&format!("shem: {input}: page 3: ")),
+            "{stderr}"
+        );
+        assert!(stderr.contains(text), "{stderr}");
+        assert!(files(&out).is_empty());
+    });
+}
+
+#[test]
 fn nothing_is_written_when_a_jpeg_of_a_later_page_is_broken() {
     // docs/adr/0027: the check decodes the JPEG, so one that is cut off, or
     // whose size is not that of the dictionary, on the third page stops the

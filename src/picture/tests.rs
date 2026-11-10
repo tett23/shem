@@ -146,3 +146,94 @@ fn packed_reads_components_from_the_top_bit() {
     assert_eq!(packed(&[0x5A, 0xF1], 3, 4), 1);
     assert_eq!(packed(&[0x12, 0x34], 0, 16), 0x1234);
 }
+
+#[test]
+fn the_mapping_refuses_entries_beyond_2_57() {
+    // docs/adr/0029. The renderer maps the corners of the unit square to
+    // the device first, which fails for such a CTM with its own error, so
+    // this bound is defensive; it is tested on `Mapping::new` itself.
+    let at = |raw: i64| {
+        let mut m = Matrix::IDENTITY;
+        m.a = Fixed::from_raw(raw);
+        Mapping::new(&m, 2, 2, None)
+    };
+    assert!(at(1 << 57).unwrap().is_some());
+    let message = "image outside the range of coordinates";
+    assert_eq!(
+        at((1 << 57) + 1).err().map(|e| e.to_string()).as_deref(),
+        Some(message)
+    );
+    assert_eq!(
+        at(-(1 << 57) - 1).err().map(|e| e.to_string()).as_deref(),
+        Some(message)
+    );
+    for entry in 0..6 {
+        let mut m = Matrix::IDENTITY;
+        let big = Fixed::from_raw(1 << 58);
+        match entry {
+            0 => m.a = big,
+            1 => m.b = big,
+            2 => m.c = big,
+            3 => m.d = big,
+            4 => m.e = big,
+            _ => m.f = big,
+        }
+        assert_eq!(
+            Mapping::new(&m, 2, 2, None)
+                .err()
+                .map(|e| e.to_string())
+                .as_deref(),
+            Some(message),
+            "entry {entry}"
+        );
+    }
+}
+
+fn picture_of(bytes: usize) -> Picture {
+    // Zeroed memory that the test never touches, so it costs no pages.
+    Picture {
+        width: bytes / 3,
+        height: 1,
+        rgb: vec![0; bytes],
+        mask: None,
+    }
+}
+
+#[test]
+fn the_cache_keeps_pictures_up_to_its_budget_and_decodes_the_rest_again() {
+    // docs/adr/0029: 2^28 bytes. Two pictures of 2^27 fill it; a third is
+    // returned but not kept, so it is loaded again each time it is asked
+    // for. The pictures that are kept are loaded once.
+    let cache = PictureCache::new();
+    let loads = std::sync::atomic::AtomicUsize::new(0);
+    let get = |num: u32, bytes: usize| {
+        cache
+            .get(num, || {
+                loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(picture_of(bytes))
+            })
+            .unwrap()
+    };
+    let half = PictureCache::BUDGET / 2;
+    assert_eq!(get(1, half).bytes(), half);
+    assert_eq!(get(2, half).bytes(), half);
+    assert!(cache.cached(1).is_some() && cache.cached(2).is_some());
+    assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // Kept: no load.
+    get(1, half);
+    get(2, half);
+    assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // Beyond the budget by one byte: given back, not kept, loaded again.
+    assert_eq!(get(3, 3).bytes(), 3);
+    assert!(cache.cached(3).is_none());
+    get(3, 3);
+    assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 4);
+    // The budget is exact: a cache with one byte to spare keeps a picture
+    // of that size.
+    let cache = PictureCache::new();
+    cache.get(1, || Ok(picture_of(half))).unwrap();
+    cache
+        .get(2, || Ok(picture_of(PictureCache::BUDGET - half)))
+        .unwrap();
+    assert!(cache.cached(2).is_some());
+}

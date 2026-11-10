@@ -501,6 +501,126 @@ fn an_unknown_adobe_transform_is_an_error() {
 }
 
 #[test]
+fn the_adobe_transform_of_three_components_and_the_one_of_a_single_component() {
+    // docs/adr/0028: transform 2 with 3 components is an error, 0 leaves
+    // the components as they are; a single component does not look at it.
+    let data = fixture("ycbcr-adobe.jpg");
+    let (_, start, _) = segments(&data)
+        .into_iter()
+        .find(|&(m, _, _)| m == 0xEE)
+        .unwrap();
+    let at = start + 4 + 11;
+    assert_eq!(data[at], 1);
+    let mut two = data.clone();
+    two[at] = 2;
+    assert_eq!(
+        decode(&two).unwrap_err().message(),
+        "unsupported JPEG APP14 transform 2 with 3 components"
+    );
+    let mut none = data.clone();
+    none[at] = 0;
+    let raw = decode(&none).unwrap();
+    let converted = decode(&data).unwrap();
+    assert_eq!(raw.samples.len(), converted.samples.len());
+    assert_ne!(raw.samples, converted.samples);
+    // One component: an APP14 of transform 1 or 2, which means nothing for
+    // it, after SOI changes nothing; a transform above 2 is still an error
+    // of the marker.
+    let gray = fixture("gray.jpg");
+    let with = |t: u8| {
+        let mut with = gray[..2].to_vec();
+        with.extend([0xFF, 0xEE, 0, 14]);
+        with.extend(b"Adobe");
+        with.extend([0, 100, 0, 0, 0, 0, t]);
+        with.extend(&gray[2..]);
+        with
+    };
+    for t in [0, 1, 2] {
+        assert_eq!(decode(&with(t)).unwrap(), decode(&gray).unwrap(), "{t}");
+    }
+    assert_eq!(
+        decode(&with(7)).unwrap_err().message(),
+        "unsupported JPEG APP14 transform 7"
+    );
+}
+
+#[test]
+fn a_precision_other_than_8_and_12_is_unsupported() {
+    let data = fixture("baseline-444.jpg");
+    let (_, start, _) = segments(&data)
+        .into_iter()
+        .find(|&(m, _, _)| m == 0xC0)
+        .unwrap();
+    for p in [0u8, 2, 16] {
+        let mut bad = data.clone();
+        bad[start + 4] = p;
+        assert_eq!(
+            decode(&bad).unwrap_err().message(),
+            format!("unsupported JPEG precision {p}")
+        );
+    }
+}
+
+#[test]
+fn the_scan_parameters_of_a_sequential_frame_are_0_63_0_0() {
+    // docs/adr/0028: Ss, Se and Ah/Al of a sequential scan.
+    let data = fixture("baseline-420.jpg");
+    let sos = segments(&data)
+        .into_iter()
+        .find(|&(m, _, _)| m == 0xDA)
+        .unwrap();
+    let params = sos.2 - 3;
+    assert_eq!(&data[params..params + 3], &[0, 63, 0]);
+    for (offset, value) in [(0, 1u8), (1, 7), (2, 0x01), (2, 0x10)] {
+        let mut bad = data.clone();
+        bad[params + offset] = value;
+        assert_eq!(
+            decode(&bad).unwrap_err().message(),
+            "corrupt JPEG data: scan parameters of a sequential frame",
+            "byte {offset} = {value}"
+        );
+    }
+}
+
+#[test]
+fn idct_of_extreme_coefficients_is_clamped_and_does_not_overflow() {
+    // docs/adr/0028: the intermediate values are i64; a corrupt 12-bit
+    // block, which a quantization table can multiply to i32::MAX, gives
+    // samples within the range.
+    for precision in [8u8, 12] {
+        let max = (1u16 << precision) - 1;
+        for pattern in 0..4 {
+            let coefs: [i32; 64] = std::array::from_fn(|k| match pattern {
+                0 => i32::MAX,
+                1 => i32::MIN,
+                2 => {
+                    if k % 2 == 0 {
+                        i32::MAX
+                    } else {
+                        i32::MIN
+                    }
+                }
+                _ => {
+                    if k == 0 {
+                        i32::MAX
+                    } else {
+                        i32::MIN
+                    }
+                }
+            });
+            let out = idct_islow(&coefs, precision);
+            assert!(out.iter().all(|&v| v <= max), "{precision} {pattern}");
+        }
+    }
+    // A DC term far beyond the range saturates, as the vectors do.
+    let mut coefs = [0i32; 64];
+    coefs[0] = i32::MAX;
+    assert_eq!(idct_islow(&coefs, 12), [4095u16; 64]);
+    coefs[0] = i32::MIN;
+    assert_eq!(idct_islow(&coefs, 12), [0u16; 64]);
+}
+
+#[test]
 fn corrupted_data_never_panics() {
     // Every byte of each fixture overwritten in turn (by a value of the
     // generator, by 0xFF and by 0), and every truncation of the smallest
