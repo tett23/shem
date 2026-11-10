@@ -11,6 +11,7 @@ v1 では、汎用の PDF のラスタライザを目指す（[roadmap.md](roadm
 ## 状態
 
 v0.1 の範囲（[ADR 0001](adr/0001-scope-golem-contract-and-determinism.md)〜[0012](adr/0012-parallel-library-api.md)）、musl の配布物でスレッドを増やすと遅くなる問題の修正（[ADR 0013](adr/0013-fewer-allocations-for-musl-threads.md)）、スレッドごとの作業用の場所と、検査と塗りの高速化（[ADR 0014](adr/0014-thread-workspaces-and-faster-check-and-fill.md)）、PNG の書き出し、描画、Flate の展開の高速化（[ADR 0015](adr/0015-faster-png-render-and-decoding.md)）、ブラウザと Deno で動かす wasm のモジュール（[ADR 0018](adr/0018-wasm-module-for-the-browser.md)）、Deflate の探索、密な格子の掃き出し、演算子の数の高速化（[ADR 0019](adr/0019-faster-deflate-sweep-and-operands.md)）、交点の持ち越しを i64 のどの座標でも正しくする変更（[ADR 0020](adr/0020-carried-crossings-for-every-i64.md)）、悪意のある入力への上限（[ADR 0021](adr/0021-limits-on-hostile-input.md)）、キャンバスの外の線分と曲線に時間をかけない変更（[ADR 0022](adr/0022-no-work-for-geometry-off-the-canvas.md)）、線の継ぎ目の miter の点の求め方（[ADR 0023](adr/0023-miter-points-within-the-limit.md)）、リリースの出自の証明と、CI とリリースの固定と保護（[ADR 0024](adr/0024-provenance-and-pinning-for-ci-and-releases.md)）、ページのパスの線と、丸い線端と破線（[ADR 0025](adr/0025-strokes-of-paths-with-round-caps-and-dashes.md)、[ADR 0026](adr/0026-corrections-to-round-caps-and-dashes.md)）を実装し、v0.1.0-rc8 をプレリリースとして出した。
+その後、画像と図版の中身の描画（[ADR 0027](adr/0027-images-and-figures.md)、[ADR 0028](adr/0028-details-left-open-by-images-and-figures.md)、[ADR 0029](adr/0029-details-left-open-by-images-and-forms.md)）と、Form の展開、切り抜きの入れ子、JPEG の走査の上限（[ADR 0030](adr/0030-limits-on-forms-clips-and-jpeg-scans.md)）を実装した。
 版ごとの計画は [roadmap.md](roadmap.md) にある。
 
 ## コマンド
@@ -133,6 +134,9 @@ v0.1 は、今の Golem の Writer が書く PDF の部分集合を読む（[ADR
 - CFF の一つのグリフの解釈は、本体とサブルーチンの数と演算子を一つずつ数えて 65,536 段までとし、超えれば `charstring longer than 65536 steps` のエラーにする。呼び出しの深さ（10）と引数のスタック（48）の上限は変わらない。
 - TrueType の一つのアウトラインが読むグリフは、自身と部品を合わせて 256 個までとし、超えれば `composite glyph of more than 256 glyphs` のエラーにする。入れ子の深さ（8）の上限は変わらない。
 - 一つのストリームの伸長の後の大きさは 2^26 バイト（64 MiB）までとする。上限を超えるバイトを書く前に `decoded data larger than 67108864 bytes` のエラーにするので、伸長に確保するメモリは上限の 2 倍を超えない。`Contents` の配列は、ストリームごとに上限を当てる。文書全体の上限は置かない。
+- 一つのページで置く Form は、入れ子の中のものも数えて 4,096 回までとし、超えれば `more than 4096 forms in a page` のエラーにする。一つのページで解釈する Form の内容は合計 2^26 バイトまでとし、超えれば `form contents larger than 67108864 bytes in a page` のエラーにする（[ADR 0030](adr/0030-limits-on-forms-clips-and-jpeg-scans.md)）。
+- `q` の入れ子は、ページと Form を通して（Form の `Do` の `q` を含めて）64 段までとし、超えれば `q nested deeper than 64` のエラーにする。同時に残る切り抜き（`W`、`W*`、Form の `BBox`）は 16 個までとし、超えれば `clips nested deeper than 16` のエラーにする。切り抜きの数は、覆いを作らない検査でも数える（[ADR 0030](adr/0030-limits-on-forms-clips-and-jpeg-scans.md)）。
+- 一つの JPEG の走査は 256 個までとし、超えれば `JPEG with more than 256 scans` のエラーにする（[ADR 0030](adr/0030-limits-on-forms-clips-and-jpeg-scans.md)）。
 - Form の入れ子は、ページを 0 段目として 8 段までとし、9 段目の Form で `forms nested deeper than 8` のエラーにする（[ADR 0027](adr/0027-images-and-figures.md)）。一つの画像の標本は `Width × Height × 成分の数` が 2^26 までとし、超えれば標本を読む前に `image larger than 67108864 samples` のエラーにする。画像の標本の伸長は、標本の大きさで打ち切る。
 
 ## 描画
@@ -157,7 +161,7 @@ v0.1 は、今の Golem の Writer が書く PDF の部分集合を読む（[ADR
 - `S` のパスの平坦化した点の x と y の絶対値に余白 `16 · half + 16` を足した値が `2^31 − 1` を超えれば、`stroke outside the range of coordinates` のエラーにする。これらのエラーは、画素を描かない検査で見つける。
 - ここまでの線の規則は、CTM が角を保つ（`a == d && −b == c` か `−a == d && b == c`）ときのものである。角を保たない CTM での線は、利用者の空間で線の多角形を作り、その点を CTM で装置の空間に写して丸める（[ADR 0027](adr/0027-images-and-figures.md)）。利用者の空間の点は Q32.32 の値（2^−32 単位の整数）で持ち、`half` は線の幅の半分、破線の要素と位相は利用者の空間の値のままとする。線端の円板と継ぎ目は利用者の空間の円で作るので、装置の空間では楕円になる。
 - 角を保たない CTM での曲線は、利用者の空間で、制御点の二階差分が `2^60 / S` 以下になるまで中点で二分する。`S` は `isqrt(a² + b² + c² + d²) + 1`（Q32.32 の値の整数の平方根に 1 を足した、拡大率の上界）である。キャンバスの外の平坦化は省かない。破線の周期は、`S` を掛けた値が 1/16 画素未満（`周期 · S < 2^60`）なら `dash pattern shorter than 1/16 pixel` のエラーにする。
-- 角を保たない CTM での線は、継ぎ目と法線の計算のために、区間の方向の成分を 2^32 未満にシフトする。利用者の空間の点の絶対値が 2^62 以上なら `stroke outside the range of coordinates` のエラーにする。多角形の点を装置の空間に写した値が `2^31 − 1` を超えても同じエラーにする。幅 0 の線は `zero-width stroke with a CTM that does not keep angles` のエラーにする。これらのエラーも、画素を描かない検査で見つける。
+- 角を保たない CTM での線は、継ぎ目と法線の計算のために、区間の方向の成分を 2^28 未満にシフトする（[ADR 0028](adr/0028-details-left-open-by-images-and-figures.md)）。利用者の空間の点の絶対値が 2^62 以上なら `stroke outside the range of coordinates` のエラーにする。多角形の点を装置の空間に写した値が `2^31 − 1` を超えても同じエラーにする。幅 0 の線は `zero-width stroke with a CTM that does not keep angles` のエラーにする。これらのエラーも、画素を描かない検査で見つける。
 - 線分の交点は、キャンバスの行（y が 0 以上、高さ以下）と列（x が 0 以上、幅以下）の中だけを求める（[ADR 0022](adr/0022-no-work-for-geometry-off-the-canvas.md)）。キャンバスの右と上下のセルは捨て、左のセルは行ごとに列 −1 の一つのセルにまとめて cover だけを足す。
 - 曲線の二分は、部分の曲線の四つの制御点がすべてキャンバスの上（y が −m 以下）、下（y が高さ + m 以上）、右（x が幅 + m 以上）、左（x が −m − 1 以下）のどれか一つの領域にあれば、そこで止めて部分の曲線を一本の線分にする。余白 `m` は、`0 Tr` の字では 0、`2 Tr` の字では線の幅の半分 `half`（装置の単位）に対して `16 · half + 16` とする。
 - ページのパスの `c` の余白は、`c` を読んだときのグラフィックスの状態で決める（[ADR 0025](adr/0025-strokes-of-paths-with-round-caps-and-dashes.md)）。実線（空の配列）で CTM が角を保てば `16 · half + 16`、破線なら平坦化を省かず、CTM が角を保たなければ 0 とする。`f` の画素は余白によらない。

@@ -37,11 +37,11 @@ v1 の範囲は、まだ決めていない。
 
 - ファイルの構造：xref のストリーム、オブジェクトのストリーム、増分更新
 - フィルタ：`LZWDecode`、`RunLengthDecode`、`ASCIIHexDecode`、`ASCII85Decode`、予測子
-- 内容のストリーム：すべての演算子（切り抜き、square の線端 `2 J`、角の種類 `j`、miter の上限 `M`、インライン画像、Type 3 のフォントの `d0` と `d1` を含む）
+- 内容のストリーム：すべての演算子（インライン画像、Type 3 のフォントの `d0` と `d1`、`s`、`b`、`b*`、`g`、`G`、`rg`、`RG`、`gs`、`sh` を含む）
 - 文字：単純なフォント（Type 1、TrueType、Type 3）、埋め込みの CMap
-- 色：DeviceRGB、ICCBased、CalGray、CalRGB、Lab、Indexed、DeviceN、パターン、シェーディング
+- 色：DeviceRGB、ICC のプロファイルによる変換、CalGray、CalRGB、Lab、DeviceN、パターン、シェーディング
 - 透明：透明のグループ、ソフトマスク、ブレンドのモード、`ExtGState`
-- 画像：`DCTDecode`、`CCITTFaxDecode`、`JBIG2Decode`、`JPXDecode` の復号
+- 画像：`CCITTFaxDecode`、`JBIG2Decode`、`JPXDecode` の復号、JPEG の算術符号とロスレスと階層の符号化
 
 ## 目視検査の項目
 
