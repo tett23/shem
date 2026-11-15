@@ -11,7 +11,7 @@ v1 では、汎用の PDF のラスタライザを目指す（docs/roadmap.md）
 - **docs/roadmap.md** 版ごとの計画（v0.1、v0.x、v1 の範囲）と、まだ実装していない項目を置く。specifications.md には今の振る舞いだけを書き、版の予定を書かない。
 - **docs/adr/** ADR を置く。ファイル名は `0001-feature-details.md` のように連番の prefix と kebab-case の名前を付ける。内容はグローバルの CLAUDE.md の構成（ステータス、文脈、実装すること、実装しないこと、テスト設計、トレードオフ、参考文献）に従う。日本語で書く。
   - コミット済みの ADR はステータスの行とリンクを除き変更不可（adr-guard が強制する）。変更が必要な場合は新たな ADR を作成する。
-  - ADR は行頭が `ステータス:` のステータスの行をちょうど一つ持つ。
+  - ADR は行頭が `Status:` のステータスの行をちょうど一つ持つ。書き方は CONTRIBUTING.md の ADR の節と [ADR 0032](docs/adr/0032-update-adr-guard-to-v0.13.1.md) に従う。新しい ADR は `Status: proposed` でコミットし、採択は次のコミットで `accepted` か `accepted-pending` に変える（adr-guard が状態の遷移を検査する）。
   - ADR からソースコードを参照するときは、コミットのハッシュを含む GitHub の URL で書く。Golem のコードを参照するときも同じ。
 - **docs/audit/**、**docs/benchmarks/** 監査と性能計測の記録。コミット済みのものは変更、削除、移動不可。
 - **src/** 実装。

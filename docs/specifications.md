@@ -354,9 +354,11 @@ README.md と CONTRIBUTING.md は英語を正とし、README.ja.md と CONTRIBUT
 
 ## ADR の検査
 
-ADR の検査には adr-guard の v0.10.0 を使う（[ADR 0017](adr/0017-update-adr-guard-to-v0.10.0.md)）。
+ADR の検査には adr-guard の v0.13.1 を使う（[ADR 0017](adr/0017-update-adr-guard-to-v0.10.0.md)、[ADR 0032](adr/0032-update-adr-guard-to-v0.13.1.md)）。
 
 - git の pre-commit の hook と CI は、コミット済みの ADR がステータスの行とリンクを除いて変わらないことを検査する。
+- ADR のステータスの行は `Status: <トークン>` の形で書く。トークンは `proposed`、`accepted`、`accepted-pending`、`superseded-pending`、`rejected`、`discarded`、`deprecated`、または `superseded [<変更の JSON 配列>]` である。すべての ADR を、[ADR 0032](adr/0032-update-adr-guard-to-v0.13.1.md) でこの形に移した。
+- git の pre-commit の hook と CI は、ステータスの状態の遷移も検査する。新しい ADR は `Status: proposed` で追加し、後のコミットで採択する。
 - CI は、`docs/adr/` で番号が重複した ADR がないことも検査する。
 - 文書の ADR の参照には、`adr-guard links --fix` でリンクを付ける。ほかのリポジトリの ADR を指すときは、外部リンクの中に書く。
 

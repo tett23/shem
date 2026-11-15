@@ -8,11 +8,11 @@
 ## 開発環境
 
 `rust-toolchain.toml` の版の Rust のツールチェーンを使う。リポジトリの中では rustup がその版を選び、`rustup toolchain install` でインストールできる。
-[adr-guard](https://github.com/tett23/adr-guard) の v0.10.0 以降をインストールし、クローンしたら git の hook を有効にする。
+[adr-guard](https://github.com/tett23/adr-guard) の v0.13.1 以降をインストールし、クローンしたら git の hook を有効にする。
 この設定はリポジトリに保存されないため、クローンのたびに実行する。
 
 ```sh
-cargo install --git https://github.com/tett23/adr-guard --tag v0.10.0
+cargo install --git https://github.com/tett23/adr-guard --tag v0.13.1
 git config core.hooksPath .githooks
 ```
 
@@ -45,10 +45,12 @@ v1 では、汎用の PDF のラスタライザを目指す。
 ## ADR
 
 - ADR は `docs/adr/` に置き、`0001-scope-and-determinism.md` のように、連番と、読んでわかる kebab-case の名前を付ける。
-- ADR は、`ステータス:` で始まるステータスの行をちょうど一つ持つ。
+- ADR は、ステータスの行 `Status: <トークン>` をちょうど一つ持つ。トークンは `proposed`、`accepted`、`accepted-pending`、`superseded-pending`、`rejected`、`discarded`、`deprecated`、または変更の JSON 配列を伴う `superseded [<変更>]` である（[ADR 0032](docs/adr/0032-update-adr-guard-to-v0.13.1.md)）。
+- 新しい ADR は `Status: proposed` でコミットし、後のコミットでステータスを `accepted` か `accepted-pending` に変えて採択する。adr-guard が pre-commit の hook と CI でステータスの遷移を検査する。
 - コミットした ADR は、ステータスの行とリンクを除いて変えない。adr-guard が pre-commit の hook と CI でこれを強制する。決定を変えるときは、古い ADR を置き換える新しい ADR を書く。
+- 新しい ADR が古い ADR の一部を置き換えるときは、古い ADR のステータスを `superseded [{"part":"<部分>","by":["docs/adr/<新しい ADR>.md"]}]` にする。ADR の全体を置き換えるときは、部分を `null` にする。`adr-guard trace` がこの変更をたどる。
 - 二つの ADR が同じ番号を持つことはない。CI が adr-guard でこれを検査する（[ADR 0017](docs/adr/0017-update-adr-guard-to-v0.10.0.md)）。
-- ADR を破棄するときは、ステータスを `破棄` にし、理由を docs/specifications.md に書く。
+- ADR を破棄するときは、ステータスを `discarded` にし、理由を docs/specifications.md に書く。
 - ADR からソースコードを参照するときは、コミットのハッシュを含む GitHub の URL で書く。`main` は rebase しないので、その URL は変わらない。
 - ADR は、決定に使った文献を末尾に挙げる。
 - ADR や文書を書いたら、`adr-guard links --fix` で ADR の参照にリンクを付ける。
