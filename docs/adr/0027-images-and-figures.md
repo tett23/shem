@@ -1,6 +1,6 @@
 # ADR 0027: 画像と図版の中身を描く
 
-ステータス: 採択→決めていなかった細部は[ADR 0028](0028-details-left-open-by-images-and-figures.md)、[ADR 0029](0029-details-left-open-by-images-and-forms.md)
+Status: superseded [{"by":["docs/adr/0028-details-left-open-by-images-and-figures.md","docs/adr/0029-details-left-open-by-images-and-forms.md"],"part":"決めていなかった細部"}]
 
 ## 文脈
 

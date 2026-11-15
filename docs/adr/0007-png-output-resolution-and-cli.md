@@ -1,6 +1,6 @@
 # ADR 0007: PNG の書き出し、解像度、CLI の形
 
-ステータス: 採択→並列の描画は[ADR 0009](0009-render-pages-in-parallel.md)、差分の画像は[ADR 0010](0010-diff-images.md)
+Status: superseded [{"by":["docs/adr/0009-render-pages-in-parallel.md"],"part":"並列の描画"},{"by":["docs/adr/0010-diff-images.md"],"part":"差分の画像"}]
 
 ## 文脈
 

@@ -1,6 +1,6 @@
 # ADR 0001: 目的と版ごとの範囲、Golem との取り決め、決定性の約束
 
-ステータス: 採択→スレッドの使用は[ADR 0009](0009-render-pages-in-parallel.md)
+Status: superseded [{"by":["docs/adr/0009-render-pages-in-parallel.md"],"part":"スレッドの使用"}]
 
 ## 文脈
 
