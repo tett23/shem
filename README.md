@@ -150,10 +150,10 @@ A panic would be a trap (`WebAssembly.RuntimeError`); then load a new instance.
 
 ## Development
 
-Install [adr-guard](https://github.com/tett23/adr-guard) v0.10.0 or later, and enable the git hooks in each clone.
+Install [adr-guard](https://github.com/tett23/adr-guard) v0.13.1 or later, and enable the git hooks in each clone.
 
 ```sh
-cargo install --git https://github.com/tett23/adr-guard --tag v0.10.0
+cargo install --git https://github.com/tett23/adr-guard --tag v0.13.1
 git config core.hooksPath .githooks
 ```
 

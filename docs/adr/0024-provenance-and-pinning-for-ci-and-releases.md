@@ -1,6 +1,6 @@
 # ADR 0024: リリースの出自の証明と、CI とリリースの固定と保護
 
-ステータス: 採択
+Status: superseded [{"by":["docs/adr/0032-update-adr-guard-to-v0.13.1.md"],"part":"adr-guard の action を固定するコミット"}]
 
 ## 文脈
 
